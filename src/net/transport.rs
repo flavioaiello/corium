@@ -42,8 +42,11 @@
 //!
 //! 1. **Direct first**: Always try direct UDP connection
 //! 2. **Relay fallback**: If blocked by NAT, connect via relay
-//! 3. **Upgrade probing**: Periodically attempt direct connection
-//! 4. **Seamless upgrade**: When direct becomes available, migrate off relay
+//! 3. **Upgrade probing**: Periodically attempt new direct connection
+//! 4. **Session handoff**: When direct succeeds, close relay session and switch
+//!
+//! Note: "Upgrade" creates a new connection (relay and peer are different hosts).
+//! QUIC migration only allows changing source IP within the same connection.
 //!
 //! This reduces relay load and latency when NAT conditions change.
 //!
@@ -65,6 +68,8 @@ use quinn::{ClientConfig, Connection, Endpoint};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
+use super::smartsock::SmartSock;
+
 use super::connection::{
     CachedConnection,
     ConnectionHealthStats,
@@ -79,7 +84,7 @@ use super::tls::identity_to_sni;
 use crate::dht::{Contact, DhtNetwork, Key};
 use crate::identity::{EndpointRecord, Identity};
 use crate::messages::{DhtRequest, DhtResponse};
-use crate::relay::{ConnectionStrategy, NatType, RelayClient, RelayInfo, detect_nat_type, DIRECT_CONNECT_TIMEOUT};
+use crate::net::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
 
 // Re-export TLS utilities for public API
 pub use super::tls::{
@@ -129,7 +134,22 @@ const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 /// - Direct QUIC connections when possible
 /// - Automatic relay fallback for Symmetric NAT (CGNAT)
 /// - NAT type detection via [`detect_nat`][Self::detect_nat]
-/// - Connection caching and reuse
+/// - Connection caching and reuse (LRU, 1,000 connections max)
+/// - Passive health monitoring via Quinn path statistics
+///
+/// # Connection Cache
+///
+/// QUIC connections are cached with the following behavior:
+/// - **LRU eviction**: Bounded to [`MAX_CACHED_CONNECTIONS`] (1,000)
+/// - **Stale detection**: Connections idle >60s get passive health check
+/// - **Passive health**: Uses Quinn's RTT estimates, no invasive probing
+/// - **Auto-invalidation**: Failed RPCs remove connection from cache
+///
+/// # RPC Limits
+///
+/// - **Max response size**: 1 MB ([`MAX_RESPONSE_SIZE`])
+/// - **Max contacts per response**: 100 (5x typical k=20)
+/// - **Max value size**: 1 MB (same as DHT storage limit)
 ///
 /// # Recommended Usage
 ///
@@ -143,18 +163,6 @@ const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 /// // Connect to any peer—NAT traversal is automatic!
 /// let conn = network.smart_connect(&peer_record).await?;
 /// ```
-///
-/// # Why This Abstracts Quinn
-///
-/// Consumers don't need to interact with quinn directly. The `smart_connect` method
-/// returns a [`SmartConnection`] that works across all network topologies. Quinn is
-/// an implementation detail—your application code never imports `quinn::*`.
-///
-/// # NAT Traversal
-///
-/// When direct connection fails, the network will attempt to connect via relay
-/// nodes. Both endpoints connect outbound to the relay (which always traverses
-/// NAT), and the relay forwards E2E-encrypted packets it cannot read.
 #[derive(Clone)]
 pub struct PeerNetwork {
     /// The quinn endpoint used for QUIC connections.
@@ -165,8 +173,6 @@ pub struct PeerNetwork {
     client_config: ClientConfig,
     /// Our own peer ID for relay negotiations.
     our_peer_id: Option<Identity>,
-    /// Relay client for NAT traversal.
-    relay_client: Arc<RelayClient>,
     /// Detected NAT type (for connection strategy decisions).
     nat_type: Arc<RwLock<NatType>>,
     /// Our public address as seen by STUN servers.
@@ -177,6 +183,9 @@ pub struct PeerNetwork {
     /// Uses LruCache to prevent unbounded memory growth.
     /// Uses CachedConnection to track liveness.
     connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
+    /// SmartSock for seamless path switching.
+    /// When set, peers are automatically registered for transparent relay/direct switching.
+    smartsock: Option<Arc<SmartSock>>,
 }
 
 impl PeerNetwork {
@@ -187,12 +196,12 @@ impl PeerNetwork {
             self_contact,
             client_config,
             our_peer_id: None,
-            relay_client: Arc::new(RelayClient::new()),
             nat_type: Arc::new(RwLock::new(NatType::Unknown)),
             public_addr: Arc::new(RwLock::new(None)),
             connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
             ))),
+            smartsock: None,
         }
     }
 
@@ -208,18 +217,35 @@ impl PeerNetwork {
             self_contact,
             client_config,
             our_peer_id: Some(our_peer_id),
-            relay_client: Arc::new(RelayClient::new()),
             nat_type: Arc::new(RwLock::new(NatType::Unknown)),
             public_addr: Arc::new(RwLock::new(None)),
             connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
             ))),
+            smartsock: None,
         }
     }
 
-    /// Get the relay client for managing relay connections.
-    pub fn relay_client(&self) -> &Arc<RelayClient> {
-        &self.relay_client
+    /// Attach a SmartSock for seamless path switching.
+    ///
+    /// When set, peers connected via `smart_connect` are automatically registered
+    /// with the SmartSock for transparent relay↔direct path switching.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (endpoint, smartsock) = SmartSock::bind_endpoint(addr, server_config).await?;
+    /// let network = PeerNetwork::with_identity(endpoint, contact, client_config, identity)
+    ///     .with_smartsock(smartsock);
+    /// ```
+    pub fn with_smartsock(mut self, smartsock: Arc<SmartSock>) -> Self {
+        self.smartsock = Some(smartsock);
+        self
+    }
+
+    /// Get the SmartSock, if configured.
+    pub fn smartsock(&self) -> Option<&Arc<SmartSock>> {
+        self.smartsock.as_ref()
     }
 
     /// Get our detected NAT type.
@@ -234,14 +260,19 @@ impl PeerNetwork {
 
     /// Detect our NAT type by querying multiple STUN-like servers.
     ///
-    /// This should be called during initialization with at least 2 bootstrap contacts.
-    /// The method queries each contact for our public address and determines:
-    /// - If addresses match: Cone NAT (hole punch may work)
-    /// - If addresses differ: Symmetric NAT (need relay for CGNAT↔CGNAT)
+    /// Queries at least 2 peers for our public address and compares results:
+    /// - **Addresses match**: Cone NAT (hole punch may work)
+    /// - **Addresses differ**: Symmetric NAT (relay required for CGNAT↔CGNAT)
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Query first two contacts via `WhatIsMyAddr` RPC
+    /// 2. Compare returned mapped addresses
+    /// 3. Store result in `nat_type` and `public_addr` for `smart_connect` decisions
     ///
     /// # Arguments
     ///
-    /// * `stun_contacts` - At least 2 contacts to query for address discovery
+    /// * `stun_contacts` - At least 2 contacts to query (returns Unknown if <2)
     ///
     /// # Returns
     ///
@@ -339,20 +370,24 @@ impl PeerNetwork {
     }
 
     /// Get an existing connection or create a new one.
-    /// 
+    ///
     /// QUIC connections are long-lived and multiplexed, so we reuse them
     /// rather than paying the 1-RTT (or 3-RTT for full handshake) overhead
-    /// for each RPC. Connections are automatically cleaned up when they
-    /// are closed (via Quinn's idle timeout or explicit close).
-    /// 
-    /// # Security
+    /// for each RPC.
     ///
-    /// Uses enhanced liveness checking to prevent timeout cascades:
-    /// 1. Rejects connections that are explicitly closed
-    /// 2. Probes stale connections (not used recently) before reuse
-    /// 3. Invalidates dead connections immediately rather than waiting for timeout
-    /// 
-    /// Uses bounded LruCache to prevent memory exhaustion from connection accumulation.
+    /// # Cache Lookup Strategy
+    ///
+    /// 1. **Closed check**: If connection is explicitly closed, remove and reconnect
+    /// 2. **Fresh check**: If used within 60s, reuse immediately (no probe)
+    /// 3. **Stale check**: If idle >60s, run passive health check via Quinn stats:
+    ///    - Check `close_reason()` for explicit closure
+    ///    - Check RTT estimate is non-zero and <4s
+    ///    - On failure, remove and reconnect
+    ///
+    /// # Bounds
+    ///
+    /// - **LRU eviction**: At 1,000 connections, oldest are evicted
+    /// - **No blocking I/O**: Passive check uses Quinn's internal RTT estimate
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
         let peer_id = contact.identity;
         
@@ -438,12 +473,24 @@ impl PeerNetwork {
 
     /// Run a single health check cycle on all cached connections.
     ///
-    /// This checks connections that need health checks (haven't been checked
-    /// recently) and removes unhealthy ones. Uses Quinn's passive path statistics
-    /// rather than invasive stream probing. Call this periodically or spawn
-    /// as a background task with `run_health_monitor`.
+    /// Checks connections that need health checks (not checked in last 15s)
+    /// and removes unhealthy ones.
     ///
-    /// Returns the number of connections checked and removed.
+    /// # Passive Health Check
+    ///
+    /// Uses Quinn's internal path statistics rather than invasive stream probing:
+    /// - `close_reason()`: Connection explicitly closed?
+    /// - `rtt()`: Non-zero and reasonable (<4s)?
+    ///
+    /// # State Transitions
+    ///
+    /// - **Pass**: Record RTT sample, mark healthy
+    /// - **Fail**: Increment failure counter, mark degraded
+    /// - **3 failures**: Mark unhealthy and remove from cache
+    ///
+    /// # Returns
+    ///
+    /// `(checked, removed)` - Number of connections checked and removed.
     pub async fn check_connection_health(&self) -> (usize, usize) {
         // Perform health checks while holding the write lock
         // This is now fast since we use passive stats instead of I/O probes
@@ -861,6 +908,16 @@ impl PeerNetwork {
             match direct_result {
                 Ok(Ok(conn)) => {
                     debug!(peer = ?peer_id, "direct connection successful");
+                    
+                    // Register peer with SmartSock for seamless path management
+                    if let Some(smartsock) = &self.smartsock {
+                        let addrs: Vec<std::net::SocketAddr> = record.addrs.iter()
+                            .filter_map(|a| a.parse().ok())
+                            .collect();
+                        smartsock.register_peer(*peer_id, addrs).await;
+                        debug!(peer = ?peer_id, "registered peer with SmartSock (direct)");
+                    }
+                    
                     return Ok(SmartConnection::Direct(conn));
                 }
                 Ok(Err(e)) => {
@@ -879,92 +936,96 @@ impl PeerNetwork {
             let our_peer_id = self.our_peer_id.as_ref()
                 .context("cannot use relay without our_peer_id set")?;
             
-            // Convert peer's relays to RelayInfo
-            // Note: We don't have RTT measurements to these relays yet
-            let peer_relays: Vec<RelayInfo> = record.relays.iter().map(|r| RelayInfo {
-                relay_peer: r.relay_identity,
-                relay_addrs: r.relay_addrs.clone(),
-                load: 0.5, // Unknown, assume medium load
-                accepting: true,
-                rtt_ms: None,  // No measurements from peer's perspective
-                tier: None,
-                capabilities: Default::default(),
-            }).collect();
+            // Pick the first available relay from peer's list
+            // Simple strategy: peer advertised these relays, so they should work
+            let relay = record.relays.first()
+                .context("no relays available")?;
             
-            // Get our known relays (already have RTT metrics from DHT tiering)
-            let our_relays = self.relay_client.get_relays(3).await;
+            let relay_peer_id = relay.relay_identity;
+            let session_id = generate_session_id()
+                .context("failed to generate session ID")?;
             
-            // Choose connection strategy using RTT-aware scoring
-            let strategy = crate::relay::choose_connection_strategy(
-                &record.addrs,
-                &our_relays,
-                &peer_relays,
-                true, // direct already failed
-            ).context("failed to generate session ID for relay")?;
+            // Connect to the relay
+            let relay_conn = self.connect_to_peer(&relay_peer_id, &relay.relay_addrs).await
+                .context("failed to connect to relay")?;
             
-            match strategy {
-                ConnectionStrategy::Relayed { relay, session_id } => {
-                    // Connect to the relay
-                    let relay_peer_id = relay.relay_peer;
-                    let relay_conn = self.connect_to_peer(&relay_peer_id, &relay.relay_addrs).await
-                        .context("failed to connect to relay")?;
+            // Request relay session
+            let request = DhtRequest::RelayConnect {
+                from_peer: *our_peer_id,
+                target_peer: *peer_id,
+                session_id,
+            };
+            
+            let response = self.send_rpc(&relay_conn, request).await?;
+            
+            // Keep direct addrs for potential upgrade later
+            let direct_addrs = record.addrs.clone();
+            
+            match response {
+                DhtResponse::RelayAccepted { session_id, relay_data_addr } => {
+                    debug!(
+                        peer = ?peer_id,
+                        relay = ?relay_peer_id,
+                        session = hex::encode(session_id),
+                        relay_data = %relay_data_addr,
+                        "relay session pending, waiting for peer"
+                    );
                     
-                    // Request relay session
-                    let request = DhtRequest::RelayConnect {
-                        from_peer: *our_peer_id,
-                        target_peer: *peer_id,
-                        session_id,
-                    };
+                    // Parse relay data address for SmartSock (where to send CRLY frames)
+                    let data_addr: Option<std::net::SocketAddr> = relay_data_addr.parse().ok();
                     
-                    let response = self.send_rpc(&relay_conn, request).await?;
-                    
-                    // Keep direct addrs for potential upgrade later
-                    let direct_addrs = record.addrs.clone();
-                    
-                    match response {
-                        DhtResponse::RelayAccepted { session_id } => {
-                            debug!(
-                                peer = ?peer_id,
-                                relay = ?relay_peer_id,
-                                session = hex::encode(session_id),
-                                "relay session pending, waiting for peer"
-                            );
-                            
-                            self.relay_client.register_session(session_id, relay_peer_id).await;
-                            
-                            Ok(SmartConnection::RelayPending {
-                                relay_connection: relay_conn,
-                                session_id,
-                                relay_peer: relay_peer_id,
-                                direct_addrs,
-                            })
-                        }
-                        DhtResponse::RelayConnected { session_id } => {
-                            debug!(
-                                peer = ?peer_id,
-                                relay = ?relay_peer_id,
-                                session = hex::encode(session_id),
-                                "relay session established"
-                            );
-                            
-                            self.relay_client.register_session(session_id, relay_peer_id).await;
-                            
-                            Ok(SmartConnection::Relayed {
-                                relay_connection: relay_conn,
-                                session_id,
-                                relay_peer: relay_peer_id,
-                                direct_addrs,
-                            })
-                        }
-                        DhtResponse::RelayRejected { reason } => {
-                            anyhow::bail!("relay rejected: {}", reason);
-                        }
-                        _ => anyhow::bail!("unexpected relay response"),
+                    // Register peer and relay tunnel with SmartSock
+                    if let (Some(smartsock), Some(relay_data)) = (&self.smartsock, data_addr) {
+                        let addrs: Vec<std::net::SocketAddr> = direct_addrs.iter()
+                            .filter_map(|a| a.parse().ok())
+                            .collect();
+                        smartsock.register_peer(*peer_id, addrs).await;
+                        smartsock.add_relay_tunnel(peer_id, session_id, relay_data).await;
+                        smartsock.use_relay_path(peer_id, session_id).await;
+                        debug!(peer = ?peer_id, "registered peer with SmartSock (relay pending)");
                     }
+                    
+                    Ok(SmartConnection::RelayPending {
+                        relay_connection: relay_conn,
+                        session_id,
+                        relay_peer: relay_peer_id,
+                        direct_addrs,
+                    })
                 }
-                ConnectionStrategy::Direct { .. } => {
-                    anyhow::bail!("no relay available and direct connection failed");
+                DhtResponse::RelayConnected { session_id, relay_data_addr } => {
+                    debug!(
+                        peer = ?peer_id,
+                        relay = ?relay_peer_id,
+                        session = hex::encode(session_id),
+                        relay_data = %relay_data_addr,
+                        "relay session established"
+                    );
+                    
+                    // Parse relay data address for SmartSock (where to send CRLY frames)
+                    let data_addr: Option<std::net::SocketAddr> = relay_data_addr.parse().ok();
+                    
+                    // Register peer and relay tunnel with SmartSock
+                    if let (Some(smartsock), Some(relay_data)) = (&self.smartsock, data_addr) {
+                        let addrs: Vec<std::net::SocketAddr> = direct_addrs.iter()
+                            .filter_map(|a| a.parse().ok())
+                            .collect();
+                        smartsock.register_peer(*peer_id, addrs).await;
+                        smartsock.add_relay_tunnel(peer_id, session_id, relay_data).await;
+                        smartsock.use_relay_path(peer_id, session_id).await;
+                        debug!(peer = ?peer_id, "registered peer with SmartSock (relay connected)");
+                    }
+                    
+                    Ok(SmartConnection::Relayed {
+                        relay_connection: relay_conn,
+                        session_id,
+                        relay_peer: relay_peer_id,
+                        direct_addrs,
+                    })
                 }
+                DhtResponse::RelayRejected { reason } => {
+                    anyhow::bail!("relay rejected: {}", reason);
+                }
+                _ => anyhow::bail!("unexpected relay response"),
             }
         } else {
             anyhow::bail!("direct connection failed and no relays available");
@@ -1008,11 +1069,6 @@ impl PeerNetwork {
         Ok(response)
     }
 
-    /// Update known relays from the DHT.
-    pub async fn update_known_relays(&self, relays: Vec<RelayInfo>) {
-        self.relay_client.update_relays(relays).await;
-    }
-
     /// Attempt to upgrade a relayed connection to direct.
     ///
     /// This should be called periodically for relayed connections to check
@@ -1023,7 +1079,17 @@ impl PeerNetwork {
     ///
     /// 1. Tries direct connection to peer's known addresses with short timeout
     /// 2. If successful, verifies peer identity via TLS certificate
-    /// 3. Returns the new direct connection (caller should close relay session)
+    /// 3. Returns the **new** direct connection (caller should close relay session)
+    ///
+    /// # Important: This is NOT QUIC migration
+    ///
+    /// QUIC connection migration allows changing source IP (e.g., WiFi→cellular)
+    /// but cannot switch to a different remote endpoint. Relay→direct requires
+    /// a **new connection** because the relay server and peer are different hosts.
+    ///
+    /// After upgrade, the caller must:
+    /// 1. Replace the old `SmartConnection` with the new direct connection
+    /// 2. Call [`close_relay_session`][Self::close_relay_session] to clean up
     ///
     /// # Benefits of upgrading
     ///
@@ -1086,25 +1152,10 @@ impl PeerNetwork {
     /// Close a relay session after upgrading to direct.
     ///
     /// Call this after successfully upgrading via `try_upgrade_to_direct`.
+    /// Note: With the UDP forwarder, sessions are cleaned up automatically on timeout.
     pub async fn close_relay_session(&self, session_id: [u8; 16]) -> Result<()> {
-        let our_peer_id = self.our_peer_id.as_ref()
-            .context("cannot close relay session without our_peer_id set")?;
-            
-        if let Some(relay_id) = self.relay_client.remove_session(&session_id).await {
-            // Send RelayClose to the relay
-            if let Some(relay_info) = self.relay_client.get_relay_info(&relay_id).await {
-                let contact = Contact {
-                    identity: relay_info.relay_peer,
-                    addr: relay_info.relay_addrs.first().cloned().unwrap_or_default(),
-                };
-                let request = DhtRequest::RelayClose {
-                    from_peer: *our_peer_id,
-                    session_id,
-                };
-                // Best effort, ignore errors
-                let _ = self.rpc(&contact, request).await;
-            }
-        }
+        // UDP forwarder will timeout the session automatically
+        debug!(session = hex::encode(session_id), "relay session closed (will timeout on forwarder)");
         Ok(())
     }
 }

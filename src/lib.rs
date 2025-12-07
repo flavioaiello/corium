@@ -67,16 +67,6 @@
 //! // Publish messages
 //! node.publish("my-topic", b"hello!".to_vec()).await?;
 //! ```
-//!
-//! ## Advanced Usage
-//!
-//! For power users who need lower-level access, the library also exports:
-//!
-//! - [`DhtNode`]: Direct DHT operations
-//! - [`PeerNetwork`]: QUIC transport layer
-//! - [`GossipSub`]: PubSub implementation
-//!
-//! Most users should use [`Node`] which wires these together automatically.
 
 /// Returns the current time in milliseconds since UNIX_EPOCH.
 ///
@@ -91,55 +81,88 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// Internal modules - not part of public API
 pub(crate) mod dht;
-pub mod identity;
-pub mod net;
-pub mod messages;
-pub mod pubsub;
-pub mod relay;
+pub(crate) mod identity;
+pub(crate) mod messages;
+pub(crate) mod net;
+pub(crate) mod pubsub;
 pub(crate) mod server;
+
+// Public facade
 pub mod node;
 
-pub use dht::{
-    hash_content, is_valid_identity, verify_key_value_pair, xor_distance, Contact, DhtNetwork,
-    DhtNode, Key, RoutingTable,
-};
-pub use identity::{
-    verify_identity, Keypair, Identity, EndpointRecord, RelayEndpoint,
-};
-pub use net::{
-    create_client_config, create_server_config, extract_public_key_from_cert,
-    generate_ed25519_cert, verify_peer_identity,
-    ConnectionManager, ConnectionStats, PathCandidate, PathProber, PathState, PathStats,
-    // Path discovery protocol
-    PathProbe, PathReply, PathMessage, ReachMe,
-    PeerNetwork, SmartConnection, ALPN, PATH_PROBE_INTERVAL, PATH_STALE_TIMEOUT,
-    PROBE_TIMEOUT, UPGRADE_PROBE_INTERVAL,
-};
-pub use relay::{
-    // ICE types
-    CandidatePair, CandidateType, CheckState, IceAgent, IceCandidate, IceRole, IceState,
-    TransportProtocol, TurnAllocation,
-    // NAT detection
-    detect_nat_type, gather_host_candidates, ice_connection_strategy, NatReport, NatType,
-    // Connection strategy
-    choose_connection_strategy, ConnectionStrategy,
-    // Relay client/server
-    ForwarderRegistry, RelayCapabilities, RelayClient, RelayInfo, RelayServer,
-    // Relay protocol
-    RelayRequest,
-    // Error types
-    CryptoError,
-    // Constants
-    DIRECT_CONNECT_TIMEOUT, ICE_CHECK_INTERVAL, ICE_KEEPALIVE_INTERVAL, MAX_RELAY_SESSIONS,
-    RELAY_SESSION_TIMEOUT, STUN_TIMEOUT, TURN_ALLOCATION_LIFETIME,
-};
-// Primary API - unified Node facade
+// ============================================================================
+// Public API - only types needed by Node facade users
+// ============================================================================
+
+// Primary API - the Node facade
 pub use node::{Node, PubSubHandler};
-pub use pubsub::{
-    GossipConfig, GossipSub, MessageId, PubSubMessage, ReceivedMessage, SignatureError,
-    sign_pubsub_message, verify_pubsub_signature,
-    DEFAULT_GOSSIP_INTERVAL, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MESH_DEGREE,
-};
-// Re-export TelemetrySnapshot for telemetry access
-pub use dht::TelemetrySnapshot;
+
+// Identity types - needed for Node::bind(), identity management
+pub use identity::{Identity, Keypair, EndpointRecord, RelayEndpoint};
+
+// DHT types - used in Node method signatures
+pub use dht::{Contact, Key, TelemetrySnapshot, hash_content, verify_key_value_pair};
+
+// Connection types - returned from Node::connect()
+pub use net::SmartConnection;
+
+// PubSub types - used with Node pubsub methods
+pub use pubsub::{MessageId, ReceivedMessage};
+
+// ============================================================================
+// Advanced API - for power users who need lower-level access
+// ============================================================================
+
+/// Advanced module for power users who need direct access to internal components.
+///
+/// Most users should use the [`Node`] facade instead. This module is for:
+/// - Building custom networking protocols on top of QUIC
+/// - Direct DHT operations without the Node wrapper
+/// - Custom pubsub handlers
+/// - Advanced NAT traversal scenarios
+///
+/// # Example
+///
+/// ```ignore
+/// use corium::advanced::{generate_ed25519_cert, create_client_config, PeerNetwork};
+///
+/// // Build custom QUIC client
+/// let (certs, key) = generate_ed25519_cert(&keypair)?;
+/// let config = create_client_config(certs, key)?;
+/// ```
+pub mod advanced {
+    // TLS/certificate utilities
+    pub use crate::net::{
+        create_client_config, create_server_config, generate_ed25519_cert,
+        extract_public_key_from_cert, verify_peer_identity, ALPN,
+    };
+    
+    // Network layer
+    pub use crate::net::PeerNetwork;
+    
+    // DHT
+    pub use crate::dht::{DhtNode, DhtNetwork, RoutingTable, hash_content};
+    
+    // PubSub
+    pub use crate::pubsub::{
+        GossipSub, GossipConfig, PubSubMessage, SignatureError,
+        sign_pubsub_message, verify_pubsub_signature,
+    };
+    
+    // Relay/NAT (from src/net/relay.rs)
+    pub use crate::net::{
+        UdpRelayForwarder, RelayInfo, NatType, NatReport, CryptoError,
+        detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT,
+    };
+    
+    // Identity (for low-level operations)
+    pub use crate::identity::{Keypair, verify_identity, Identity};
+    
+    // Wire protocol (for custom protocol implementations)
+    pub use crate::messages::{
+        deserialize_request, deserialize_response, serialize,
+        DhtRequest, DhtResponse, MAX_DESERIALIZE_SIZE,
+    };
+}

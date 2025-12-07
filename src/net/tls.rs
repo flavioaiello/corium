@@ -83,9 +83,20 @@ pub fn generate_ed25519_cert(
 
 /// Create a server configuration for accepting QUIC connections.
 ///
-/// Enables connection migration by default, allowing clients to change
-/// their IP address (e.g., switching from relay to direct) without
-/// re-establishing the connection.
+/// # TLS Configuration
+///
+/// - **Client auth**: Required (mutual TLS for peer identity)
+/// - **ALPN**: `corium`
+/// - **Verifier**: [`Ed25519ClientCertVerifier`] (accepts any cert, app-layer verification)
+///
+/// # Transport Configuration
+///
+/// - **Migration**: Enabled (clients can change source IP/port mid-connection,
+///   e.g., WiFi→cellular handoff, NAT rebinding). Note: this does NOT enable
+///   relay→direct upgrades, which require establishing a new connection.
+/// - **Idle timeout**: 60 seconds
+/// - **Max bidi streams**: 64 concurrent bidirectional streams
+/// - **Max uni streams**: 64 concurrent unidirectional streams
 pub fn create_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -103,8 +114,9 @@ pub fn create_server_config(
             .context("failed to create QUIC server config")?,
     ));
     
-    // Enable connection migration - allows clients to change addresses
-    // (e.g., switching from relay to direct path)
+    // Enable connection migration - allows clients to change source addresses
+    // (e.g., WiFi→cellular handoff, NAT rebinding). This does NOT enable
+    // relay→direct upgrades, which require a new connection to a different endpoint.
     server_config.migration(true);
     
     // Configure transport parameters for security and resource management
@@ -203,10 +215,24 @@ pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bo
 // Certificate Verifiers
 // ============================================================================
 
-/// Client certificate verifier for mutual TLS.
+/// Server-side client certificate verifier for mutual TLS.
 ///
-/// Accepts any client certificate - actual identity verification is done at the
-/// application layer after extracting the public key from the certificate.
+/// # Verification Strategy
+///
+/// This verifier accepts any syntactically valid certificate during the TLS handshake.
+/// Actual identity verification is deferred to the application layer, where the
+/// server extracts the public key from the certificate and matches it against
+/// the expected peer identity.
+///
+/// # Why Accept All Certificates?
+///
+/// In a decentralized mesh network:
+/// - There is no central CA to trust
+/// - Peer identity = Ed25519 public key (self-certifying)
+/// - The server may not know the client's identity until after connection
+///
+/// The TLS signature verification (`verify_tls1[23]_signature`) still ensures
+/// the client possesses the private key corresponding to their certificate.
 #[derive(Debug)]
 struct Ed25519ClientCertVerifier;
 
@@ -298,7 +324,7 @@ fn parse_identity_from_sni(sni: &str) -> Option<Identity> {
     Some(Identity::from_bytes(arr))
 }
 
-/// Certificate verifier implementing SNI-based identity pinning.
+/// Client-side server certificate verifier with SNI-based identity pinning.
 ///
 /// # Formal Property (P3 - SNI Identity Pinning)
 ///
@@ -308,12 +334,18 @@ fn parse_identity_from_sni(sni: &str) -> Option<Identity> {
 ///     ∃ pk ∈ cert.SPKI : pk == parse_identity_from_sni(sni)
 /// ```
 ///
-/// The verification chain is:
-/// 1. Extract expected identity from SNI hostname (DNS-encoded)
-/// 2. Extract actual public key from certificate's Subject Public Key Info
-/// 3. Compare: public key must equal expected identity (zero-hash model)
+/// # Verification Chain
 ///
-/// This prevents MITM attacks where an attacker presents a different certificate.
+/// 1. **SNI → Expected Identity**: Parse DNS-encoded identity from SNI hostname
+///    (format: `<first32hex>.<last32hex>` to fit DNS label limits)
+/// 2. **Certificate → Actual Public Key**: Extract Ed25519 public key from SPKI
+/// 3. **Compare**: Public key must equal expected identity (zero-hash model)
+///
+/// # Security Properties
+///
+/// - Prevents MITM: Attacker cannot present a certificate for a different identity
+/// - Prevents spoofing: Certificate's key must match the claimed identity
+/// - No CA required: Self-certifying identities in decentralized network
 #[derive(Debug)]
 struct Ed25519CertVerifier;
 

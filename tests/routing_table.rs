@@ -1,4 +1,5 @@
-use corium::{Contact, Identity, RoutingTable};
+use corium::{Contact, Identity};
+use corium::advanced::RoutingTable;
 
 fn make_identity(byte: u8) -> Identity {
     let mut id = [0u8; 32];

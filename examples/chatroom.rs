@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use corium::{
-    create_client_config, generate_ed25519_cert,
-    hash_content, Contact, Identity, Keypair, Node,
+    Contact, Identity, Keypair, Node,
+    advanced::{create_client_config, generate_ed25519_cert, hash_content},
 };
 
 /// CLI arguments for the chatroom example.

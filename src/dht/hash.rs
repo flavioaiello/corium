@@ -69,9 +69,20 @@ pub fn xor_distance(a: &Identity, b: &Identity) -> [u8; 32] {
     a.xor_distance(b)
 }
 
-/// Verify that a key matches the hash of a value.
+/// Verify that a key matches the hash of a value, or is a valid signed EndpointRecord.
 ///
-/// Used to validate content integrity after retrieval:
+/// This function supports two verification modes:
+///
+/// 1. **Content-addressed data**: `key == BLAKE3(value)` for immutable storage
+/// 2. **Signed EndpointRecord**: `key == identity && record.verify_fresh()` for mutable peer addresses
+///
+/// # Security
+///
+/// For EndpointRecords, this function verifies both the cryptographic signature
+/// AND timestamp freshness (max 24 hours) to prevent replay attacks where attackers
+/// re-publish old records to redirect traffic to stale addresses.
+///
+/// # Example
 ///
 /// ```
 /// use corium::{hash_content, verify_key_value_pair};
@@ -81,12 +92,6 @@ pub fn xor_distance(a: &Identity, b: &Identity) -> [u8; 32] {
 /// assert!(verify_key_value_pair(&key, content));
 /// assert!(!verify_key_value_pair(&key, b"wrong data"));
 /// ```
-///
-/// # Security
-///
-/// For EndpointRecords, this function verifies both the cryptographic signature
-/// AND timestamp freshness to prevent replay attacks where attackers re-publish
-/// old records to redirect traffic to stale addresses.
 pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
     // 1. Check strict content addressing (immutable data)
     if hash_content(value) == *key {

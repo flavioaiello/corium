@@ -10,11 +10,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use corium::identity::Keypair;
-use corium::relay::{
+use corium::advanced::{
     CandidateType, CheckState, IceCandidate, IceAgent, IceRole, IceState,
     NatType, TurnAllocation, CandidatePair, TransportProtocol,
     MAX_RELAY_SESSIONS, RELAY_SESSION_TIMEOUT, RelayServer, RelayRequest,
+    Keypair,
 };
 
 /// Maximum relay packet size (from relay module, not exported)
@@ -609,7 +609,7 @@ mod relay_session_authentication {
             session_id,
         };
         let response = server.handle_request(request_a, tx_a).await;
-        assert!(matches!(response, corium::relay::RelayResponse::Accepted { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Accepted { .. }));
         
         // Attacker tries to close the session (should fail silently)
         server.close_session(&session_id, &keypair_attacker.identity(), "attacker trying to close").await;
@@ -623,7 +623,7 @@ mod relay_session_authentication {
             session_id,
         };
         let response = server.handle_request(request_b, tx_b).await;
-        assert!(matches!(response, corium::relay::RelayResponse::Connected { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Connected { .. }));
     }
 
     /// Test that session initiator can close pending session.
@@ -644,7 +644,7 @@ mod relay_session_authentication {
             session_id,
         };
         let response = server.handle_request(request_a, tx_a).await;
-        assert!(matches!(response, corium::relay::RelayResponse::Accepted { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Accepted { .. }));
         
         // Peer A closes the session (should succeed)
         server.close_session(&session_id, &keypair_a.identity(), "initiator closing").await;
@@ -658,7 +658,7 @@ mod relay_session_authentication {
         };
         let response = server.handle_request(request_b, tx_b).await;
         // Will be Accepted (new pending session) not Connected
-        assert!(matches!(response, corium::relay::RelayResponse::Accepted { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Accepted { .. }));
     }
 
     /// Test that target peer can also close pending session.
@@ -679,7 +679,7 @@ mod relay_session_authentication {
             session_id,
         };
         let response = server.handle_request(request_a, tx_a).await;
-        assert!(matches!(response, corium::relay::RelayResponse::Accepted { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Accepted { .. }));
         
         // Peer B (target) closes the session (should succeed)
         server.close_session(&session_id, &keypair_b.identity(), "target closing").await;
@@ -715,7 +715,7 @@ mod relay_session_authentication {
             session_id,
         };
         let response = server.handle_request(request_b, tx_b).await;
-        assert!(matches!(response, corium::relay::RelayResponse::Connected { .. }));
+        assert!(matches!(response, corium::advanced::RelayResponse::Connected { .. }));
         
         // Either participant can close
         server.close_session(&session_id, &keypair_a.identity(), "peer_a closing").await;
@@ -761,7 +761,7 @@ mod relay_cleanup_under_load {
             
             let response = server.handle_request(request, tx).await;
             assert!(
-                matches!(response, corium::relay::RelayResponse::Accepted { .. }),
+                matches!(response, corium::advanced::RelayResponse::Accepted { .. }),
                 "session {} should be accepted",
                 i
             );
@@ -861,7 +861,7 @@ mod relay_cleanup_under_load {
             .filter(|r| {
                 matches!(
                     r.as_ref().unwrap(),
-                    corium::relay::RelayResponse::Accepted { .. }
+                    corium::advanced::RelayResponse::Accepted { .. }
                 )
             })
             .count();
@@ -877,7 +877,7 @@ mod relay_cleanup_under_load {
     #[tokio::test]
     async fn active_sessions_cleanup_on_close() {
         let server = RelayServer::with_capacity(20).unwrap();
-        let mut sessions: Vec<([u8; 16], corium::identity::Identity, corium::identity::Identity)> = Vec::new();
+        let mut sessions: Vec<([u8; 16], corium::advanced::Identity, corium::advanced::Identity)> = Vec::new();
         
         // Create active sessions (both peers connect)
         for i in 0u8..10 {
@@ -904,7 +904,7 @@ mod relay_cleanup_under_load {
                 session_id,
             };
             let response = server.handle_request(request_b, tx_b).await;
-            assert!(matches!(response, corium::relay::RelayResponse::Connected { .. }));
+            assert!(matches!(response, corium::advanced::RelayResponse::Connected { .. }));
             
             sessions.push((session_id, keypair_a.identity(), keypair_b.identity()));
         }
@@ -953,7 +953,7 @@ mod relay_cleanup_under_load {
             
             let response = server.handle_request(request, tx).await;
             
-            if matches!(response, corium::relay::RelayResponse::Accepted { .. }) {
+            if matches!(response, corium::advanced::RelayResponse::Accepted { .. }) {
                 accepted_sessions.push(session_id);
             }
         }
@@ -972,7 +972,7 @@ mod relay_cleanup_under_load {
     /// Test that forwarder registry properly limits concurrent tasks.
     #[tokio::test]
     async fn forwarder_registry_capacity_limits() {
-        let registry = corium::relay::ForwarderRegistry::new();
+        let registry = corium::advanced::ForwarderRegistry::new();
         
         // Initially should accept tasks
         assert!(registry.can_accept().await);
@@ -1008,7 +1008,7 @@ mod relay_cleanup_under_load {
     /// Test that aborting a session also aborts the forwarder task.
     #[tokio::test]
     async fn forwarder_abort_on_session_close() {
-        let registry = corium::relay::ForwarderRegistry::new();
+        let registry = corium::advanced::ForwarderRegistry::new();
         
         let session_id: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         
@@ -1030,7 +1030,7 @@ mod relay_cleanup_under_load {
     /// Test abort_all cleans up all forwarder tasks.
     #[tokio::test]
     async fn forwarder_abort_all() {
-        let registry = corium::relay::ForwarderRegistry::new();
+        let registry = corium::advanced::ForwarderRegistry::new();
         
         // Register multiple long-running tasks
         for i in 0u8..5 {
@@ -1078,7 +1078,7 @@ mod relay_cleanup_under_load {
             
             // Should always be accepted (we close each before creating next)
             assert!(
-                matches!(response, corium::relay::RelayResponse::Accepted { .. }),
+                matches!(response, corium::advanced::RelayResponse::Accepted { .. }),
                 "cycle {} should be accepted",
                 cycle
             );
@@ -1185,7 +1185,7 @@ mod relay_cleanup_under_load {
             session_id,
         };
         let response1 = server.handle_request(request1, tx1).await;
-        assert!(matches!(response1, corium::relay::RelayResponse::Accepted { .. }));
+        assert!(matches!(response1, corium::advanced::RelayResponse::Accepted { .. }));
         
         // Second pair tries to use same session ID - should be rejected
         // (because target_peer doesn't match the expected target from first request)
@@ -1197,7 +1197,7 @@ mod relay_cleanup_under_load {
         };
         let response2 = server.handle_request(request2, tx2).await;
         // This is actually rejected because the from_peer doesn't match expected target
-        assert!(matches!(response2, corium::relay::RelayResponse::Rejected { .. }));
+        assert!(matches!(response2, corium::advanced::RelayResponse::Rejected { .. }));
     }
 
     /// Stress test: many concurrent operations.

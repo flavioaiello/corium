@@ -18,14 +18,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{make_contact, make_identity, NetworkRegistry, TestNode};
-use corium::identity::{
-    verify_identity, EndpointRecord, Identity, Keypair, RelayEndpoint,
-};
-use corium::protocol::{
+use corium::advanced::{
+    verify_identity, Keypair,
     deserialize_request, deserialize_response, serialize, DhtRequest,
     DhtResponse, MAX_DESERIALIZE_SIZE,
 };
-use corium::{hash_content, verify_key_value_pair, Contact};
+use corium::{hash_content, verify_key_value_pair, Contact, EndpointRecord, Identity, RelayEndpoint};
 
 // ============================================================================
 // Cryptographic Identity Tests

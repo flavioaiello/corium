@@ -29,7 +29,6 @@
 
 use crate::net::holepunch::HolePunchRegistry;
 use crate::net::connection::ConnectionRateLimiter;
-use crate::relay::RelayConnectionRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,8 +40,8 @@ use crate::dht::{DhtNetwork, DhtNode};
 use crate::identity::Identity;
 use crate::net::extract_public_key_from_cert;
 use crate::messages::{DhtRequest, DhtResponse};
-use crate::pubsub::{PubSubHandler, PubSubMessage};
-use crate::relay::{CryptoError, RelayClient, RelayPacket, RelayServer, MAX_RELAY_PACKET_SIZE};
+use crate::pubsub::PubSubHandler;
+use crate::net::relay::CryptoError;
 
 /// Read timeout for inbound RPC streams (mitigates slowloris-style stalls).
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,24 +63,20 @@ const MAX_REQUEST_SIZE: usize = 64 * 1024;
 /// - Impersonate another NodeId (requires the corresponding private key)
 /// - Have their requests processed (rejected before first request)
 ///
-/// For relayed data (`RelayData` messages), the node verifies that:
-/// 1. The session ID corresponds to an active relay session we initiated
-/// 2. The message arrives from the relay server we established the session with
-///
-/// This prevents rogue relays from injecting data into sessions they don't own.
+/// Relay data is forwarded via UDP using the UdpRelayForwarder, which handles
+/// CRLY-framed packets directly without RPC overhead. The relay cannot decrypt
+/// the payload (true E2E encryption).
 ///
 /// Connection rate limiting prevents resource exhaustion attacks.
 pub(crate) struct Server<N: DhtNetwork> {
     /// The DHT node that handles DHT operations.
     node: DhtNode<N>,
-    /// Relay server for NAT traversal (when acting as a relay).
-    relay: Arc<RelayServer>,
-    /// Relay client for tracking our outbound relay sessions.
-    relay_client: Arc<RelayClient>,
+    /// UDP relay forwarder for SmartSock CRLY frames.
+    udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
+    /// Address of the UDP relay forwarder (for responses to clients).
+    udp_forwarder_addr: Option<std::net::SocketAddr>,
     /// Hole punch rendezvous registry.
     hole_punch: Arc<HolePunchRegistry>,
-    /// Registry of peer connections for relay forwarding.
-    relay_connections: Arc<RelayConnectionRegistry>,
     /// Connection rate limiter to prevent DoS.
     rate_limiter: ConnectionRateLimiter,
     /// Optional PubSub handler for GossipSub messages.
@@ -90,35 +85,15 @@ pub(crate) struct Server<N: DhtNetwork> {
 
 impl<N: DhtNetwork> Server<N> {
     /// Create a new server backed by the given DHT node.
-    ///
-    /// # Errors
-    ///
-    /// Returns `CryptoError` if the relay server cannot be initialized due
-    /// to CSPRNG unavailability.
     pub fn new(node: DhtNode<N>) -> Result<Self, CryptoError> {
         Ok(Self {
             node,
-            relay: Arc::new(RelayServer::new()?),
-            relay_client: Arc::new(RelayClient::new()),
+            udp_forwarder: None,
+            udp_forwarder_addr: None,
             hole_punch: Arc::new(HolePunchRegistry::new()),
-            relay_connections: Arc::new(RelayConnectionRegistry::new()),
             rate_limiter: ConnectionRateLimiter::new(),
             pubsub_handler: None,
         })
-    }
-
-    /// Create a server with a custom relay server configuration.
-    #[allow(dead_code)]
-    pub fn with_relay(node: DhtNode<N>, relay: RelayServer) -> Self {
-        Self {
-            node,
-            relay: Arc::new(relay),
-            relay_client: Arc::new(RelayClient::new()),
-            hole_punch: Arc::new(HolePunchRegistry::new()),
-            relay_connections: Arc::new(RelayConnectionRegistry::new()),
-            rate_limiter: ConnectionRateLimiter::new(),
-            pubsub_handler: None,
-        }
     }
 
     /// Register a PubSub handler for processing GossipSub messages.
@@ -130,19 +105,34 @@ impl<N: DhtNetwork> Server<N> {
         self
     }
 
+    /// Configure the UDP relay forwarder for SmartSock CRLY frame forwarding.
+    ///
+    /// When enabled, the server will bind a separate UDP port for relay data.
+    /// Clients receive this address in RelayAccepted/RelayConnected responses.
+    ///
+    /// This enables true E2E encryption over relay without RPC overhead.
+    pub fn with_udp_forwarder(
+        mut self,
+        forwarder: Arc<crate::net::UdpRelayForwarder>,
+        addr: std::net::SocketAddr,
+    ) -> Self {
+        self.udp_forwarder = Some(forwarder);
+        self.udp_forwarder_addr = Some(addr);
+        self
+    }
+
     /// Run the server, accepting connections from the endpoint.
     ///
     /// This method runs indefinitely, accepting and handling connections.
     pub async fn run(&self, endpoint: Endpoint) -> Result<()> {
-        // Spawn periodic cleanup task for relays
-        let relay_cleanup = self.relay.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                relay_cleanup.cleanup_expired().await;
-            }
-        });
+        // Spawn UDP relay forwarder if configured
+        if let Some(forwarder) = &self.udp_forwarder {
+            info!(
+                addr = ?self.udp_forwarder_addr,
+                "starting UDP relay forwarder"
+            );
+            forwarder.clone().spawn();
+        }
 
         // Spawn periodic cleanup task for hole punch registry
         let punch_cleanup = self.hole_punch.clone();
@@ -151,16 +141,6 @@ impl<N: DhtNetwork> Server<N> {
             loop {
                 interval.tick().await;
                 punch_cleanup.cleanup_expired().await;
-            }
-        });
-
-        // Spawn periodic cleanup task for relay connections
-        let relay_conn_cleanup = self.relay_connections.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                relay_conn_cleanup.cleanup().await;
             }
         });
 
@@ -175,13 +155,15 @@ impl<N: DhtNetwork> Server<N> {
             }
             
             let node = self.node.clone();
-            let relay = self.relay.clone();
-            let relay_client = self.relay_client.clone();
             let hole_punch = self.hole_punch.clone();
-            let relay_connections = self.relay_connections.clone();
             let pubsub_handler = self.pubsub_handler.clone();
+            let udp_forwarder = self.udp_forwarder.clone();
+            let udp_forwarder_addr = self.udp_forwarder_addr;
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(node, relay, relay_client, hole_punch, relay_connections, pubsub_handler, incoming).await {
+                if let Err(e) = handle_connection(
+                    node, hole_punch,
+                    pubsub_handler, udp_forwarder, udp_forwarder_addr, incoming
+                ).await {
                     warn!("connection error: {:?}", e);
                 }
             });
@@ -220,11 +202,10 @@ fn extract_verified_identity(connection: &quinn::Connection) -> Option<Identity>
 /// Sybil attacks where a peer claims to be a different identity.
 async fn handle_connection<N: DhtNetwork>(
     node: DhtNode<N>,
-    relay: Arc<RelayServer>,
-    relay_client: Arc<RelayClient>,
     hole_punch: Arc<HolePunchRegistry>,
-    relay_connections: Arc<RelayConnectionRegistry>,
     pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<std::net::SocketAddr>,
     incoming: Incoming,
 ) -> Result<()> {
     debug!("handle_connection: accepting incoming connection");
@@ -241,30 +222,6 @@ async fn handle_connection<N: DhtNetwork>(
     
     // Log new peer connection in format: Peer IP:PORT/IDENTITY
     info!("Peer {}/{}", remote, hex::encode(verified_identity));
-    
-    // Derive peer Identity from verified public key for relay connection tracking
-    let peer_identity: Option<Identity> = {
-        let peer_identity_opt = connection.peer_identity();
-        if let Some(identity) = peer_identity_opt {
-            if let Some(certs) = identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer>>() {
-                if let Some(cert) = certs.first() {
-                    extract_public_key_from_cert(cert.as_ref())
-                        .map(Identity::from_bytes)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    
-    // Register this connection for relay forwarding if we got the identity
-    if let Some(ref identity) = peer_identity {
-        relay_connections.register(*identity, connection.clone()).await;
-    }
     
     // Connection events demoted to debug - too noisy at info level in production
     debug!(
@@ -286,26 +243,22 @@ async fn handle_connection<N: DhtNetwork>(
         };
 
         let node = node.clone();
-        let relay = relay.clone();
-        let relay_client = relay_client.clone();
         let hole_punch = hole_punch.clone();
-        let relay_conns = relay_connections.clone();
         let pubsub = pubsub_handler.clone();
+        let forwarder = udp_forwarder.clone();
+        let forwarder_addr = udp_forwarder_addr;
         let remote_addr = remote;
         let verified_id = verified_identity;
-        let conn_peer_identity = peer_identity;
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(node, relay, relay_client, hole_punch, relay_conns, pubsub, stream, remote_addr, verified_id, conn_peer_identity).await {
+            if let Err(e) = handle_stream(
+                node, hole_punch, pubsub, 
+                forwarder, forwarder_addr, stream, remote_addr, verified_id
+            ).await {
                 // Stream errors are common (peer disconnect) but useful for troubleshooting
                 debug!(error = ?e, "stream error");
             }
         });
     };
-    
-    // Unregister connection on disconnect
-    if let Some(identity) = peer_identity {
-        relay_connections.unregister(&identity).await;
-    }
     
     result
 }
@@ -315,21 +268,16 @@ async fn handle_connection<N: DhtNetwork>(
 /// The `verified_identity` parameter is the peer's identity extracted from their
 /// TLS certificate. All incoming requests must have a `from` Contact that
 /// matches this verified identity to prevent Sybil attacks.
-///
-/// The `connection_peer_identity` is the Identity of the peer on this connection,
-/// used to verify RelayData messages come from the expected relay server.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream<N: DhtNetwork>(
     node: DhtNode<N>,
-    relay: Arc<RelayServer>,
-    relay_client: Arc<RelayClient>,
     hole_punch: Arc<HolePunchRegistry>,
-    relay_connections: Arc<RelayConnectionRegistry>,
     pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<std::net::SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: std::net::SocketAddr,
     verified_identity: Identity,
-    connection_peer_identity: Option<Identity>,
 ) -> Result<()> {
     // Read request length with a timeout to avoid slowloris stalling the task.
     let mut len_buf = [0u8; 4];
@@ -389,7 +337,11 @@ async fn handle_stream<N: DhtNetwork>(
     }
 
     // Handle the request and produce a response
-    let response = handle_request(node, relay, relay_client, hole_punch, relay_connections, request, remote_addr, verified_identity, connection_peer_identity, pubsub_handler).await;
+    let response = handle_request(
+        node, hole_punch, 
+        request, remote_addr, verified_identity, 
+        pubsub_handler, udp_forwarder, udp_forwarder_addr
+    ).await;
 
     // Send response
     let response_bytes = bincode::serialize(&response).context("failed to serialize response")?;
@@ -405,15 +357,13 @@ async fn handle_stream<N: DhtNetwork>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_request<N: DhtNetwork>(
     node: DhtNode<N>,
-    relay: Arc<RelayServer>,
-    relay_client: Arc<RelayClient>,
     hole_punch: Arc<HolePunchRegistry>,
-    relay_connections: Arc<RelayConnectionRegistry>,
     request: DhtRequest,
     remote_addr: std::net::SocketAddr,
-    verified_identity: Identity,
-    connection_peer_identity: Option<Identity>,
+    _verified_identity: Identity,
     pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<std::net::SocketAddr>,
 ) -> DhtResponse {
     match request {
         DhtRequest::Ping { from } => {
@@ -475,285 +425,75 @@ async fn handle_request<N: DhtNetwork>(
                 "handling RELAY_CONNECT request"
             );
             
-            // Create a channel for this peer to receive forwarded packets
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<RelayPacket>(32);
-            
-            let relay_request = crate::relay::RelayRequest {
-                from_peer,
-                target_peer,
-                session_id,
-            };
-            
-            let response = relay.handle_request(relay_request, tx).await;
-            
-            // If session was accepted/connected, spawn a task to forward packets to this peer
-            let should_spawn_forwarder = matches!(
-                response, 
-                crate::relay::RelayResponse::Accepted { .. } | 
-                crate::relay::RelayResponse::Connected { .. }
-            );
-            
-            if should_spawn_forwarder {
-                // Check if we can accept a new forwarder task before spawning
-                if !relay.forwarder_registry().can_accept().await {
-                    let active_count = relay.forwarder_registry().active_count().await;
-                    warn!(
-                        session = hex::encode(session_id),
-                        active_count = active_count,
-                        "rejecting relay: forwarder task limit reached"
-                    );
-                    return DhtResponse::RelayRejected { 
-                        reason: "relay server at capacity".to_string() 
-                    };
-                }
-                
-                let relay_conns = relay_connections.clone();
-                let peer = from_peer;
-                let sid = session_id;
-                
-                // Spawn a task to read from the channel and forward packets to this peer
-                // Uses timeout to prevent task leak if peer disconnects without closing channel
-                let handle = tokio::spawn(async move {
-                    use crate::relay::RELAY_SESSION_TIMEOUT;
-                    
-                    loop {
-                        // Use select with timeout to prevent indefinite blocking
-                        // if the channel never receives another packet
-                        tokio::select! {
-                            packet_opt = rx.recv() => {
-                                match packet_opt {
-                                    Some(packet) => {
-                                        if let Err(e) = relay_conns.forward_to_peer(&peer, packet).await {
-                                            debug!(
-                                                session = hex::encode(sid),
-                                                error = ?e,
-                                                "failed to forward packet to peer, closing relay forwarder"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    None => {
-                                        // Channel closed
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(RELAY_SESSION_TIMEOUT) => {
-                                debug!(
-                                    session = hex::encode(sid),
-                                    "relay forwarder timed out waiting for packets"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    trace!(
-                        session = hex::encode(sid),
-                        "relay forwarder task completed"
-                    );
-                });
-                
-                // Register the task handle for tracking and potential cleanup
-                // If registration fails (at capacity race), the task is aborted by the registry
-                if !relay.forwarder_registry().register(session_id, handle).await {
-                    warn!(
-                        session = hex::encode(session_id),
-                        "failed to register forwarder task (capacity reached)"
-                    );
-                    // The registry aborts the handle if registration fails
-                    return DhtResponse::RelayRejected { 
-                        reason: "relay server at capacity".to_string() 
-                    };
-                }
-            }
-            
-            match response {
-                crate::relay::RelayResponse::Accepted { session_id } => {
-                    DhtResponse::RelayAccepted { session_id }
-                }
-                crate::relay::RelayResponse::Connected { session_id } => {
-                    DhtResponse::RelayConnected { session_id }
-                }
-                crate::relay::RelayResponse::Rejected { reason } => {
-                    DhtResponse::RelayRejected { reason }
-                }
-            }
-        }
-        DhtRequest::RelayForward { from, session_id, payload } => {
-            trace!(
-                session = hex::encode(session_id),
-                payload_len = payload.len(),
-                "handling RELAY_FORWARD request"
-            );
-            
-            // Validate payload size to prevent memory exhaustion
-            if payload.len() > MAX_RELAY_PACKET_SIZE {
-                warn!(
-                    session = hex::encode(session_id),
-                    size = payload.len(),
-                    max = MAX_RELAY_PACKET_SIZE,
-                    "rejecting oversized relay payload"
-                );
-                return DhtResponse::Error {
-                    message: format!("relay payload too large: {} bytes (max {})", payload.len(), MAX_RELAY_PACKET_SIZE),
-                };
-            }
-
-            // Verify sender matches connection identity
-            if from != verified_identity {
-                warn!(
-                    remote = %remote_addr,
-                    claimed = ?hex::encode(&from.as_bytes()[..8]),
-                    verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
-                    "rejecting RELAY_FORWARD: identity mismatch"
-                );
-                return DhtResponse::Error {
-                    message: "Identity mismatch".to_string(),
-                };
-            }
-            
-            let packet = crate::relay::RelayPacket {
-                from,
-                session_id,
-                payload,
-            };
-
-            match relay.forward_packet(&from, packet).await {
-                Ok(_) => DhtResponse::RelayForwarded,
-                Err(e) => DhtResponse::Error { message: e },
-            }
-        }
-        DhtRequest::RelayClose { from_peer, session_id } => {
-            debug!(
-                from = ?hex::encode(&from_peer.as_bytes()[..8]),
-                session = hex::encode(session_id),
-                "handling RELAY_CLOSE request"
-            );
-            
-            // Verify sender matches connection identity (Sybil protection)
-            if from_peer != verified_identity {
-                warn!(
-                    remote = %remote_addr,
-                    claimed = ?hex::encode(&from_peer.as_bytes()[..8]),
-                    verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
-                    "rejecting RELAY_CLOSE: identity mismatch"
-                );
-                return DhtResponse::Error {
-                    message: "Identity mismatch".to_string(),
-                };
-            }
-            
-            // Note: The relay server's close_session will verify that from_peer
-            // is actually a participant in the session before closing it.
-            // This prevents authenticated users from closing sessions they're not part of.
-            relay.close_session(&session_id, &from_peer, "peer requested close").await;
-            DhtResponse::RelayClosed
-        }
-        DhtRequest::RelayData { from, session_id, payload } => {
-            // This is received by peers when the relay pushes forwarded data to them.
-            // The peer should process this as incoming relay data from the other peer.
-            //
-            // Security Model:
-            // 1. Verify we have an active relay session with this session_id
-            // 2. Verify the message arrived from the relay server we established the session with
-            // 3. The payload is E2E encrypted QUIC data, so the relay cannot modify its contents
-            //
-            // This prevents:
-            // - Rogue relays from injecting data into sessions they don't own
-            // - Session hijacking where an attacker guesses/steals a session ID
-            // - Man-in-the-middle attacks where a malicious node claims to be a relay
-            
-            // Verify the relay server's identity matches our expected relay for this session
-            let relay_identity = match &connection_peer_identity {
-                Some(id) => id,
+            // Check if UDP forwarder is available
+            let forwarder = match &udp_forwarder {
+                Some(f) => f,
                 None => {
-                    warn!(
-                        session = hex::encode(session_id),
-                        remote = %remote_addr,
-                        "rejecting RELAY_DATA: could not determine connection peer identity"
-                    );
-                    return DhtResponse::Error {
-                        message: "relay verification failed".to_string(),
+                    return DhtResponse::RelayRejected { 
+                        reason: "relay not available".to_string() 
                     };
                 }
             };
             
-            // Verify the connection is from a registered/known relay
-            // This provides defense-in-depth against rogue nodes claiming to be relays
-            if !relay_client.is_known_relay(relay_identity).await {
-                warn!(
-                    session = hex::encode(session_id),
-                    claimed_relay = ?hex::encode(&relay_identity.as_bytes()[..8]),
-                    remote = %remote_addr,
-                    "rejecting RELAY_DATA: sender is not a registered relay"
-                );
-                return DhtResponse::Error {
-                    message: "relay verification failed".to_string(),
+            // Get the forwarder address for the response
+            let relay_data_addr = match udp_forwarder_addr {
+                Some(addr) => addr.to_string(),
+                None => {
+                    return DhtResponse::RelayRejected { 
+                        reason: "relay address not configured".to_string() 
+                    };
+                }
+            };
+            
+            // Check current session count
+            let session_count = forwarder.session_count().await;
+            if session_count >= crate::net::relay::MAX_SESSIONS {
+                return DhtResponse::RelayRejected { 
+                    reason: "relay server at capacity".to_string() 
                 };
             }
             
-            // Check if we have an active session with this ID through this relay
-            if !relay_client.verify_session(&session_id, relay_identity).await {
-                warn!(
-                    session = hex::encode(session_id),
-                    relay = ?hex::encode(&relay_identity.as_bytes()[..8]),
-                    remote = %remote_addr,
-                    "rejecting RELAY_DATA: session not found or relay mismatch (possible injection attack)"
-                );
-                // Use opaque error to prevent session enumeration
-                return DhtResponse::Error {
-                    message: "relay verification failed".to_string(),
-                };
-            }
-            
-            // Validate payload size
-            if payload.len() > MAX_RELAY_PACKET_SIZE {
-                warn!(
-                    session = hex::encode(session_id),
-                    size = payload.len(),
-                    max = MAX_RELAY_PACKET_SIZE,
-                    "rejecting oversized RELAY_DATA payload"
-                );
-                return DhtResponse::Error {
-                    message: format!("relay data too large: {} bytes (max {})", payload.len(), MAX_RELAY_PACKET_SIZE),
-                };
-            }
-            
-            trace!(
-                session = hex::encode(session_id),
-                from = ?hex::encode(&from.as_bytes()[..8]),
-                payload_len = payload.len(),
-                "received RELAY_DATA from relay"
-            );
-            
-            // Queue the relay data for processing by the application layer.
-            // The RelayClient maintains a bounded channel where incoming relay
-            // data is queued. The application (or a dedicated task) consumes
-            // this data and processes the E2E encrypted QUIC packets.
-            //
-            // Note: The payload contains encrypted QUIC packet data that needs
-            // to be injected into the QUIC layer for the relayed connection.
-            // The current architecture queues the data; full QUIC integration
-            // would require deeper integration with Quinn's internals.
-            match relay_client.queue_incoming_data(session_id, from, payload).await {
+            // Try to register or complete the session
+            // First peer: register as pending
+            // Second peer: complete the session
+            match forwarder.register_session(session_id, remote_addr).await {
                 Ok(()) => {
+                    // First peer registered - session pending
                     debug!(
                         session = hex::encode(session_id),
-                        "relay data queued for processing"
+                        peer = %remote_addr,
+                        "relay session pending (waiting for peer B)"
                     );
-                    DhtResponse::Ack
+                    DhtResponse::RelayAccepted { session_id, relay_data_addr }
                 }
-                Err(reason) => {
+                Err("session already exists") => {
+                    // Second peer - try to complete the session
+                    match forwarder.complete_session(session_id, remote_addr).await {
+                        Ok(()) => {
+                            debug!(
+                                session = hex::encode(session_id),
+                                peer = %remote_addr,
+                                "relay session established"
+                            );
+                            DhtResponse::RelayConnected { session_id, relay_data_addr }
+                        }
+                        Err(e) => {
+                            warn!(
+                                session = hex::encode(session_id),
+                                error = e,
+                                "failed to complete relay session"
+                            );
+                            DhtResponse::RelayRejected { reason: e.to_string() }
+                        }
+                    }
+                }
+                Err(e) => {
                     warn!(
                         session = hex::encode(session_id),
-                        reason = reason,
-                        "failed to queue relay data"
+                        error = e,
+                        "failed to register relay session"
                     );
-                    // Return error so the relay knows delivery failed.
-                    // This allows the sender to retry or fall back.
-                    DhtResponse::Error {
-                        message: "relay data delivery failed: receiver busy".to_string(),
-                    }
+                    DhtResponse::RelayRejected { reason: e.to_string() }
                 }
             }
         }

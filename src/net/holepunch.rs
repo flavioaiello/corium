@@ -1,4 +1,32 @@
-//! QUIC-based NAT hole punching extracted from the legacy `net.rs`.
+//! QUIC-based NAT hole punching with server-side rendezvous coordination.
+//!
+//! This module provides:
+//!
+//! - [`HolePuncher`]: Client-side hole punch orchestration
+//! - [`HolePunchRegistry`]: Server-side rendezvous for coordinating simultaneous open
+//!
+//! # Protocol Overview
+//!
+//! 1. **Discovery**: Both peers query STUN-like servers to learn public addresses
+//! 2. **Registration**: Each peer registers with a rendezvous server (punch_id, target_peer, public_addr)
+//! 3. **Coordination**: When both peers register, server returns start_time for synchronized punch
+//! 4. **Simultaneous Open**: Both peers initiate QUIC connections at start_time
+//! 5. **Race**: First successful connection wins; others are dropped
+//!
+//! # Timing Parameters
+//!
+//! - **Punch timeout**: 5 seconds ([`HOLE_PUNCH_TIMEOUT`])
+//! - **Rendezvous timeout**: 10 seconds waiting for peer ([`HOLE_PUNCH_RENDEZVOUS_TIMEOUT`])
+//! - **Stagger**: 50ms between connection attempts for NAT slot diversity
+//! - **Clock skew tolerance**: 2,000ms for real-world NTP drift
+//! - **Registry timeout**: 30 seconds before pending registrations expire
+//!
+//! # Rate Limiting
+//!
+//! Server-side bounds prevent abuse:
+//! - **Per-identity**: Max 5 pending registrations per peer
+//! - **Global pending**: Max 5,000 pending registrations
+//! - **Ready results**: Max 1,000 cached results
 
 use std::net::SocketAddr;
 use std::collections::HashMap;
@@ -62,6 +90,19 @@ pub struct HolePunchResult {
     pub duration: Duration,
 }
 
+/// Client-side hole punch coordinator.
+///
+/// Orchestrates the hole punch workflow:
+///
+/// 1. [`discover_public_addr`][Self::discover_public_addr]: Query STUN servers for NAT-mapped address
+/// 2. [`punch_with_rendezvous`][Self::punch_with_rendezvous]: Full workflow with server coordination
+/// 3. [`punch`][Self::punch]: Direct simultaneous open attempt
+///
+/// # Connection Racing
+///
+/// Makes 3 staggered connection attempts (50ms apart) and races them.
+/// First successful QUIC handshake wins; losers are dropped.
+/// Identity verification happens via SNI during TLS handshake.
 #[derive(Debug)]
 pub struct HolePuncher {
     endpoint: Endpoint,
@@ -369,7 +410,22 @@ struct RegistryState {
 
 /// Tracks pending hole punch rendezvous requests.
 ///
-/// Uses a single mutex to protect all state atomically, preventing:
+/// Coordinates simultaneous UDP hole punch attempts between two peers:
+///
+/// 1. First peer calls [`register`][Self::register] → stored in `pending`
+/// 2. Second peer calls [`register`][Self::register] → matched, both get start_time
+/// 3. Both peers initiate QUIC connections at synchronized time
+///
+/// # State Management
+///
+/// - `pending`: Waiting for second peer (bounded by [`MAX_PENDING_HOLE_PUNCHES`])
+/// - `ready`: Both peers registered, result awaiting pickup (bounded by [`MAX_READY_HOLE_PUNCHES`])
+/// - `by_peers`: Sorted peer-pair → punch_id lookup for matching
+/// - `per_identity_count`: Per-peer rate limiting (max [`MAX_HOLE_PUNCH_PER_IDENTITY`])
+///
+/// # Thread Safety
+///
+/// Uses a single `tokio::sync::Mutex` for atomic state transitions, preventing:
 /// - TOCTOU race conditions on rate limit checks
 /// - Deadlocks from nested lock acquisition
 /// - State corruption from concurrent modifications

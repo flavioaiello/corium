@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use quinn::Endpoint;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dht::{Contact, DhtNode, Key, TelemetrySnapshot};
 use crate::identity::{EndpointRecord, Identity, Keypair};
-use crate::net::PeerNetwork;
+use crate::net::{PeerNetwork, smartsock::SmartSock};
 use crate::pubsub::{GossipConfig, GossipSub, ReceivedMessage};
+use crate::net::UdpRelayForwarder;
 use crate::server::Server;
 
 // Re-export PubSubHandler for users who want to implement custom handlers
@@ -76,6 +77,8 @@ pub struct Node {
     keypair: Keypair,
     /// The QUIC endpoint for connections.
     endpoint: Endpoint,
+    /// SmartSock for seamless path switching (relay↔direct).
+    smartsock: Arc<SmartSock>,
     /// Our contact information.
     contact: Contact,
     /// The underlying DHT node.
@@ -143,9 +146,10 @@ impl Node {
         let server_config = crate::net::create_server_config(server_certs, server_key)?;
         let client_config = crate::net::create_client_config(client_certs, client_key)?;
         
-        // Create QUIC endpoint
-        let endpoint = Endpoint::server(server_config, addr)
-            .context("failed to bind QUIC endpoint")?;
+        // Create QUIC endpoint with SmartSock for seamless path switching
+        let (endpoint, smartsock) = SmartSock::bind_endpoint(addr, server_config)
+            .await
+            .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
         // Create contact info
@@ -154,13 +158,13 @@ impl Node {
             addr: local_addr.to_string(),
         };
         
-        // Create network and DHT
+        // Create network with SmartSock for seamless path switching
         let network = PeerNetwork::with_identity(
             endpoint.clone(),
             contact.clone(),
             client_config,
             identity,
-        );
+        ).with_smartsock(smartsock.clone());
         
         let dht = DhtNode::new(
             identity,
@@ -173,6 +177,22 @@ impl Node {
         // Create server
         let mut server = Server::new(dht.clone())
             .map_err(|e| anyhow::anyhow!("failed to initialize server: {}", e))?;
+        
+        // Setup UDP relay forwarder on port+1 for CRLY frame forwarding
+        // This enables true E2E encryption over relay without RPC overhead
+        let forwarder_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
+        match UdpRelayForwarder::bind(forwarder_addr).await {
+            Ok(forwarder) => {
+                let forwarder = Arc::new(forwarder);
+                let actual_addr = forwarder.local_addr().unwrap_or(forwarder_addr);
+                info!("UDP relay forwarder on {}", actual_addr);
+                server = server.with_udp_forwarder(forwarder, actual_addr);
+            }
+            Err(e) => {
+                // Non-fatal: fall back to RPC-based relay
+                warn!("failed to bind UDP relay forwarder on {}: {}", forwarder_addr, e);
+            }
+        }
         
         // Setup pubsub if enabled
         let (pubsub, pubsub_receiver) = if enable_pubsub {
@@ -197,6 +217,7 @@ impl Node {
         Ok(Self {
             keypair,
             endpoint,
+            smartsock,
             contact,
             dht,
             network,
@@ -239,6 +260,14 @@ impl Node {
         &self.endpoint
     }
     
+    /// Get the SmartSock for path management.
+    ///
+    /// SmartSock provides seamless relay↔direct path switching.
+    /// Use this to register peers and update path preferences.
+    pub fn smartsock(&self) -> &Arc<SmartSock> {
+        &self.smartsock
+    }
+
     // =========================================================================
     // DHT Operations
     // =========================================================================
@@ -367,6 +396,12 @@ impl Node {
         for peer in peers {
             self.dht.observe_contact(peer.clone()).await;
         }
+        
+        // Automatically detect NAT type using bootstrap peers
+        if peers.len() >= 2 {
+            self.network.detect_nat(peers).await;
+        }
+        
         // Perform self-lookup to populate routing table
         self.dht.iterative_find_node(self.identity()).await
     }
@@ -401,26 +436,11 @@ impl Node {
         self.network.smart_connect(record).await
     }
     
-    /// Detect our NAT type by querying multiple peers.
-    ///
-    /// This should be called after bootstrapping. The method queries
-    /// peers for our public address and determines:
-    /// - Cone NAT: Hole punching may work
-    /// - Symmetric NAT: Need relay for mesh connectivity
-    ///
-    /// # Arguments
-    ///
-    /// * `stun_contacts` - At least 2 contacts to query for address discovery
-    pub async fn detect_nat(&self, stun_contacts: &[Contact]) -> crate::relay::NatType {
-        self.network.detect_nat(stun_contacts).await
-    }
-    
-    /// Get our detected NAT type.
-    pub async fn nat_type(&self) -> crate::relay::NatType {
-        self.network.nat_type().await
-    }
-    
     /// Get our public address (if detected).
+    ///
+    /// Returns the public IP:port as seen by external peers. This is
+    /// discovered automatically during [`bootstrap`][Self::bootstrap].
+    /// Useful for logging or displaying to users.
     pub async fn public_addr(&self) -> Option<SocketAddr> {
         self.network.public_addr().await
     }

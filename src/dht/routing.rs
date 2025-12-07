@@ -1,7 +1,14 @@
 //! Kademlia routing table with per-peer rate limiting.
 //!
 //! Provides the core routing infrastructure for DHT operations including
-//! 256 k-buckets for 256-bit identities and per-peer insertion rate limiting.
+//! 256 k-buckets for 256-bit identities, LRU-style bucket management,
+//! and per-peer insertion rate limiting (50 contacts/minute/peer).
+//!
+//! # Security
+//!
+//! Per-peer rate limiting prevents routing table flooding attacks where
+//! a malicious peer returns excessive contacts in FindNode responses.
+//! Each peer has a token bucket that replenishes at 50 tokens/minute.
 
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
@@ -396,7 +403,15 @@ impl RoutingTable {
 
     /// Find the k closest contacts to a target identity.
     ///
-    /// Uses a bounded max-heap for O(n log k) complexity instead of O(n log n).
+    /// Uses a bounded max-heap for O(n log k) complexity where n is total contacts
+    /// and k is the requested count. This is more efficient than sorting when k << n.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Iterate all contacts across all 256 buckets
+    /// 2. Maintain a max-heap of size k (largest distances at top)
+    /// 3. Only insert if closer than current max, then pop the max
+    /// 4. Extract and sort the k contacts by distance (ascending)
     pub fn closest(&self, target: &Identity, k: usize) -> Vec<Contact> {
         if k == 0 {
             return Vec::new();

@@ -264,11 +264,11 @@ pub enum StoreRejection {
 ///
 /// This store implements multiple layers of protection against abuse:
 ///
-/// 1. **Maximum value size**: Rejects values larger than 64 KB
+/// 1. **Maximum value size**: Rejects values larger than 1 MB
 /// 2. **Per-peer quotas**: Each peer can store at most 1 MB / 100 entries
 /// 3. **Per-peer rate limiting**: Max 20 store requests per minute per peer
-/// 4. **Popularity-based eviction**: Frequently accessed data survives longer
-/// 5. **Pressure-based eviction**: Automatic eviction when resources are constrained
+/// 4. **Popularity-based eviction**: Frequently accessed data (>3 accesses) survives longer
+/// 5. **Pressure-based eviction**: Automatic eviction when pressure exceeds 0.75
 pub(crate) struct LocalStore {
     /// LRU cache providing O(1) get, put, and eviction operations.
     cache: LruCache<Key, StoredEntry>,

@@ -5,7 +5,8 @@ use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 
-use corium::{Contact, DhtNetwork, DhtNode, Key, Identity};
+use corium::{Contact, Key, Identity};
+use corium::advanced::{DhtNetwork, DhtNode};
 
 #[derive(Clone)]
 pub struct TestNetwork {

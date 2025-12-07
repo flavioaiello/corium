@@ -7,27 +7,39 @@
 //! - Direct QUIC connections when network conditions allow
 //! - Automatic relay fallback when behind Symmetric NAT (CGNAT)
 //! - NAT type detection and connection strategy selection
-//! - Connection upgrade probing (relay → direct when conditions improve)
+//! - Connection upgrade probing (relay → direct via new connection when conditions improve)
 //!
 //! # Module Structure
 //!
-//! - [`transport`]: Core `PeerNetwork` implementation, smart_connect, RPC handling
-//! - [`tls`]: TLS/certificate handling, Ed25519 cert generation, SNI identity pinning
-//! - [`connection`]: Connection caching, health monitoring, `SmartConnection`
-//! - [`path`]: Path probing, candidate discovery, connection management
-//! - [`holepunch`]: NAT hole punching coordination and registry
+//! | Module | Responsibility |
+//! |--------|----------------|
+//! | [`transport`] | `PeerNetwork` implementation, smart_connect, DhtNetwork trait impl |
+//! | [`tls`] | TLS configuration, Ed25519 certificates, SNI identity pinning |
+//! | [`connection`] | Connection cache (LRU, 1000 max), health monitoring, rate limiting |
+//! | [`smartsock`] | Unified transport socket with seamless relay↔direct path switching |
+//! | [`holepunch`] | NAT hole punching coordination, rendezvous registry (5000 pending max) |
+//! | [`relay`] | UDP relay forwarder for CRLY-framed packet forwarding |
+//!
+//! # Re-exports
+//!
+//! Key types are re-exported for convenience:
+//! - [`PeerNetwork`]: Main network interface
+//! - [`SmartConnection`]: Transport-agnostic connection handle
+//! - [`UdpRelayForwarder`]: Relay packet forwarder for NAT traversal
+//! - [`ALPN`]: Protocol identifier (`corium`)
+//! - TLS utilities: `generate_ed25519_cert`, `create_server_config`, `create_client_config`
 
 pub mod connection;
 pub mod holepunch;
-pub mod path;
+pub mod relay;
+pub mod smartsock;
 pub mod tls;
 pub mod transport;
 
-// Re-export primary types from transport (main API surface)
+// Re-export types used by other internal modules and lib.rs
 pub use transport::{
     PeerNetwork,
     ALPN,
-    UPGRADE_PROBE_INTERVAL,
     generate_ed25519_cert,
     create_server_config,
     create_client_config,
@@ -35,53 +47,8 @@ pub use transport::{
     verify_peer_identity,
 };
 
-// Re-export connection types
-pub use connection::{
-    CachedConnection,
-    ConnectionHealthStats,
-    ConnectionHealthStatus,
-    ConnectionHealthSummary,
-    ConnectionRateLimiter,
-    SmartConnection,
-    CONNECTION_HEALTH_CHECK_INTERVAL,
-    MAX_CACHED_CONNECTIONS,
-    MAX_CONNECTIONS_PER_IP_PER_SECOND,
-    MAX_GLOBAL_CONNECTIONS_PER_SECOND,
-    MAX_TRACKED_IPS,
-};
-
-// Re-export path types
-pub use path::{
-    ConnectionManager,
-    ConnectionStats,
-    PathCandidate,
-    PathMessage,
-    PathProbe,
-    PathProber,
-    PathReply,
-    PathState,
-    PathStats,
-    ReachMe,
-    MAX_PATH_PROBERS,
-    MAX_PROBE_FAILURES,
-    PATH_PROBE_INTERVAL,
-    PATH_STALE_TIMEOUT,
-    PROBE_TIMEOUT,
-};
-
-// Re-export hole punch types
-pub use holepunch::{
-    HolePunchRegistry,
-    HolePunchResult,
-    HolePunchState,
-    HolePuncher,
-    HOLE_PUNCH_CLOCK_SKEW_TOLERANCE_MS,
-    HOLE_PUNCH_REGISTRY_TIMEOUT,
-    HOLE_PUNCH_RENDEZVOUS_TIMEOUT,
-    HOLE_PUNCH_STAGGER,
-    HOLE_PUNCH_TIMEOUT,
-    MAX_BY_PEERS_ENTRIES,
-    MAX_HOLE_PUNCH_PER_IDENTITY,
-    MAX_PENDING_HOLE_PUNCHES,
-    MAX_READY_HOLE_PUNCHES,
+pub use connection::SmartConnection;
+pub use relay::{
+    UdpRelayForwarder, RelayInfo, NatType, NatReport, CryptoError,
+    detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT,
 };

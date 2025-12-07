@@ -98,7 +98,7 @@ pub enum DhtRequest {
     /// Request to establish a relay session.
     ///
     /// Used when direct connection fails due to NAT. Both peers connect
-    /// outbound to the relay, which forwards encrypted packets.
+    /// outbound to the relay, which forwards encrypted packets via UDP.
     RelayConnect {
         /// The sender's peer ID.
         from_peer: Identity,
@@ -106,36 +106,6 @@ pub enum DhtRequest {
         target_peer: Identity,
         /// Session ID to correlate the two halves of the relay.
         session_id: [u8; 16],
-    },
-    /// Forward a packet through the relay.
-    ///
-    /// The payload is an encrypted QUIC packet; the relay cannot decrypt it.
-    RelayForward {
-        /// The sender's identity.
-        from: Identity,
-        /// Session ID for routing.
-        session_id: [u8; 16],
-        /// Encrypted payload (opaque to relay).
-        payload: Vec<u8>,
-    },
-    /// Close a relay session.
-    RelayClose {
-        /// The sender's identity (must be a participant in the session).
-        from_peer: Identity,
-        /// Session ID to close.
-        session_id: [u8; 16],
-    },
-    /// Relay data pushed from the relay server to a peer.
-    ///
-    /// This is sent by the relay to deliver packets from the other peer
-    /// in a relay session. The payload is an encrypted QUIC packet.
-    RelayData {
-        /// The sender's identity (the other peer in the session).
-        from: Identity,
-        /// Session ID for routing.
-        session_id: [u8; 16],
-        /// Encrypted payload (opaque to relay).
-        payload: Vec<u8>,
     },
     /// STUN-like request: ask the server what our public address looks like.
     ///
@@ -177,14 +147,6 @@ impl DhtRequest {
     ///
     /// This is used for Sybil protection: the returned identity must match
     /// the verified identity from the TLS connection.
-    ///
-    /// # Special Cases
-    ///
-    /// - `RelayData`: Returns `None` because this message is sent by a relay
-    ///   server to forward data from another peer. The `from` field contains
-    ///   the *originating peer's* identity, not the relay's. The relay is
-    ///   trusted to have authenticated the original sender. Validation of
-    ///   relay sessions should happen at the application layer.
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
             DhtRequest::Ping { from } => Some(from.identity),
@@ -192,11 +154,6 @@ impl DhtRequest {
             DhtRequest::FindValue { from, .. } => Some(from.identity),
             DhtRequest::Store { from, .. } => Some(from.identity),
             DhtRequest::RelayConnect { from_peer, .. } => Some(*from_peer),
-            DhtRequest::RelayForward { from, .. } => Some(*from),
-            // RelayData is sent by the relay server, but `from` is the other peer.
-            // The relay is trusted to authenticate the original sender.
-            DhtRequest::RelayData { .. } => None,
-            DhtRequest::RelayClose { from_peer, .. } => Some(*from_peer),
             DhtRequest::WhatIsMyAddr => None,
             DhtRequest::HolePunchRegister { from_peer, .. } => Some(*from_peer),
             DhtRequest::HolePunchStart { .. } => None,
@@ -223,21 +180,23 @@ pub enum DhtResponse {
     RelayAccepted {
         /// Confirmed session ID.
         session_id: [u8; 16],
+        /// UDP address for sending CRLY-framed relay data.
+        /// Clients should send raw UDP packets (not RPC) with CRLY framing to this address.
+        relay_data_addr: String,
     },
     /// Relay session established (both peers connected).
     RelayConnected {
         /// Session ID.
         session_id: [u8; 16],
+        /// UDP address for sending CRLY-framed relay data.
+        /// Clients should send raw UDP packets (not RPC) with CRLY framing to this address.
+        relay_data_addr: String,
     },
     /// Relay request rejected.
     RelayRejected {
         /// Reason for rejection.
         reason: String,
     },
-    /// Packet forwarded successfully.
-    RelayForwarded,
-    /// Relay session closed.
-    RelayClosed,
     /// Response to WhatIsMyAddr with the observed public address.
     ///
     /// This is the STUN-like response containing the client's public IP:port

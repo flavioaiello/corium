@@ -36,8 +36,8 @@
 //!        └──► Sybil Protection: verify_identity(identity, cert.pk) (P4)
 //! ```
 
-use corium::{
-    Keypair, Identity, RelayEndpoint,
+use corium::{Keypair, Identity, RelayEndpoint};
+use corium::advanced::{
     verify_identity,
     extract_public_key_from_cert, generate_ed25519_cert,
 };

@@ -15,9 +15,12 @@ const QUERY_STATS_WINDOW: usize = 100;
 
 /// Adaptive parameters for DHT operations based on network conditions.
 ///
-/// Dynamically adjusts:
-/// - **k** (bucket size): 10-30, increases with churn rate for routing resilience
-/// - **α** (parallelism): 2-5, increases with failure rate to improve lookup success
+/// Dynamically adjusts parameters based on observed success/failure rates:
+/// - **k** (bucket size): Ranges from 10-30, where `k = 10 + 20*churn_rate`
+/// - **α** (parallelism): Ranges from 2-5, where `α = 2 + 3*failure_rate`
+///
+/// Higher churn/failure rates trigger larger k and α values to maintain
+/// routing resilience and lookup success probability.
 pub(crate) struct AdaptiveParams {
     /// Current k parameter (bucket size), ranges from 10 to 30.
     k: usize,

@@ -33,48 +33,42 @@ let conn = network.smart_connect(&peer_record).await?;
 ### 1. Create a Node
 
 ```rust
-use corium::{
-    create_client_config, create_server_config, generate_ed25519_cert,
-    Contact, MeshNode, DiscoveryNode, Keypair, PeerNetwork,
-};
-use quinn::Endpoint;
-use std::net::SocketAddr;
+use corium::{Node, Keypair};
 
 // Generate identity
 let keypair = Keypair::generate();
-let identity = keypair.identity();
 
-// Setup QUIC endpoint (one-time boilerplate)
-let (certs, key) = generate_ed25519_cert(&keypair)?;
-let server_config = create_server_config(certs, key)?;
-let endpoint = Endpoint::server(server_config, "0.0.0.0:0".parse()?)?;
+// Start the node (binds to random port)
+let node = Node::bind("0.0.0.0:0", keypair).await?;
 
-// Create network with smart_connect capability
-let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
-let client_config = create_client_config(client_certs, client_key)?;
-let contact = Contact { id: keypair.node_id(), addr: endpoint.local_addr()?.to_string() };
-let network = PeerNetwork::with_identity(endpoint.clone(), contact.clone(), client_config, identity);
-
-// Create DHT node
-let dht = DiscoveryNode::new(keypair.node_id(), contact, network.clone(), 20, 3);
-
-// Start accepting connections
-let mesh = MeshNode::new(dht.clone())?;
-let _handle = mesh.spawn(endpoint);
+println!("Node listening on {}", node.local_addr()?);
+println!("Identity: {}", hex::encode(node.identity().as_bytes()));
 ```
 
-### 2. Connect to Peers (The Simple Way)
+### 2. Store and Retrieve Data
 
 ```rust
-use corium::{EndpointRecord, SmartConnection};
+// Store data (content-addressed)
+let key = node.put(b"hello world".to_vec()).await?;
 
-// Get peer's endpoint record (from DHT, out-of-band, etc.)
-let peer_record: EndpointRecord = /* ... */;
+// Retrieve data
+if let Some(data) = node.get(&key).await? {
+    println!("Retrieved: {:?}", data);
+}
+```
+
+### 3. Connect to Peers
+
+```rust
+use corium::SmartConnection;
+
+// Resolve peer's endpoint record from DHT
+let peer_record = node.resolve_peer(&peer_identity).await?.unwrap();
 
 // Connect—NAT traversal is automatic!
-let conn = network.smart_connect(&peer_record).await?;
+let conn = node.connect(&peer_record).await?;
 
-// Use the connection
+// Check connection type
 match &conn {
     SmartConnection::Direct(c) => println!("Direct to {}", c.remote_address()),
     SmartConnection::Relayed { .. } => println!("Via relay (E2E encrypted)"),
@@ -88,18 +82,27 @@ match &conn {
 - Implement relay logic
 - Manage hole punching
 
-### 3. Discover Peers via DHT
+### 4. PubSub Messaging
 
 ```rust
-// Publish your endpoint so others can find you
-let record = EndpointRecord::new(identity, vec![my_addr.to_string()]);
-let signed = keypair.sign_endpoint_record(&record)?;
-dht.publish_endpoint(&signed).await?;
+use corium::{Node, Keypair};
 
-// Find a peer by their Identity
-if let Some(record) = dht.resolve_identity(&peer_identity).await? {
-    let conn = network.smart_connect(&record).await?;
-}
+let keypair = Keypair::generate();
+let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
+
+// Subscribe to a topic
+node.subscribe("my-topic").await?;
+
+// Receive messages
+let mut rx = node.take_message_receiver().await?;
+tokio::spawn(async move {
+    while let Some(msg) = rx.recv().await {
+        println!("[{}] {}", msg.topic, String::from_utf8_lossy(&msg.data));
+    }
+});
+
+// Publish messages
+node.publish("my-topic", b"Hello everyone!".to_vec()).await?;
 ```
 
 ---
@@ -109,11 +112,11 @@ if let Some(record) = dht.resolve_identity(&peer_identity).await? {
 ### Chat / Messaging
 ```rust
 // 1. Each user publishes their endpoint
-dht.publish_endpoint(&my_signed_record).await?;
+node.publish_address(vec![my_addr.to_string()]).await?;
 
 // 2. To message someone, resolve their identity and connect
-let peer_record = dht.resolve_identity(&recipient).await?.unwrap();
-let conn = network.smart_connect(&peer_record).await?;
+let peer_record = node.resolve_peer(&recipient).await?.unwrap();
+let conn = node.connect(&peer_record).await?;
 
 // 3. Send message over the connection
 let (mut send, _) = conn.connection().open_bi().await?;
@@ -123,31 +126,11 @@ send.write_all(message_bytes).await?;
 ### File Sync / P2P Storage
 ```rust
 // Store content-addressed data in the DHT
-let key = hash_content(&file_bytes);
-dht.store(key, file_bytes).await?;
+let key = node.put(file_bytes).await?;
 
 // Retrieve from any peer that has it
-if let Some(data) = dht.get(&key).await? {
+if let Some(data) = node.get(&key).await? {
     // data retrieved
-}
-```
-
-### Pub/Sub (Topic Broadcasting)
-```rust
-use corium::pubsub::{GossipSub, GossipConfig};
-
-let mut pubsub = GossipSub::new(dht.clone(), keypair.clone(), GossipConfig::default());
-let mut rx = pubsub.take_message_receiver().unwrap();
-
-// Subscribe to a topic
-pubsub.subscribe("events").await;
-
-// Publish to the topic
-pubsub.publish("events", b"hello world".to_vec()).await?;
-
-// Receive messages
-while let Some(msg) = rx.recv().await {
-    println!("Received: {:?}", msg.data);
 }
 ```
 
@@ -155,7 +138,7 @@ while let Some(msg) = rx.recv().await {
 
 ## How NAT Traversal Works
 
-You don't need to understand this—`smart_connect` handles it. But if you're curious:
+You don't need to understand this—`node.connect()` handles it. But if you're curious:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -259,10 +242,10 @@ Corium is organized as a layered networking stack. **Most applications only inte
 │    ← DiscoveryNode, resolve_identity(), DHT lookups         │
 ├─────────────────────────────────────────────────────────────┤
 │                   Connection Layer (automatic)              │
-│       SmartConnection, PathProber, ConnectionManager        │
+│       SmartConnection, SmartSock (seamless path switching)  │
 ├─────────────────────────────────────────────────────────────┤
 │                   NAT Traversal Layer (automatic)           │
-│        ICE Agent, STUN, TURN Relay, Hole Punching           │
+│        Path Probing, Relay Tunnels, Direct UDP              │
 ├─────────────────────────────────────────────────────────────┤
 │                    Transport Layer (automatic)              │
 │                  QUIC (quinn), Ed25519 TLS                  │
@@ -272,105 +255,58 @@ Corium is organized as a layered networking stack. **Most applications only inte
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Layers marked "automatic" are handled by `smart_connect`**—you don't interact with them directly.
+**Layers marked "automatic" are handled by `node.connect()`**—you don't interact with them directly.
 
 ### Module Overview
 
 | Module | Description | You Use Directly? |
 |--------|-------------|-------------------|
-| `net` | **Primary API**: `smart_connect()`, `PeerNetwork` | ✅ Yes |
-| `identity` | `Keypair`, `Identity`, `EndpointRecord` | ✅ Yes |
-| `core` | `DiscoveryNode`, DHT operations | ✅ Yes |
-| `pubsub` | GossipSub topic-based messaging | ✅ If using pub/sub |
-| `node` | `MeshNode` for accepting connections | ✅ At startup |
-| `relay` | NAT detection, relay nodes | ⚠️ Rarely (automatic) |
-| `protocol` | RPC message definitions | ❌ Internal |
+| `node` | **Primary API**: `Node` facade | ✅ Yes |
+| `corium` | `Keypair`, `Identity`, `Contact`, `Key` | ✅ Yes (types) |
+| `advanced` | Lower-level access for power users | ⚠️ Rarely |
 
 ### Public API
 
 ```rust
-// Identity
-pub use identity::{
-    Keypair,                 // Ed25519 keypair for node identity
-    Identity,                // 32-byte Ed25519 public key (peer address)
-    EndpointRecord,          // Signed record of peer's network addresses
-    RelayEndpoint,           // Relay node info for NAT traversal
-    node_id_from_public_key, // Derive NodeId from public key
-    verify_node_id,          // Verify NodeId matches public key
-};
+// Primary API - the Node facade
+pub use node::{Node, PubSubHandler};
 
-// Core types and helpers
-pub use core::{
-    derive_node_id,        // Hash bytes to NodeId using BLAKE3
-    hash_content,          // Hash content to Key using BLAKE3
-    is_valid_node_id,      // Check if NodeId is valid (not placeholder/reserved)
-    verify_key_value_pair, // Verify key matches content hash
-    Contact,               // Peer identity + address
-    DhtNetwork,            // Network abstraction trait
-    DiscoveryNode,         // Main DHT node handle
-    Key,                   // 32-byte content key
-    NodeId,                // 32-byte node identifier
-    RoutingTable,          // Kademlia routing table
-    PLACEHOLDER_NODE_ID,   // Reserved invalid NodeId (all zeros)
-};
+// Identity types
+pub use identity::{Identity, Keypair, EndpointRecord, RelayEndpoint};
 
-// Network layer
-pub use net::{
-    create_client_config,        // Create QUIC client config (requires certs + key)
-    create_server_config,        // Create QUIC server config
-    generate_ed25519_cert,       // Generate Ed25519 TLS cert from keypair
-    extract_public_key_from_cert, // Extract public key from peer cert
-    verify_peer_identity,        // Verify peer's cert matches NodeId
-    PeerNetwork,                // quinn-based network implementation
-    SmartConnection,             // Direct or relayed connection
-    ConnectionManager,           // Parallel path probing for connections
-    ConnectionStats,             // Connection statistics
-    PathProber, PathCandidate, PathState, PathStats, // Path probing
-    PathProbe, PathReply, ReachMe, PathMessage, // Path discovery protocol
-    ALPN,                        // ALPN protocol identifier
-    PATH_PROBE_INTERVAL,         // Path probe frequency (5s)
-    PATH_STALE_TIMEOUT,          // Path stale timeout (30s)
-    PROBE_TIMEOUT,               // Individual probe timeout (3s)
-    UPGRADE_PROBE_INTERVAL,      // Relay->direct upgrade interval (30s)
-};
+// DHT types
+pub use dht::{Contact, Key, TelemetrySnapshot};
 
-// Relay and NAT traversal
-pub use relay::{
-    RelayServer, RelayClient, RelayInfo, RelayCapabilities, // Relay implementation
-    NatType, NatReport, detect_nat_type, // NAT type detection
-    gather_host_candidates,       // Gather local ICE candidates
-    ice_connection_strategy,      // Determine ICE connection strategy
-    choose_connection_strategy,   // Choose direct vs relay
-    ConnectionStrategy,           // Direct vs relay connection choice
-    IceCandidate, IceAgent, IceRole, IceState, // ICE types and state
-    CandidatePair, CandidateType, CheckState, TransportProtocol, // ICE checks
-    TurnAllocation,               // TURN-style allocation
-    DIRECT_CONNECT_TIMEOUT,       // Direct connection timeout (5s)
-    STUN_TIMEOUT,                 // STUN request timeout (3s)
-    ICE_CHECK_INTERVAL,           // ICE check interval (50ms)
-    ICE_KEEPALIVE_INTERVAL,       // ICE keepalive interval (15s)
-    MAX_RELAY_SESSIONS,           // Max relay sessions (100)
-    RELAY_SESSION_TIMEOUT,        // Relay session timeout (5min)
-    TURN_ALLOCATION_LIFETIME,     // TURN allocation lifetime (10min)
-};
+// Connection types
+pub use net::SmartConnection;
 
-// Publish/Subscribe
-pub use pubsub::{
-    GossipSub, GossipConfig,    // GossipSub router and config
-    PubSubMessage,              // Protocol messages (Graft, Prune, Publish, etc.)
-    ReceivedMessage, MessageId, // Received message and unique ID
-    SignatureError,             // Signature verification error
-    sign_pubsub_message,        // Sign a pubsub message
-    verify_pubsub_signature,    // Verify pubsub message signature
-    DEFAULT_MESH_DEGREE,        // Default mesh size per topic (6)
-    DEFAULT_GOSSIP_INTERVAL,    // Gossip interval (1s)
-    DEFAULT_HEARTBEAT_INTERVAL, // Heartbeat interval (1s)
-};
+// NAT types
+pub use relay::NatType;
 
-// Mesh node
-pub use node::{
-    MeshNode,       // Mesh node for accepting connections
-    PubSubHandler,  // Trait for handling PubSub messages
+// PubSub types
+pub use pubsub::{MessageId, ReceivedMessage};
+```
+
+### Advanced API
+
+For power users who need lower-level access:
+
+```rust
+use corium::advanced::{
+    // TLS/certificate utilities
+    generate_ed25519_cert, create_client_config, create_server_config,
+    
+    // Network layer
+    PeerNetwork,
+    
+    // DHT
+    DhtNode, DhtNetwork, hash_content,
+    
+    // PubSub
+    GossipSub, GossipConfig,
+    
+    // Relay/NAT
+    RelayClient, RelayServer, detect_nat_type,
 };
 ```
 
@@ -679,7 +615,7 @@ pub struct RelayCapabilities {
 ### Smart Connections
 
 ```rust
-use corium::{PeerNetwork, SmartConnection, PathProber};
+use corium::SmartConnection;
 
 // Automatically chooses direct or relay based on NAT
 let connection = network.smart_connect(&endpoint_record).await?;
@@ -705,28 +641,31 @@ if connection.is_direct() {
 }
 ```
 
-### Path Probing
+### Automatic Path Switching (SmartSock)
+
+Corium uses **SmartSock** to provide seamless relay↔direct path switching without reconnection.
+Path probing happens automatically in the background:
+
+- **Probe interval**: Every 5 seconds
+- **RTT smoothing**: Exponential moving average (0.8 old + 0.2 new)
+- **Path selection**: Direct preferred unless relay is 50ms+ faster
+- **Failure detection**: 3 consecutive probe failures marks path dead
 
 ```rust
-use corium::{PathProber, PathState};
+// SmartSock is integrated into the Node automatically
+let node = Node::bind("0.0.0.0:0", keypair).await?;
 
-// Create prober for existing connection
-let mut prober = PathProber::new(connection, initial_addr, is_relay);
+// Path probing starts automatically when you connect to a peer
+let conn = node.connect(&peer_record).await?;
 
-// Add alternate paths to probe
-prober.add_direct_candidates(&endpoint_record.addrs);
+// Access SmartSock for advanced path management
+let smartsock = node.smartsock();
 
-// Generate probes for all paths needing measurement
-let probes = prober.generate_probes();
-for (addr, probe) in probes {
-    // Send probe to addr...
-}
+// Register additional direct addresses for a peer
+smartsock.add_direct_candidate(&peer_identity, new_addr).await;
 
-// Get path statistics
-for stats in prober.path_stats() {
-    println!("{}: {:?} rtt={:?}ms relay={}",
-        stats.addr, stats.state, stats.rtt_ms, stats.is_relay);
-}
+// Check if using relay or direct
+// (SmartSock switches transparently - you don't need to check)
 ```
 
 ---

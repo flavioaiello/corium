@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{make_identity, NetworkRegistry, TestNode};
-use corium::identity::Keypair;
+use corium::advanced::Keypair;
 use corium::Identity;
 
 // ============================================================================
@@ -631,7 +631,7 @@ mod sybil_routing_table {
         
         // Verification would catch this
         assert!(
-            !corium::identity::verify_identity(&chosen_identity, &keypair.public_key_bytes()),
+            !corium::advanced::verify_identity(&chosen_identity, &keypair.public_key_bytes()),
             "Chosen ID should fail verification"
         );
     }
@@ -726,11 +726,11 @@ mod sybil_routing_table {
         let keypair = Keypair::generate();
         
         assert!(
-            !corium::identity::verify_identity(&all_zeros, &keypair.public_key_bytes()),
+            !corium::advanced::verify_identity(&all_zeros, &keypair.public_key_bytes()),
             "All-zeros Identity should not verify against any real keypair"
         );
         assert!(
-            !corium::identity::verify_identity(&all_ones, &keypair.public_key_bytes()),
+            !corium::advanced::verify_identity(&all_ones, &keypair.public_key_bytes()),
             "All-ones Identity should not verify against any real keypair"
         );
     }

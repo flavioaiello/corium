@@ -2,7 +2,15 @@
 //!
 //! This module defines the [`DhtNetwork`] trait that abstracts the transport layer,
 //! allowing the core DHT logic to work with different network implementations
-//! (e.g., Quinn QUIC, mock for testing).
+//! (e.g., [`PeerNetwork`][crate::net::PeerNetwork] for QUIC, mock for testing).
+//!
+//! # Design
+//!
+//! The trait defines four core Kademlia RPCs:
+//! - `find_node`: Locate k-closest peers to a target identity
+//! - `find_value`: Retrieve a value or get closer contacts if not found
+//! - `store`: Replicate a key-value pair to a peer
+//! - `ping`: Check liveness for bucket eviction decisions
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -1,7 +1,26 @@
 //! Connection caching, health monitoring, and transport-agnostic handles.
 //!
-//! Extracted from the legacy `net.rs` monolith. Provides [`SmartConnection`]
-//! plus health metadata used for connection reuse.
+//! This module provides:
+//!
+//! - [`CachedConnection`]: Connection wrapper with health tracking and RTT metrics
+//! - [`SmartConnection`]: Transport-agnostic handle (direct QUIC or relayed)
+//! - [`ConnectionRateLimiter`]: Token bucket rate limiter for connection admission
+//!
+//! # Connection Cache
+//!
+//! QUIC connections are long-lived and multiplexed, so we cache them with LRU eviction:
+//! - **Capacity**: 1,000 connections ([`MAX_CACHED_CONNECTIONS`])
+//! - **Stale timeout**: 60 seconds of inactivity triggers passive health check
+//! - **Health check interval**: 15 seconds between checks
+//! - **RTT sample history**: 10 samples with EMA smoothing
+//! - **Unhealthy threshold**: 3 consecutive failures or RTT > 2,000ms
+//!
+//! # Rate Limiting
+//!
+//! Token bucket algorithm bounds new connections:
+//! - **Global limit**: 100 connections/second
+//! - **Per-IP limit**: 20 connections/second
+//! - **IP tracking**: LRU cache of 1,000 IPs
 
 use std::net::{SocketAddr, IpAddr};
 use std::num::NonZeroUsize;
@@ -218,6 +237,17 @@ impl CachedConnection {
 }
 
 /// A transport-agnostic connection to a peer.
+///
+/// Represents three connection states:
+/// - [`Direct`][Self::Direct]: QUIC connection with no relay hop
+/// - [`RelayPending`][Self::RelayPending]: Relay session requested, awaiting peer
+/// - [`Relayed`][Self::Relayed]: Active relay session with E2E encryption
+///
+/// # Upgrade Path
+///
+/// Relayed connections can upgrade to direct when conditions improve.
+/// Use [`can_attempt_upgrade`][Self::can_attempt_upgrade] to check eligibility
+/// and [`PeerNetwork::try_upgrade_to_direct`] to attempt the upgrade.
 #[derive(Debug, Clone)]
 pub enum SmartConnection {
     Direct(Connection),
@@ -333,12 +363,19 @@ impl TokenBucket {
 
 /// Connection rate limiter using token bucket algorithm.
 ///
-/// This is more memory-efficient than sliding window (VecDeque of timestamps):
-/// - Global: 16 bytes (f64 + Instant) vs up to 800 bytes (100 * 8-byte Instants)
-/// - Per-IP: 16 bytes each vs up to 160 bytes each (20 * 8-byte Instants)
+/// Bounds connection admission to prevent DoS attacks:
+/// - **Global**: 100 tokens, refilled at 100/sec ([`MAX_GLOBAL_CONNECTIONS_PER_SECOND`])
+/// - **Per-IP**: 20 tokens, refilled at 20/sec ([`MAX_CONNECTIONS_PER_IP_PER_SECOND`])
+/// - **IP tracking**: LRU cache of 1,000 IPs ([`MAX_TRACKED_IPS`])
 ///
-/// Uses tokio::sync::Mutex for async safety - avoids blocking the async
-/// runtime when checking rate limits in async connection handlers.
+/// # Memory Efficiency
+///
+/// Token bucket uses fixed 16 bytes per bucket (f64 + Instant) vs sliding window's
+/// O(rate) memory (e.g., 800 bytes for 100 timestamps).
+///
+/// # Async Safety
+///
+/// Uses `tokio::sync::Mutex` to avoid blocking the async runtime during rate checks.
 #[derive(Debug)]
 pub struct ConnectionRateLimiter {
     state: tokio::sync::Mutex<RateLimitState>,

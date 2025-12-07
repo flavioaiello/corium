@@ -56,7 +56,7 @@
 //! # Example
 //!
 //! ```rust
-//! use corium::identity::Keypair;
+//! use corium::Keypair;
 //!
 //! // Generate a new random keypair
 //! let keypair = Keypair::generate();

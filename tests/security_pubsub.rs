@@ -9,8 +9,8 @@
 
 use std::time::Duration;
 
-use corium::identity::Keypair;
-use corium::pubsub::{GossipConfig, MessageId, PubSubMessage};
+use corium::advanced::{Keypair, GossipConfig, PubSubMessage};
+use corium::MessageId;
 
 // ============================================================================
 // Configuration Security Tests
@@ -615,7 +615,7 @@ mod message_roundtrip {
 
 mod message_authentication {
     use super::*;
-    use corium::pubsub::{sign_pubsub_message, verify_pubsub_signature, SignatureError};
+    use corium::advanced::{sign_pubsub_message, verify_pubsub_signature, SignatureError};
 
     /// Test that signed messages can be verified by the correct identity.
     #[test]

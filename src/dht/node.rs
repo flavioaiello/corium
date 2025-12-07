@@ -30,14 +30,24 @@ use crate::identity::{EndpointRecord, Identity, Keypair};
 /// generic over the network layer so tests can use an in-memory mock while
 /// production uses [`crate::net::PeerNetwork`].
 ///
+/// # Core Responsibilities
+///
+/// 1. **Peer Discovery**: Iterative FIND_NODE lookups with tier-aware parallelism
+/// 2. **Content Storage**: STORE/FIND_VALUE with k-replication to closest nodes
+/// 3. **Routing Table**: 256 k-buckets with LRU eviction and ping-before-evict
+/// 4. **Address Publishing**: Signed EndpointRecord storage for peer resolution
+/// 5. **Adaptive Parameters**: Dynamic k (10-30) and α (2-5) based on churn
+/// 6. **Latency Tiering**: k-means clustering for latency-aware routing
+/// 7. **Rate Limiting**: Per-peer routing table insertion limits
+///
 /// # Key Methods
 ///
 /// * [`observe_contact`](Self::observe_contact) - Update routing table when peers are discovered
 /// * [`iterative_find_node`](Self::iterative_find_node) - Perform iterative lookup with adaptive tuning
-/// * [`put`](Self::put) - Store a key-value pair with replication
+/// * [`put`](Self::put) - Store a key-value pair with k-replication
 /// * [`get`](Self::get) - Retrieve a value from the DHT
-/// * [`publish_address`](Self::publish_address) - Publish node addresses to the DHT
-/// * [`resolve_peer`](Self::resolve_peer) - Resolve a peer's addresses from the DHT
+/// * [`publish_address`](Self::publish_address) - Publish node addresses as signed EndpointRecord
+/// * [`resolve_peer`](Self::resolve_peer) - Resolve a peer's addresses with signature verification
 /// * [`handle_find_node_request`](Self::handle_find_node_request) - Handle incoming FIND_NODE RPC
 /// * [`handle_find_value_request`](Self::handle_find_value_request) - Handle incoming FIND_VALUE RPC
 /// * [`handle_store_request`](Self::handle_store_request) - Handle incoming STORE RPC

@@ -81,14 +81,17 @@ pub struct TieringStats {
 // Tiering Manager
 // ============================================================================
 
-/// Manages latency-based tiering of DHT peers using k-means clustering.
+/// Manages latency-based tiering of DHT peers using dynamic k-means clustering.
 ///
 /// The tiering manager:
-/// 1. Collects RTT samples from RPC interactions
-/// 2. Periodically recomputes tier assignments using k-means
-/// 3. Assigns new contacts to a default middle tier
-/// 4. Cleans up stale data for nodes not seen in 24 hours
+/// 1. Collects RTT samples from RPC interactions (up to 32 samples per peer)
+/// 2. Recomputes tier assignments every 5 minutes using dynamic k-means
+/// 3. Dynamically selects optimal tier count (1-7) using BIC-like penalty
+/// 4. Assigns new contacts to the middle tier (centroids.len() / 2)
+/// 5. Cleans up stale data for nodes not seen in 24 hours
+/// 6. Evicts oldest peers when tracking exceeds 10,000 limit
 ///
+/// Lower tier indices (e.g., tier 0) represent faster, lower-latency peers.
 /// This enables latency-aware routing where fast peers are preferred.
 pub(crate) struct TieringManager {
     /// Current tier assignment for each known node.
