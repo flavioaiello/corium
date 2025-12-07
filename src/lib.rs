@@ -43,13 +43,31 @@
 //! For persistent identity, use [`Node::bind_with_keypair`] with a keypair
 //! from the `tests` feature module.
 
-// Internal modules
+// Internal modules - conditionally pub when tests feature is enabled
+#[cfg(feature = "tests")]
+pub mod dht;
+#[cfg(feature = "tests")]
+pub mod identity;
+#[cfg(feature = "tests")]
+pub mod messages;
+#[cfg(feature = "tests")]
+pub mod net;
+#[cfg(feature = "tests")]
+pub mod pubsub;
+
+#[cfg(not(feature = "tests"))]
 pub(crate) mod dht;
+#[cfg(not(feature = "tests"))]
 pub(crate) mod identity;
+#[cfg(not(feature = "tests"))]
 pub(crate) mod messages;
+#[cfg(not(feature = "tests"))]
 pub(crate) mod net;
-pub(crate) mod node;
+#[cfg(not(feature = "tests"))]
 pub(crate) mod pubsub;
+
+// Always crate-internal (never exposed via tests feature)
+pub(crate) mod node;
 pub(crate) mod server;
 
 /// Returns the current time in milliseconds since UNIX_EPOCH (crate-internal).

@@ -836,21 +836,44 @@ Example output:
 
 ### Chatroom Example
 
-A simple chatroom demonstrating mesh networking:
+A chatroom demonstrating both **room broadcast** (GossipSub pubsub) and **direct messaging** (QUIC connections):
 
 ```bash
-# Start first node
-cargo run --example chatroom -- --name alice --room lobby --port 4433
+# Terminal 1: Start first node (Alice)
+cargo run --example chatroom -- --name alice --room lobby
 
-# Connect another node (in a different terminal)
-cargo run --example chatroom -- --name bob --room lobby --peer 127.0.0.1:4433
+# Note the bootstrap string printed, e.g.:
+# 127.0.0.1:54321/5821a288e16c6491ae72f4cf060b8d6523cd416c418c1ec3b8b5bc7608a55b7d
+
+# Terminal 2: Connect another node (Bob) - use Alice's bootstrap string
+cargo run --example chatroom -- --name bob --room lobby \
+    --bootstrap 127.0.0.1:54321/5821a288e16c6491ae72f4cf060b8d6523cd416c418c1ec3b8b5bc7608a55b7d
 ```
 
-The chatroom example shows:
-- Peer discovery via DHT
-- Direct message routing
-- Room-based message filtering
-- JSON message serialization over QUIC streams
+**Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `Hello!` | Broadcast to everyone in the room |
+| `/dm <identity> <addr> <msg>` | Send private direct message |
+| `/peers` | List known peers |
+| `/quit` | Exit |
+
+**Example session:**
+
+```
+# Room broadcast (everyone sees it)
+alice@5821a288: Hello everyone!
+
+# Direct message (only recipient sees it)
+/dm 6932b399... 127.0.0.1:54322 Hey Bob, this is private!
+```
+
+The chatroom example demonstrates:
+- **Room chat**: GossipSub pubsub with `node.subscribe()` / `node.publish()`
+- **Direct messages**: QUIC streams via `node.connect()` / `conn.open_bi()`
+- **Peer discovery**: Automatic via DHT bootstrap
+- **Identity verification**: TLS-pinned connections
 
 ### Address Publishing & Resolution
 

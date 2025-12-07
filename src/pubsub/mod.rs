@@ -1,6 +1,9 @@
 //! GossipSub-style publish/subscribe for Corium.
 //!
-//! This module implements a gossip-based pubsub system inspired by libp2p's GossipSub.
+//! This module is internal to the crate. Types are exposed externally only via
+//! the `tests` feature module in `lib.rs`.
+//!
+//! Implements a gossip-based pubsub system inspired by libp2p's GossipSub.
 //! Messages propagate through the network via epidemic broadcast, achieving O(log n)
 //! hop delivery with high reliability.
 //!
@@ -66,9 +69,25 @@ mod signature;
 mod subscription;
 mod types;
 
-// Re-export public types
+// Re-export types for tests feature (pub) or internal use (pub(crate))
+#[cfg(feature = "tests")]
 pub use config::GossipConfig;
+#[cfg(feature = "tests")]
 pub use gossipsub::{GossipSub, PubSubHandler};
+#[cfg(feature = "tests")]
 pub use message::{MessageId, PubSubMessage};
+#[cfg(feature = "tests")]
 pub use signature::{SignatureError, sign_pubsub_message, verify_pubsub_signature};
+#[cfg(feature = "tests")]
 pub use types::ReceivedMessage;
+
+#[cfg(not(feature = "tests"))]
+pub(crate) use config::GossipConfig;
+#[cfg(not(feature = "tests"))]
+pub(crate) use gossipsub::{GossipSub, PubSubHandler};
+#[cfg(not(feature = "tests"))]
+pub(crate) use message::{MessageId, PubSubMessage};
+#[cfg(not(feature = "tests"))]
+pub(crate) use signature::{SignatureError, sign_pubsub_message, verify_pubsub_signature};
+#[cfg(not(feature = "tests"))]
+pub(crate) use types::ReceivedMessage;

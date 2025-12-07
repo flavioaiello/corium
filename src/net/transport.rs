@@ -80,8 +80,19 @@ use crate::identity::{EndpointRecord, Identity};
 use crate::messages::{DhtRequest, DhtResponse};
 use crate::net::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
 
-// Re-export TLS utilities for public API
+// Re-export TLS utilities - pub when tests feature, pub(crate) otherwise
+#[cfg(feature = "tests")]
 pub use super::tls::{
+    ALPN,
+    generate_ed25519_cert,
+    create_server_config,
+    create_client_config,
+    extract_public_key_from_cert,
+    verify_peer_identity,
+};
+
+#[cfg(not(feature = "tests"))]
+pub(crate) use super::tls::{
     ALPN,
     generate_ed25519_cert,
     create_server_config,
