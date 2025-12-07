@@ -9,14 +9,14 @@ use anyhow::{Context, Result};
 use quinn::Endpoint;
 use tracing::info;
 
-use crate::core::{Contact, DhtNode, Key, TelemetrySnapshot};
+use crate::dht::{Contact, DhtNode, Key, TelemetrySnapshot};
 use crate::identity::{EndpointRecord, Identity, Keypair};
-use crate::net::QuinnNetwork;
+use crate::net::PeerNetwork;
 use crate::pubsub::{GossipConfig, GossipSub, ReceivedMessage};
 use crate::server::Server;
 
 // Re-export PubSubHandler for users who want to implement custom handlers
-pub use crate::server::PubSubHandler;
+pub use crate::pubsub::PubSubHandler;
 
 /// Default Kademlia bucket size / replication factor.
 const DEFAULT_K: usize = 20;
@@ -64,7 +64,7 @@ const DEFAULT_ALPHA: usize = 3;
 /// # Architecture
 ///
 /// Internally, `Node` wires together:
-/// - **QuinnNetwork**: QUIC transport with connection caching
+/// - **PeerNetwork**: QUIC transport with connection caching
 /// - **DhtNode**: Kademlia DHT for peer discovery and storage
 /// - **Server**: RPC handler for incoming connections
 /// - **GossipSub** (optional): Pub/sub messaging layer
@@ -79,11 +79,11 @@ pub struct Node {
     /// Our contact information.
     contact: Contact,
     /// The underlying DHT node.
-    dht: DhtNode<QuinnNetwork>,
+    dht: DhtNode<PeerNetwork>,
     /// The network transport layer.
-    network: QuinnNetwork,
+    network: PeerNetwork,
     /// Optional GossipSub pubsub handler.
-    pubsub: Option<Arc<GossipSub<QuinnNetwork>>>,
+    pubsub: Option<Arc<GossipSub<PeerNetwork>>>,
     /// Message receiver for pubsub (taken from GossipSub at construction).
     pubsub_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
     /// Handle to the server task.
@@ -155,7 +155,7 @@ impl Node {
         };
         
         // Create network and DHT
-        let network = QuinnNetwork::with_identity(
+        let network = PeerNetwork::with_identity(
             endpoint.clone(),
             contact.clone(),
             client_config,

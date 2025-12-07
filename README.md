@@ -35,7 +35,7 @@ let conn = network.smart_connect(&peer_record).await?;
 ```rust
 use corium::{
     create_client_config, create_server_config, generate_ed25519_cert,
-    Contact, MeshNode, DiscoveryNode, Keypair, QuinnNetwork,
+    Contact, MeshNode, DiscoveryNode, Keypair, PeerNetwork,
 };
 use quinn::Endpoint;
 use std::net::SocketAddr;
@@ -53,7 +53,7 @@ let endpoint = Endpoint::server(server_config, "0.0.0.0:0".parse()?)?;
 let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
 let client_config = create_client_config(client_certs, client_key)?;
 let contact = Contact { id: keypair.node_id(), addr: endpoint.local_addr()?.to_string() };
-let network = QuinnNetwork::with_identity(endpoint.clone(), contact.clone(), client_config, identity);
+let network = PeerNetwork::with_identity(endpoint.clone(), contact.clone(), client_config, identity);
 
 // Create DHT node
 let dht = DiscoveryNode::new(keypair.node_id(), contact, network.clone(), 20, 3);
@@ -278,7 +278,7 @@ Corium is organized as a layered networking stack. **Most applications only inte
 
 | Module | Description | You Use Directly? |
 |--------|-------------|-------------------|
-| `net` | **Primary API**: `smart_connect()`, `QuinnNetwork` | ✅ Yes |
+| `net` | **Primary API**: `smart_connect()`, `PeerNetwork` | ✅ Yes |
 | `identity` | `Keypair`, `Identity`, `EndpointRecord` | ✅ Yes |
 | `core` | `DiscoveryNode`, DHT operations | ✅ Yes |
 | `pubsub` | GossipSub topic-based messaging | ✅ If using pub/sub |
@@ -321,7 +321,7 @@ pub use net::{
     generate_ed25519_cert,       // Generate Ed25519 TLS cert from keypair
     extract_public_key_from_cert, // Extract public key from peer cert
     verify_peer_identity,        // Verify peer's cert matches NodeId
-    QuinnNetwork,                // quinn-based network implementation
+    PeerNetwork,                // quinn-based network implementation
     SmartConnection,             // Direct or relayed connection
     ConnectionManager,           // Parallel path probing for connections
     ConnectionStats,             // Connection statistics
@@ -679,7 +679,7 @@ pub struct RelayCapabilities {
 ### Smart Connections
 
 ```rust
-use corium::{QuinnNetwork, SmartConnection, PathProber};
+use corium::{PeerNetwork, SmartConnection, PathProber};
 
 // Automatically chooses direct or relay based on NAT
 let connection = network.smart_connect(&endpoint_record).await?;
@@ -993,7 +993,7 @@ Multi-layer rate limiting prevents DoS attacks at the connection level:
 
 ```rust
 // Rate limiter rejects excessive connection attempts
-if !rate_limiter.check(remote_addr.ip()).await {
+if !rate_limiter.allow(remote_addr.ip()).await {
     warn!(remote = %remote_addr, "rate limiting: rejecting connection");
     continue;
 }

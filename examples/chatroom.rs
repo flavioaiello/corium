@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use corium::{
-    create_client_config, create_server_config, generate_ed25519_cert,
-    hash_content, Contact, MeshNode, DhtNode, Identity, Keypair, QuinnNetwork,
+    create_client_config, generate_ed25519_cert,
+    hash_content, Contact, Identity, Keypair, Node,
 };
 
 /// CLI arguments for the chatroom example.
@@ -90,17 +90,15 @@ async fn main() -> Result<()> {
     let keypair = Keypair::generate();
     let identity = keypair.identity();
 
-    // Generate self-signed Ed25519 certificate for QUIC
-    let (certs, key) = generate_ed25519_cert(&keypair)?;
-    let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
-    let server_config = create_server_config(certs, key)?;
-    // Use client config that enforces identity verification via SNI pinning.
-    let client_config = create_client_config(client_certs, client_key)?;
-
-    // Bind to the specified port
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
-    let endpoint = Endpoint::server(server_config, bind_addr)?;
+    // Bind full Corium node (facade handles server/DHT setup)
+    let bind_addr = format!("0.0.0.0:{}", args.port);
+    let node = Node::bind(&bind_addr, keypair.clone()).await?;
+    let endpoint = node.endpoint().clone();
     let local_addr = endpoint.local_addr()?;
+
+    // Client config for outbound chat connects (identity-pinned)
+    let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
+    let client_config = create_client_config(client_certs, client_key)?;
 
     println!("Chatroom node ready");
     println!("  Nickname        : {}", args.name);
@@ -109,20 +107,7 @@ async fn main() -> Result<()> {
     println!("  Listening addr  : {local_addr}");
     println!("Share the listening address with peers so they can /add it.");
 
-    let self_contact = Contact {
-        identity,
-        addr: local_addr.to_string(),
-    };
-
-    let network = QuinnNetwork::new(endpoint.clone(), self_contact.clone(), client_config.clone());
-
-    // DHT is still used for peer discovery, but not for storing chat messages.
-    let dht = DhtNode::new(identity, self_contact.clone(), network, 20, 3);
-
-    // Start DHT mesh node
-    let dht_node = MeshNode::new(dht.clone())
-        .context("failed to initialize relay server")?;
-    let _dht_handle = dht_node.spawn(endpoint.clone());
+    let self_contact = node.contact().clone();
 
     // Start chat server (reusing the same endpoint)
     tokio::spawn(run_chat_server(endpoint.clone()));
@@ -137,9 +122,8 @@ async fn main() -> Result<()> {
     println!("Type anything else to send it to the room.\n");
 
     run_repl(
-        endpoint.clone(),
+        node,
         client_config,
-        dht.clone(),
         peers.clone(),
         args.name.clone(),
         args.room.clone(),
@@ -168,14 +152,14 @@ fn room_discovery_key(room: &str) -> Identity {
 }
 
 async fn run_repl(
-    endpoint: Endpoint,
+    node: Node,
     client_config: quinn::ClientConfig,
-    dht: DhtNode<QuinnNetwork>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
     nickname: String,
     room: String,
     _self_contact: Contact,
 ) -> Result<()> {
+    let endpoint = node.endpoint().clone();
     let stdin = tokio::io::stdin();
     let mut stdin_reader = tokio::io::BufReader::new(stdin).lines();
 
@@ -231,8 +215,8 @@ async fn run_repl(
         // 2. DHT-based peers: ask the DHT for nodes close to a room-discovery key
         //    via a regular iterative_find_node lookup.
         let discovery_key = room_discovery_key(&room);
-        let dynamic_peers = dht
-            .iterative_find_node(discovery_key)
+        let dynamic_peers = node
+            .find_peers(discovery_key)
             .await
             .unwrap_or_default();
 

@@ -73,7 +73,7 @@
 //! For power users who need lower-level access, the library also exports:
 //!
 //! - [`DhtNode`]: Direct DHT operations
-//! - [`QuinnNetwork`]: QUIC transport layer
+//! - [`PeerNetwork`]: QUIC transport layer
 //! - [`GossipSub`]: PubSub implementation
 //!
 //! Most users should use [`Node`] which wires these together automatically.
@@ -91,16 +91,16 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) mod core;
+pub(crate) mod dht;
 pub mod identity;
 pub mod net;
-pub mod protocol;
+pub mod messages;
 pub mod pubsub;
 pub mod relay;
 pub(crate) mod server;
 pub mod node;
 
-pub use core::{
+pub use dht::{
     hash_content, is_valid_identity, verify_key_value_pair, xor_distance, Contact, DhtNetwork,
     DhtNode, Key, RoutingTable,
 };
@@ -113,7 +113,7 @@ pub use net::{
     ConnectionManager, ConnectionStats, PathCandidate, PathProber, PathState, PathStats,
     // Path discovery protocol
     PathProbe, PathReply, PathMessage, ReachMe,
-    QuinnNetwork, SmartConnection, ALPN, PATH_PROBE_INTERVAL, PATH_STALE_TIMEOUT,
+    PeerNetwork, SmartConnection, ALPN, PATH_PROBE_INTERVAL, PATH_STALE_TIMEOUT,
     PROBE_TIMEOUT, UPGRADE_PROBE_INTERVAL,
 };
 pub use relay::{
@@ -142,4 +142,4 @@ pub use pubsub::{
     DEFAULT_GOSSIP_INTERVAL, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MESH_DEGREE,
 };
 // Re-export TelemetrySnapshot for telemetry access
-pub use core::TelemetrySnapshot;
+pub use dht::TelemetrySnapshot;

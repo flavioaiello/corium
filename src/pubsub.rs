@@ -70,9 +70,30 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, trace, warn};
 
-use crate::core::{hash_content, DhtNetwork, DhtNode};
+use crate::dht::{hash_content, DhtNetwork, DhtNode};
 use crate::identity::{Identity, Keypair};
-use crate::node::PubSubHandler;
+
+// ============================================================================
+// PubSub Handler Trait
+// ============================================================================
+
+/// Trait for handling incoming PubSub messages.
+///
+/// Implement this trait to receive and process GossipSub messages.
+/// The [`GossipSub`](crate::pubsub::GossipSub) struct implements this trait.
+#[async_trait::async_trait]
+pub trait PubSubHandler: Send + Sync {
+    /// Handle an incoming pubsub message from a peer.
+    ///
+    /// # Arguments
+    /// * `from` - The TLS-verified identity of the peer who sent this message
+    /// * `message` - The pubsub protocol message
+    ///
+    /// # Returns
+    /// * `Ok(())` if the message was processed (may have been dropped due to dedup, etc.)
+    /// * `Err(_)` if there was an error processing the message
+    async fn handle_message(&self, from: &Identity, message: PubSubMessage) -> anyhow::Result<()>;
+}
 
 // ============================================================================
 // Type Aliases

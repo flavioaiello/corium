@@ -1,7 +1,8 @@
-//! DHT protocol message definitions.
+//! Wire protocol for all RPC communication.
 //!
-//! This module defines the RPC request and response types for DHT communication.
-//! All messages are serializable using bincode for efficient network transport.
+//! This module defines the unified request and response types for DHT, Relay,
+//! PubSub, and hole-punching communication. All messages are serializable using
+//! bincode for efficient network transport.
 //!
 //! # Security
 //!
@@ -12,7 +13,7 @@
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::core::{Contact, Key};
+use crate::dht::{Contact, Key};
 use crate::identity::Identity;
 use crate::pubsub::PubSubMessage;
 

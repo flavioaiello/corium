@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 /// - A 32-byte secret key (signing key)
 /// - A 32-byte public key (verifying key)
 ///
-/// The NodeId is derived by hashing the public key with BLAKE3.
+/// The Identity is the public key itself (zero-hash architecture).
 #[derive(Clone)]
 pub struct Keypair {
     signing_key: SigningKey,
@@ -295,6 +295,39 @@ impl Identity {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Ok(Self(arr))
+    }
+
+    /// Check if this Identity is valid (not a placeholder or reserved value).
+    ///
+    /// # Security
+    ///
+    /// Used to prevent routing table pollution from placeholder IDs.
+    /// Returns false for:
+    /// - All-zeros (placeholder for unknown peers)
+    /// - All-ones (reserved/invalid)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use corium::Identity;
+    ///
+    /// let valid = Identity::from_bytes([1u8; 32]);
+    /// assert!(valid.is_valid());
+    ///
+    /// let placeholder = Identity::from_bytes([0u8; 32]);
+    /// assert!(!placeholder.is_valid());
+    /// ```
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        // Check for all-zeros (placeholder)
+        if self.0.iter().all(|&b| b == 0) {
+            return false;
+        }
+        // Check for all-ones (reserved/invalid)
+        if self.0.iter().all(|&b| b == 0xFF) {
+            return false;
+        }
+        true
     }
 }
 

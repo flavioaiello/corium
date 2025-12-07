@@ -27,558 +27,29 @@
 //! server.run(endpoint).await?;
 //! ```
 
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use crate::net::holepunch::HolePunchRegistry;
+use crate::net::connection::ConnectionRateLimiter;
+use crate::relay::RelayConnectionRegistry;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use lru::LruCache;
 use quinn::{Endpoint, Incoming};
 use tracing::{debug, info, trace, warn};
 
-use crate::core::{DhtNetwork, DhtNode};
+use crate::dht::{DhtNetwork, DhtNode};
 use crate::identity::Identity;
 use crate::net::extract_public_key_from_cert;
-use crate::protocol::{DhtRequest, DhtResponse};
-use crate::pubsub::PubSubMessage;
+use crate::messages::{DhtRequest, DhtResponse};
+use crate::pubsub::{PubSubHandler, PubSubMessage};
 use crate::relay::{CryptoError, RelayClient, RelayPacket, RelayServer, MAX_RELAY_PACKET_SIZE};
-
-/// Timeout for hole punch rendezvous (waiting for peer to register).
-const HOLE_PUNCH_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum number of ready hole punch results to keep.
-/// Prevents memory exhaustion from rapid punch registrations.
-const MAX_READY_HOLE_PUNCHES: usize = 1000;
 
 /// Read timeout for inbound RPC streams (mitigates slowloris-style stalls).
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Clock skew tolerance for hole punch timing.
-/// 2000ms handles typical NTP drift and asymmetric network delays.
-/// This is more robust than 500ms for real-world deployments where peers
-/// may have significant clock differences.
-const HOLE_PUNCH_CLOCK_SKEW_TOLERANCE_MS: u64 = 2000;
-
-/// Maximum pending hole punch registrations (waiting for peer).
-/// Prevents memory exhaustion from excessive registrations.
-const MAX_PENDING_HOLE_PUNCHES: usize = 5000;
-
-/// Maximum entries in the by_peers lookup map.
-/// This should equal MAX_PENDING_HOLE_PUNCHES since there's a 1:1 relationship,
-/// but we define it explicitly for clarity and defensive bounds checking.
-const MAX_BY_PEERS_ENTRIES: usize = MAX_PENDING_HOLE_PUNCHES;
-
-// ============================================================================
-// PubSub Handler Trait
-// ============================================================================
-
-/// Trait for handling incoming PubSub messages.
-///
-/// Implement this trait to receive and process GossipSub messages.
-/// The [`GossipSub`](crate::pubsub::GossipSub) struct implements this trait.
-#[async_trait::async_trait]
-pub trait PubSubHandler: Send + Sync {
-    /// Handle an incoming pubsub message from a peer.
-    ///
-    /// # Arguments
-    /// * `from` - The TLS-verified identity of the peer who sent this message
-    /// * `message` - The pubsub protocol message
-    ///
-    /// # Returns
-    /// * `Ok(())` if the message was processed (may have been dropped due to dedup, etc.)
-    /// * `Err(_)` if there was an error processing the message
-    async fn handle_message(&self, from: &Identity, message: PubSubMessage) -> anyhow::Result<()>;
-}
-
 /// Maximum size of an RPC request in bytes (64 KB).
 /// Prevents memory exhaustion from oversized requests.
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
-
-/// Maximum pending hole punch registrations per identity.
-/// Prevents resource exhaustion from a single peer.
-const MAX_HOLE_PUNCH_PER_IDENTITY: usize = 5;
-
-/// Maximum new connections per second globally.
-const MAX_GLOBAL_CONNECTIONS_PER_SECOND: usize = 100;
-
-/// Maximum new connections per second per IP.
-const MAX_CONNECTIONS_PER_IP_PER_SECOND: usize = 20;
-
-/// Maximum number of IPs to track for rate limiting.
-const MAX_TRACKED_IPS: usize = 1000;
-
-// ============================================================================
-// Token Bucket Rate Limiter
-// ============================================================================
-
-/// A token bucket for rate limiting.
-///
-/// Uses fixed-size storage (2 fields) instead of per-request timestamp storage.
-/// Tokens are replenished at a constant rate up to a maximum capacity.
-#[derive(Debug, Clone, Copy)]
-struct TokenBucket {
-    /// Current number of available tokens (fractional for smooth replenishment).
-    tokens: f64,
-    /// Last time tokens were replenished.
-    last_update: Instant,
-}
-
-impl TokenBucket {
-    /// Create a new token bucket with full capacity.
-    fn new(capacity: usize) -> Self {
-        Self {
-            tokens: capacity as f64,
-            last_update: Instant::now(),
-        }
-    }
-
-    /// Try to consume one token. Returns true if successful.
-    ///
-    /// Tokens are replenished at `rate` tokens per second, up to `capacity`.
-    fn try_consume(&mut self, rate: f64, capacity: f64) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        
-        // Replenish tokens based on elapsed time
-        self.tokens = (self.tokens + elapsed * rate).min(capacity);
-        self.last_update = now;
-        
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Connection rate limiter using token bucket algorithm.
-///
-/// This is more memory-efficient than sliding window (VecDeque of timestamps):
-/// - Global: 16 bytes (f64 + Instant) vs up to 800 bytes (100 * 8-byte Instants)
-/// - Per-IP: 16 bytes each vs up to 160 bytes each (20 * 8-byte Instants)
-///
-/// Uses tokio::sync::Mutex for async safety - avoids blocking the async
-/// runtime when checking rate limits in async connection handlers.
-struct ConnectionRateLimiter {
-    state: tokio::sync::Mutex<RateLimitState>,
-}
-
-struct RateLimitState {
-    /// Global token bucket.
-    global: TokenBucket,
-    /// Per-IP token buckets.
-    per_ip: LruCache<IpAddr, TokenBucket>,
-}
-
-impl ConnectionRateLimiter {
-    fn new() -> Self {
-        Self {
-            state: tokio::sync::Mutex::new(RateLimitState {
-                global: TokenBucket::new(MAX_GLOBAL_CONNECTIONS_PER_SECOND),
-                per_ip: LruCache::new(NonZeroUsize::new(MAX_TRACKED_IPS).unwrap()),
-            }),
-        }
-    }
-
-    /// Check if a new connection should be allowed.
-    /// Returns true if under rate limit, false if should reject.
-    ///
-    /// This is an async method to avoid blocking the tokio runtime.
-    async fn check(&self, ip: IpAddr) -> bool {
-        let mut state = self.state.lock().await;
-        
-        // 1. Check global limit
-        if !state.global.try_consume(
-            MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
-            MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
-        ) {
-            return false;
-        }
-        
-        // 2. Check per-IP limit
-        let ip_bucket = state.per_ip.get_or_insert_mut(ip, || {
-            TokenBucket::new(MAX_CONNECTIONS_PER_IP_PER_SECOND)
-        });
-        
-        if !ip_bucket.try_consume(
-            MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
-            MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
-        ) {
-            // Refund the global token since we're rejecting
-            state.global.tokens = (state.global.tokens + 1.0)
-                .min(MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64);
-            return false;
-        }
-        
-        true
-    }
-}
-
-/// A pending hole punch waiting for the second peer.
-#[derive(Debug)]
-struct PendingHolePunch {
-    /// First peer's ID.
-    initiator: Identity,
-    /// Target peer's ID.
-    target: Identity,
-    /// Initiator's public address.
-    initiator_addr: String,
-    /// When this was registered.
-    registered_at: Instant,
-}
-
-/// Result of a successful hole punch rendezvous.
-#[derive(Debug, Clone)]
-struct HolePunchResult {
-    /// Address of the peer to connect to.
-    peer_addr: String,
-    /// When to start the simultaneous open.
-    start_time_ms: u64,
-}
-
-/// Internal state protected by a single mutex to prevent race conditions.
-#[derive(Debug, Default)]
-struct HolePunchState {
-    /// Pending punches: punch_id -> pending info.
-    pending: HashMap<[u8; 16], PendingHolePunch>,
-    /// Completed punches ready for pickup: punch_id -> result.
-    ready: HashMap<[u8; 16], HolePunchResult>,
-    /// Lookup by peer pair: (peer_a, peer_b) sorted -> punch_id.
-    by_peers: HashMap<(Identity, Identity), [u8; 16]>,
-    /// Count of pending registrations per identity (for rate limiting).
-    per_identity_count: HashMap<Identity, usize>,
-}
-
-/// Tracks pending hole punch rendezvous requests.
-///
-/// Uses a single mutex to protect all state atomically, preventing:
-/// - TOCTOU race conditions on rate limit checks
-/// - Deadlocks from nested lock acquisition
-/// - State corruption from concurrent modifications
-#[derive(Debug, Default)]
-pub struct HolePunchRegistry {
-    /// All state protected by a single mutex for atomic operations.
-    state: tokio::sync::Mutex<HolePunchState>,
-}
-
-impl HolePunchRegistry {
-    /// Create a new registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a hole punch request.
-    ///
-    /// If the peer is already waiting, returns their info for simultaneous open.
-    /// Returns `None` if the peer has exceeded their registration limit.
-    ///
-    /// This method is atomic - all state checks and modifications happen
-    /// under a single lock to prevent race conditions.
-    pub async fn register(
-        &self,
-        punch_id: [u8; 16],
-        from_peer: Identity,
-        target_peer: Identity,
-        from_addr: String,
-    ) -> Result<Option<(String, u64)>, &'static str> {
-        // Normalize peer pair for lookup
-        let peer_pair = if from_peer.as_bytes() < target_peer.as_bytes() {
-            (from_peer, target_peer)
-        } else {
-            (target_peer, from_peer)
-        };
-
-        // Single lock protects all state atomically - no TOCTOU race conditions
-        let mut state = self.state.lock().await;
-
-        // Check per-identity rate limit (atomic with the rest of the operation)
-        if let Some(&count) = state.per_identity_count.get(&from_peer) {
-            if count >= MAX_HOLE_PUNCH_PER_IDENTITY {
-                return Err("too many pending hole punch registrations");
-            }
-        }
-
-        // Check if the other peer is already waiting
-        if let Some(&existing_id) = state.by_peers.get(&peer_pair) {
-            // Check if it's us (retry) or them (match)
-            let is_self = if let Some(existing) = state.pending.get(&existing_id) {
-                existing.initiator == from_peer
-            } else {
-                false // Should not happen
-            };
-
-            if !is_self {
-                if let Some(existing) = state.pending.remove(&existing_id) {
-                    state.by_peers.remove(&peer_pair);
-                    
-                    // Decrement count for the initiator
-                    if let Some(count) = state.per_identity_count.get_mut(&existing.initiator) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            state.per_identity_count.remove(&existing.initiator);
-                        }
-                    }
-                    
-                    // Both peers ready! Calculate start time
-                    // Use 500ms offset to handle clock skew between peers
-                    let start_time_ms = crate::now_ms()
-                        + HOLE_PUNCH_CLOCK_SKEW_TOLERANCE_MS;
-                    
-                    // Enforce limit on ready results to prevent memory exhaustion
-                    if state.ready.len() >= MAX_READY_HOLE_PUNCHES {
-                        // Remove oldest entries (those with earliest start_time_ms)
-                        let oldest_key = state.ready
-                            .iter()
-                            .min_by_key(|(_, r)| r.start_time_ms)
-                            .map(|(k, _)| *k);
-                        if let Some(key) = oldest_key {
-                            state.ready.remove(&key);
-                        }
-                    }
-                    
-                    // Store result for the first peer to pick up via check_ready()
-                    state.ready.insert(existing_id, HolePunchResult {
-                        peer_addr: from_addr.clone(),
-                        start_time_ms,
-                    });
-                    
-                    // Return the first peer's address to the second peer
-                    return Ok(Some((existing.initiator_addr, start_time_ms)));
-                }
-            } else {
-                // It's us! Remove old registration to allow update (retry)
-                state.pending.remove(&existing_id);
-                state.by_peers.remove(&peer_pair);
-                // Decrement count for the old registration
-                if let Some(count) = state.per_identity_count.get_mut(&from_peer) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.per_identity_count.remove(&from_peer);
-                    }
-                }
-            }
-        }
-
-        // First peer - register and wait
-        // Check pending limit to prevent memory exhaustion
-        if state.pending.len() >= MAX_PENDING_HOLE_PUNCHES {
-            // Remove oldest pending registration
-            let oldest = state.pending
-                .iter()
-                .min_by_key(|(_, p)| p.registered_at)
-                .map(|(id, _)| *id);
-            if let Some(old_id) = oldest {
-                if let Some(old_punch) = state.pending.remove(&old_id) {
-                    // Clean up associated state
-                    let old_pair = if old_punch.initiator.as_bytes() < old_punch.target.as_bytes() {
-                        (old_punch.initiator, old_punch.target)
-                    } else {
-                        (old_punch.target, old_punch.initiator)
-                    };
-                    state.by_peers.remove(&old_pair);
-                    if let Some(count) = state.per_identity_count.get_mut(&old_punch.initiator) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            state.per_identity_count.remove(&old_punch.initiator);
-                        }
-                    }
-                }
-            }
-        }
-        
-        state.pending.insert(punch_id, PendingHolePunch {
-            initiator: from_peer,
-            target: target_peer,
-            initiator_addr: from_addr,
-            registered_at: Instant::now(),
-        });
-        
-        // Defensive bounds check for by_peers map.
-        // This should never trigger due to the pending limit above, but we check
-        // explicitly to prevent unbounded growth if the invariant is broken.
-        if state.by_peers.len() >= MAX_BY_PEERS_ENTRIES {
-            // Remove an arbitrary entry to make room (should not happen in practice)
-            if let Some(key) = state.by_peers.keys().next().copied() {
-                state.by_peers.remove(&key);
-            }
-        }
-        state.by_peers.insert(peer_pair, punch_id);
-        
-        // Increment count for this identity (saturating to prevent overflow)
-        *state.per_identity_count.entry(from_peer).or_insert(0) = 
-            state.per_identity_count.get(&from_peer).copied().unwrap_or(0).saturating_add(1);
-
-        Ok(None)
-    }
-
-    /// Check if a punch is ready (both peers registered).
-    /// 
-    /// The first peer calls this to poll for the result after registering.
-    /// Returns `Some((peer_addr, start_time_ms))` when the second peer has registered.
-    pub async fn check_ready(&self, punch_id: &[u8; 16]) -> Option<(String, u64)> {
-        // Single lock for atomic access
-        let mut state = self.state.lock().await;
-        
-        // Check if result is ready (second peer has registered)
-        if let Some(result) = state.ready.remove(punch_id) {
-            return Some((result.peer_addr, result.start_time_ms));
-        }
-        
-        // Still waiting for the other peer
-        None
-    }
-
-    /// Clean up expired pending punches and stale ready results.
-    ///
-    /// This method is atomic - all cleanup happens under a single lock.
-    pub async fn cleanup_expired(&self) {
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-        
-        // Get current time in milliseconds for ready result expiration
-        let now_ms = crate::now_ms();
-
-        // Collect expired punch IDs first to avoid borrow issues
-        let expired_ids: Vec<[u8; 16]> = state.pending
-            .iter()
-            .filter(|(_, p)| now.duration_since(p.registered_at) >= HOLE_PUNCH_RENDEZVOUS_TIMEOUT)
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in expired_ids {
-            if let Some(p) = state.pending.remove(&id) {
-                // Also remove from by_peers lookup
-                let peer_pair = if p.initiator.as_bytes() < p.target.as_bytes() {
-                    (p.initiator, p.target)
-                } else {
-                    (p.target, p.initiator)
-                };
-                state.by_peers.remove(&peer_pair);
-                
-                // Decrement count for the initiator
-                if let Some(count) = state.per_identity_count.get_mut(&p.initiator) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.per_identity_count.remove(&p.initiator);
-                    }
-                }
-                
-                debug!(punch_id = hex::encode(id), "hole punch rendezvous expired");
-            }
-        }
-        
-        // Clean up stale ready results (not picked up within 30 seconds)
-        state.ready.retain(|_id, result| {
-            now_ms < result.start_time_ms + 30_000
-        });
-    }
-}
-
-// ============================================================================
-// Relay Connection Registry
-// ============================================================================
-
-/// Maximum number of peer connections to track for relay forwarding.
-const MAX_RELAY_CONNECTIONS: usize = 1000;
-
-/// Tracks peer connections for relay packet forwarding.
-///
-/// When a peer connects and establishes a relay session, we store their
-/// connection so we can push relayed packets back to them by opening
-/// new streams on their connection.
-#[derive(Debug, Default)]
-pub struct RelayConnectionRegistry {
-    /// Map from peer identity to their QUIC connection.
-    connections: tokio::sync::RwLock<HashMap<Identity, quinn::Connection>>,
-}
-
-impl RelayConnectionRegistry {
-    /// Create a new registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a peer's connection for relay forwarding.
-    pub async fn register(&self, peer: Identity, connection: quinn::Connection) {
-        let mut conns = self.connections.write().await;
-        
-        // Enforce capacity limit to prevent memory exhaustion
-        if conns.len() >= MAX_RELAY_CONNECTIONS && !conns.contains_key(&peer) {
-            warn!(
-                peer = ?hex::encode(&peer.as_bytes()[..8]),
-                "relay connection registry at capacity, rejecting new connection"
-            );
-            return;
-        }
-        
-        conns.insert(peer, connection);
-    }
-
-    /// Remove a peer's connection.
-    pub async fn unregister(&self, peer: &Identity) {
-        let mut conns = self.connections.write().await;
-        conns.remove(peer);
-    }
-
-    /// Get a peer's connection for sending relayed packets.
-    pub async fn get(&self, peer: &Identity) -> Option<quinn::Connection> {
-        let conns = self.connections.read().await;
-        conns.get(peer).cloned()
-    }
-
-    /// Send a relayed packet to a peer by opening a stream on their connection.
-    ///
-    /// This is the core of relay forwarding - when peer A sends data to peer B
-    /// through the relay, we open a stream on B's connection and push the data.
-    pub async fn forward_to_peer(&self, to_peer: &Identity, packet: RelayPacket) -> Result<()> {
-        let connection = self.get(to_peer).await.ok_or_else(|| {
-            anyhow::anyhow!("peer not connected for relay forwarding")
-        })?;
-
-        // Open a unidirectional stream to push the relayed packet
-        let mut send = connection.open_uni().await.context("failed to open stream for relay")?;
-
-        // Construct a RelayData message to send to the peer
-        let relay_data = DhtRequest::RelayData {
-            from: packet.from,
-            session_id: packet.session_id,
-            payload: packet.payload,
-        };
-
-        let data = bincode::serialize(&relay_data).context("failed to serialize relay data")?;
-        let len = data.len() as u32;
-        
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&data).await?;
-        send.finish()?;
-
-        trace!(
-            to = ?hex::encode(&to_peer.as_bytes()[..8]),
-            session = hex::encode(packet.session_id),
-            "forwarded relay packet to peer"
-        );
-
-        Ok(())
-    }
-
-    /// Clean up closed connections.
-    pub async fn cleanup(&self) {
-        let mut conns = self.connections.write().await;
-        conns.retain(|peer, conn| {
-            let is_open = conn.close_reason().is_none();
-            if !is_open {
-                debug!(
-                    peer = ?hex::encode(&peer.as_bytes()[..8]),
-                    "removing closed connection from relay registry"
-                );
-            }
-            is_open
-        });
-    }
-}
 
 /// Server for handling incoming DHT connections.
 ///
@@ -696,7 +167,7 @@ impl<N: DhtNetwork> Server<N> {
         while let Some(incoming) = endpoint.accept().await {
             // Rate limit incoming connections to prevent DoS
             let remote_addr = incoming.remote_address();
-            if !self.rate_limiter.check(remote_addr.ip()).await {
+            if !self.rate_limiter.allow(remote_addr.ip()).await {
                 // Security event - rate limiting is an attack indicator
                 warn!(remote = %remote_addr, "rate limiting: rejecting connection");
                 // Drop the incoming connection by not awaiting it
@@ -892,7 +363,7 @@ async fn handle_stream<N: DhtNetwork>(
         .await
         .map_err(|_| anyhow::anyhow!("request body read timed out"))??;
 
-    let request: DhtRequest = crate::protocol::deserialize_request(&request_bytes)
+    let request: DhtRequest = crate::messages::deserialize_request(&request_bytes)
         .context("failed to deserialize request")?;
 
     // Verify the request's `from` Contact matches the verified TLS identity (Sybil protection)
@@ -1392,7 +863,7 @@ async fn handle_request<N: DhtNetwork>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
     async fn test_rate_limiter_per_ip() {
@@ -1400,44 +871,15 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
         // Should allow up to MAX_CONNECTIONS_PER_IP_PER_SECOND (20)
-        for _ in 0..MAX_CONNECTIONS_PER_IP_PER_SECOND {
-            assert!(limiter.check(ip).await);
+        for _ in 0..crate::net::connection::MAX_CONNECTIONS_PER_IP_PER_SECOND {
+            assert!(limiter.allow(ip).await);
         }
         
         // Should reject next
-        assert!(!limiter.check(ip).await);
+        assert!(!limiter.allow(ip).await);
         
         // Different IP should be allowed
         let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
-        assert!(limiter.check(ip2).await);
-    }
-
-    #[tokio::test]
-    async fn test_relay_connection_registry() {
-        use crate::identity::Keypair;
-        
-        let registry = RelayConnectionRegistry::new();
-        
-        // Generate a test identity
-        let keypair = Keypair::generate();
-        let identity = keypair.identity();
-        
-        // Initially no connection should be present
-        assert!(registry.get(&identity).await.is_none());
-        
-        // We can't easily create a real Connection in tests, but we can verify
-        // the registry's capacity enforcement logic by checking len after unregister
-        registry.unregister(&identity).await;
-        
-        // After unregister, still no connection
-        assert!(registry.get(&identity).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_relay_connection_registry_cleanup() {
-        let registry = RelayConnectionRegistry::new();
-        
-        // Cleanup on empty registry should not panic
-        registry.cleanup().await;
+        assert!(limiter.allow(ip2).await);
     }
 }
