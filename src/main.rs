@@ -19,8 +19,9 @@
 //! RUST_LOG=debug cargo run
 //! ```
 //!
-//! The node will start and print its NodeId and endpoint address. Telemetry
-//! is printed periodically showing the current state of the node.
+//! The node will start and print its Identity (hex-encoded Ed25519 public key)
+//! and endpoint address. Telemetry is printed periodically showing the current
+//! state of the node.
 
 use std::net::SocketAddr;
 use std::str::FromStr;

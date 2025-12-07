@@ -7,11 +7,11 @@
 //! ```ignore
 //! use corium::Node;
 //!
-//! // Create a node (auto-generates identity)
+//! // Create a node (auto-generates identity, pubsub enabled by default)
 //! let node = Node::bind("0.0.0.0:0").await?;
 //! println!("My identity: {}", node.identity());
 //!
-//! // Bootstrap from a seed node
+//! // Bootstrap from a known peer (identity = hex-encoded 64-char Ed25519 public key)
 //! node.bootstrap("a1b2c3d4e5f6...", "seed.example.com:9000").await?;
 //!
 //! // Subscribe to a topic
@@ -21,14 +21,14 @@
 //! let mut rx = node.messages().await?;
 //! tokio::spawn(async move {
 //!     while let Some(msg) = rx.recv().await {
-//!         println!("[{}] {}: {:?}", msg.topic, msg.from, msg.data);
+//!         println!("[{}] from {}: {:?}", msg.topic, msg.from, msg.data);
 //!     }
 //! });
 //!
-//! // Publish messages
+//! // Publish messages  
 //! node.publish("chat", b"Hello!".to_vec()).await?;
 //!
-//! // Connect to a peer
+//! // Connect to a peer by identity and address
 //! let conn = node.connect("abc123...", "192.168.1.50:9000").await?;
 //! ```
 //!
@@ -37,10 +37,11 @@
 //! The public API consists of just 3 types:
 //!
 //! - [`Node`] - The mesh network node
-//! - [`Message`] - A received pubsub message
+//! - [`Message`] - A received pubsub message  
 //! - [`Connection`] - A QUIC connection to a peer
 //!
-//! For persistent identity, use [`Node::bind_with_keypair`].
+//! For persistent identity, use [`Node::bind_with_keypair`] with a keypair
+//! from the `tests` feature module.
 
 // Internal modules
 pub(crate) mod dht;

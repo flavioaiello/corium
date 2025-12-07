@@ -203,9 +203,9 @@ You don't need to understand this—`node.connect()` handles it. But if you're c
 - **Parallel lookups** querying α nodes concurrently per round
 - **Endpoint record publishing** for address resolution via DHT
 
-### Identity & Security
-- **Ed25519 identity** with NodeId derived from public key via BLAKE3
-- **Sybil protection** via NodeId-to-TLS certificate binding
+### Identity & Security (Zero-Hash Architecture)
+- **Ed25519 identity** where Identity = public key directly (no hashing)
+- **Sybil protection** via Identity-to-TLS certificate binding
 - **Signed endpoint records** for verifiable address announcements
 - **Storage exhaustion protection** with quotas and rate limiting
 
@@ -231,15 +231,15 @@ corium = "0.2"
 
 ## Architecture
 
-Corium is organized as a layered networking stack. **Most applications only interact with the top two layers** via `smart_connect` and `DiscoveryNode`:
+Corium is organized as a layered networking stack. **Most applications only interact with the Node facade**:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Application Layer                        │
-│    ← YOUR CODE: smart_connect(), publish_endpoint()         │
+│    ← YOUR CODE: node.connect(), node.put(), node.publish()  │
 ├─────────────────────────────────────────────────────────────┤
-│                    Discovery Layer                          │
-│    ← DiscoveryNode, resolve_identity(), DHT lookups         │
+│                       Node Facade                           │
+│    ← Node (primary API with DHT + PubSub)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   Connection Layer (automatic)              │
 │       SmartConnection, SmartSock (seamless path switching)  │
@@ -251,104 +251,92 @@ Corium is organized as a layered networking stack. **Most applications only inte
 │                  QUIC (quinn), Ed25519 TLS                  │
 ├─────────────────────────────────────────────────────────────┤
 │                    Identity Layer                           │
-│    ← Keypair, Identity, EndpointRecord (you create these)   │
+│    ← Keypair, Identity, EndpointRecord (tests feature)      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Layers marked "automatic" are handled by `node.connect()`**—you don't interact with them directly.
 
-### Module Overview
-
-| Module | Description | You Use Directly? |
-|--------|-------------|-------------------|
-| `node` | **Primary API**: `Node` facade | ✅ Yes |
-| `corium` | `Keypair`, `Identity`, `Contact`, `Key` | ✅ Yes (types) |
-| `advanced` | Lower-level access for power users | ⚠️ Rarely |
-
 ### Public API
 
+The public API is deliberately minimal:
+
 ```rust
-// Primary API - the Node facade
-pub use node::{Node, PubSubHandler};
-
-// Identity types
-pub use identity::{Identity, Keypair, EndpointRecord, RelayEndpoint};
-
-// DHT types
-pub use dht::{Contact, Key, TelemetrySnapshot};
-
-// Connection types
-pub use net::SmartConnection;
-
-// NAT types
-pub use relay::NatType;
-
-// PubSub types
-pub use pubsub::{MessageId, ReceivedMessage};
+// Just 3 types in the public API
+pub use node::{Node, Message};  // The mesh node and pubsub messages
+pub use quinn::Connection;      // QUIC connection to a peer
 ```
 
-### Advanced API
+### Internal Access (Tests Feature)
 
-For power users who need lower-level access:
+For testing or advanced use cases, enable the `tests` feature:
+
+```toml
+[dependencies]
+corium = { version = "0.2", features = ["tests"] }
+```
+
+Then access internal types:
 
 ```rust
-use corium::advanced::{
-    // TLS/certificate utilities
-    generate_ed25519_cert, create_client_config, create_server_config,
-    
-    // Network layer
-    PeerNetwork,
+use corium::tests::{
+    // Identity
+    Keypair, Identity, EndpointRecord, verify_identity,
     
     // DHT
-    DhtNode, DhtNetwork, hash_content,
+    DhtNode, DhtNetwork, Contact, Key, hash_content,
+    
+    // Network
+    PeerNetwork, SmartConnection, UdpRelayForwarder,
     
     // PubSub
-    GossipSub, GossipConfig,
+    GossipSub, GossipConfig, PubSubMessage,
     
-    // Relay/NAT
-    RelayClient, RelayServer, detect_nat_type,
+    // TLS utilities
+    generate_ed25519_cert, create_client_config, create_server_config,
 };
 ```
 
 ---
 
-## Ed25519 Identity
+## Ed25519 Identity (Zero-Hash Architecture)
 
-Each node has a cryptographic identity based on an Ed25519 keypair:
+Corium uses a **zero-hash architecture** where Identity = Ed25519 public key directly:
 
 ```rust
-use corium::{Keypair, verify_node_id};
+// Using the tests feature for internal access
+use corium::tests::{Keypair, Identity, verify_identity};
 
 // Generate a new keypair
 let keypair = Keypair::generate();
 
-// The NodeId is the BLAKE3 hash of the public key
-let node_id = keypair.node_id();
+// The Identity IS the public key (no hashing)
+let identity = keypair.identity();
 let public_key = keypair.public_key_bytes();
 
-// Verify that a NodeId matches a public key
-assert!(verify_node_id(&node_id, &public_key));
+// Zero-hash property: Identity bytes == public key bytes
+assert_eq!(identity.as_bytes(), &public_key);
 
 // Keypairs can be restored from the secret key
 let secret = keypair.secret_key_bytes();
 let restored = Keypair::from_secret_key_bytes(&secret);
-assert_eq!(keypair.node_id(), restored.node_id());
+assert_eq!(keypair.identity(), restored.identity());
 ```
 
 ### Peer Verification
 
-When connecting to a peer, you can verify their identity:
+Peer identity is verified automatically during TLS handshake:
 
 ```rust
-use corium::{verify_peer_identity, extract_public_key_from_cert, NodeId};
+use corium::tests::{verify_peer_identity, extract_public_key_from_cert, Identity};
 
 // After receiving a peer's certificate
 let cert_der: &[u8] = /* from TLS handshake */;
-let claimed_node_id: NodeId = /* from Contact */;
+let claimed_identity: Identity = /* from Contact */;
 
-// Verify the peer owns their claimed NodeId
-if verify_peer_identity(cert_der, &claimed_node_id) {
-    // Peer verified!
+// Verify the peer owns their claimed Identity
+if verify_peer_identity(cert_der, &claimed_identity) {
+    // Peer verified - their certificate's public key matches claimed Identity
 }
 ```
 
@@ -356,14 +344,18 @@ if verify_peer_identity(cert_der, &claimed_node_id) {
 
 ## Core Concepts
 
-### Node and Key Identity
+### Identity and Key (Zero-Hash Architecture)
 
 The DHT uses 256-bit identifiers:
 
 ```rust
-type NodeId = [u8; 32];  // Node identifier (BLAKE3 hash of Ed25519 public key)
-type Key = [u8; 32];     // Content key (BLAKE3 hash of value)
+type Identity = [u8; 32];  // Node identifier = Ed25519 public key (no hash)
+type Key = [u8; 32];       // Content key = BLAKE3 hash of value
 ```
+
+Unlike traditional Kademlia implementations, Corium uses the Ed25519 public key
+directly as the node Identity—no intermediate hashing step. This simplifies
+identity verification and eliminates hash collision concerns.
 
 ### Routing Table
 
@@ -402,7 +394,7 @@ Contacts are dynamically assigned to latency tiers:
 ## Configuration Constants
 
 The following constants are defined internally. Default values for `k` and `alpha` 
-are passed as parameters to `DiscoveryNode::new()`.
+are configured automatically based on network conditions.
 
 ### DHT Core Constants
 
@@ -684,7 +676,7 @@ Corium includes a GossipSub-style publish/subscribe system for topic-based messa
 │                      GossipSub                              │
 │         Topic meshes, message routing, deduplication        │
 ├─────────────────────────────────────────────────────────────┤
-│                    DiscoveryNode                            │
+│                        Node                                 │
 │              Peer discovery, DHT, connections               │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -799,7 +791,7 @@ cargo run
 # Bind to a specific port
 cargo run -- --bind 0.0.0.0:9000
 
-# Connect to bootstrap peer (NodeId is required for TLS identity verification)
+# Connect to bootstrap peer (Identity is required for TLS identity verification)
 cargo run -- -B 192.168.1.100:9000/5821a288e16c6491ae72f4cf060b8d6523cd416c418c1ec3b8b5bc7608a55b7d
 
 # Multiple bootstrap peers
@@ -823,7 +815,7 @@ RUST_LOG=corium=debug cargo run
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-b, --bind` | `0.0.0.0:0` | Address to bind to |
-| `-B, --bootstrap` | - | Bootstrap peer in `IP:PORT/NODEID` format (can be repeated) |
+| `-B, --bootstrap` | - | Bootstrap peer in `IP:PORT/IDENTITY` format (can be repeated) |
 | `-k` | 20 | Bucket size / replication factor |
 | `-a, --alpha` | 3 | Lookup parallelism |
 | `-t, --telemetry-interval` | 300 | Telemetry logging interval (seconds) |
@@ -837,7 +829,7 @@ This starts a node with:
 Example output:
 ```
 2024-12-02T10:00:00Z  INFO corium: DHT node started
-2024-12-02T10:00:00Z  INFO corium: NodeId node_id="a1b2c3d4..."
+2024-12-02T10:00:00Z  INFO corium: Identity identity="a1b2c3d4..."
 2024-12-02T10:00:00Z  INFO corium: Listening address addr="0.0.0.0:54321"
 2024-12-02T10:05:00Z  INFO corium: telemetry snapshot pressure="0.00" stored_keys=0 k=20 alpha=3
 ```
@@ -863,23 +855,22 @@ The chatroom example shows:
 ### Address Publishing & Resolution
 
 ```rust
-use corium::{Keypair, DiscoveryNode, Identity};
+use corium::Node;
+use corium::tests::Identity;  // requires `tests` feature
+
+// Create node (keypair auto-generated or use bind_with_keypair)
+let node = Node::bind("0.0.0.0:0").await?;
 
 // Publish our address to the DHT
-let keypair = Keypair::generate();
 let addresses = vec!["192.168.1.100:4433".to_string()];
-node.publish_address(&keypair, addresses).await?;
+node.publish_address(addresses).await?;
 
 // Resolve a peer's addresses from the DHT
-let peer_identity: Identity = /* ... */;
+let peer_identity = Identity::from_hex("5821a288e16c6491...")?;
 if let Some(record) = node.resolve_peer(&peer_identity).await? {
     println!("Peer addresses: {:?}", record.addrs);
     println!("Relay endpoints: {:?}", record.relays);
 }
-
-// Republish when network changes (e.g., WiFi → cellular)
-let new_addrs = vec!["10.0.0.50:4433".to_string()];
-node.republish_on_network_change(&keypair, new_addrs, vec![]).await?;
 ```
 
 ---
@@ -888,16 +879,17 @@ node.republish_on_network_change(&keypair, new_addrs, vec![]).await?;
 
 Corium implements comprehensive, defense-in-depth security measures across all subsystems. Security fixes are documented in the source code.
 
-### Sybil Protection
+### Sybil Protection (Zero-Hash Architecture)
 
-Corium prevents Sybil attacks by cryptographically binding each peer's NodeId to their TLS certificate:
+Corium prevents Sybil attacks by cryptographically binding each peer's Identity to their TLS certificate:
 
-1. **NodeId derivation**: `NodeId = BLAKE3(Ed25519_public_key)`
-2. **Certificate binding**: The Ed25519 public key is embedded in the TLS certificate's Common Name
-3. **Connection verification**: On each incoming connection, the server extracts the public key from the peer's certificate and derives the expected NodeId
-4. **Request validation**: Every RPC request's `from` Contact must match the verified NodeId from the TLS handshake
+1. **Identity binding**: `Identity = Ed25519_public_key` (zero-hash: no intermediate derivation)
+2. **Certificate embedding**: The Ed25519 public key is embedded in the TLS certificate's SPKI
+3. **SNI pinning**: TLS SNI hostname = `hex(Identity)` = `hex(PublicKey)`
+4. **Connection verification**: On each incoming connection, the server extracts the public key from the peer's certificate and compares directly to the claimed Identity
+5. **Request validation**: Every RPC request's `from` Contact must match the verified Identity from the TLS handshake
 
-This prevents attackers from claiming arbitrary NodeIds—they can only use NodeIds derived from keys they control.
+This prevents attackers from claiming arbitrary Identities—they can only use Identities matching keys they control. The zero-hash property eliminates hash collision concerns entirely.
 
 ### Protocol Security
 
@@ -1020,7 +1012,7 @@ Protection against routing pollution:
 
 | Protection | Description |
 |------------|-------------|
-| Placeholder rejection | Rejects zero NodeId entries |
+| Placeholder rejection | Rejects zero Identity entries |
 | Eviction bounds | Max 100 iterations for bucket eviction |
 | Tiering tracked peers | 10,000 max (`MAX_TIERING_TRACKED_PEERS`) |
 
