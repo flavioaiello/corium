@@ -1,35 +1,29 @@
 //! # Corium
 //!
-//! A mesh networking library with automatic NAT traversal. **Consumers connect
-//! to peers via [`QuinnNetwork::smart_connect`][net::QuinnNetwork::smart_connect]—you don't
-//! need to use quinn/QUIC APIs directly.**
+//! A mesh networking library with automatic NAT traversal.
 //!
-//! The library provides a Kademlia-inspired DHT for peer discovery, with adaptive
-//! tiering and backpressure controls for embedding in services that need a
-//! self-healing mesh key/value store.
+//! ## Quick Start
 //!
-//! ## Smart Connections (Primary API)
-//!
-//! The [`smart_connect`][net::QuinnNetwork::smart_connect] method abstracts all transport
-//! complexity. It returns a [`SmartConnection`] that works regardless
-//! of NAT topology:
+//! The [`Node`] type is the primary API. It provides a simple, high-level
+//! interface for mesh networking:
 //!
 //! ```ignore
-//! // Resolve peer's endpoint record from DHT
-//! let record = dht.resolve_identity(&peer_identity).await?;
+//! use corium::{Node, Keypair};
 //!
-//! // Connect—NAT traversal is automatic!
-//! let conn = network.smart_connect(&record).await?;
+//! // Generate or load identity
+//! let keypair = Keypair::generate();
 //!
-//! // Works whether direct, hole-punched, or relayed
-//! println!("Connected: direct={}", conn.is_direct());
+//! // Start the node
+//! let node = Node::bind("0.0.0.0:0", keypair).await?;
+//!
+//! // Store and retrieve data
+//! let key = node.put(b"hello world".to_vec()).await?;
+//! let value = node.get(&key).await?;
+//!
+//! // Connect to peers with automatic NAT traversal
+//! let record = node.resolve_peer(&peer_identity).await?;
+//! let conn = node.connect(&record).await?;
 //! ```
-//!
-//! **Why use `smart_connect` instead of raw QUIC?**
-//! - Works behind any NAT (including CGNAT/Symmetric NAT)
-//! - Automatic relay fallback when direct fails
-//! - Transparent upgrade probing (relay → direct)
-//! - No quinn dependency in your application code
 //!
 //! ## Ed25519 Identity
 //!
@@ -44,77 +38,45 @@
 //! ## NAT Traversal (Handled Automatically)
 //!
 //! Corium uses a multi-layered approach to NAT traversal, all handled internally
-//! by `smart_connect`:
+//! by [`Node::connect`]:
 //!
-//! 1. **NAT Detection**: Queries multiple endpoints to classify NAT type
-//! 2. **Direct First**: Always attempt direct UDP connection
-//! 3. **Relay Fallback**: When blocked by Symmetric NAT/CGNAT, connect via relay
-//! 4. **Parallel Probing**: Continuously probe all paths to find the best route
-//! 5. **QUIC Migration**: Seamlessly switch paths without reconnecting (saves 1-2 RTTs)
+//! 1. **Direct First**: Always attempt direct UDP connection
+//! 2. **Relay Fallback**: When blocked by Symmetric NAT/CGNAT, connect via relay
+//! 3. **Parallel Probing**: Continuously probe all paths to find the best route
+//! 4. **QUIC Migration**: Seamlessly switch paths without reconnecting
 //!
-//! ## Modules
+//! ## PubSub Messaging
 //!
-//! - `core`: transport-agnostic Kademlia logic (routing table, storage, state machine)
-//! - [`identity`]: Ed25519 keypair, cryptographic identity, and endpoint records
-//! - [`net`]: **primary API** via [`QuinnNetwork::smart_connect`][net::QuinnNetwork::smart_connect]
-//! - [`node`]: mesh node for accepting incoming connections
-//! - [`protocol`]: RPC request/response definitions
-//! - [`relay`]: NAT detection, relay nodes, and ICE candidates
-//!
-//! ## Getting Started
-//!
-//! ### Step 1: Create a Node (One-Time Setup)
-//!
-//! ```no_run
-//! use std::net::SocketAddr;
-//! use anyhow::Result;
-//! use quinn::Endpoint;
-//! use corium::{
-//!     create_client_config, create_server_config, generate_ed25519_cert,
-//!     Contact, MeshNode, DhtNode, Keypair, QuinnNetwork,
-//! };
-//!
-//! # async fn setup() -> Result<()> {
-//! // Generate identity
-//! let keypair = Keypair::generate();
-//! let identity = keypair.identity();
-//!
-//! // Setup QUIC endpoint
-//! let (certs, key) = generate_ed25519_cert(&keypair)?;
-//! let server_config = create_server_config(certs, key)?;
-//! let endpoint = Endpoint::server(server_config, "0.0.0.0:0".parse()?)?;
-//!
-//! // Create network with smart_connect capability
-//! let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
-//! let client_config = create_client_config(client_certs, client_key)?;
-//! let contact = Contact { identity: keypair.identity(), addr: endpoint.local_addr()?.to_string() };
-//! let network = QuinnNetwork::with_identity(
-//!     endpoint.clone(), contact.clone(), client_config, identity
-//! );
-//!
-//! // Create DHT and start mesh node
-//! let dht = DhtNode::new(keypair.identity(), contact, network.clone(), 20, 3);
-//! let mesh = MeshNode::new(dht.clone())?;
-//! let _handle = mesh.spawn(endpoint);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ### Step 2: Connect to Peers
+//! Enable GossipSub for pub/sub messaging:
 //!
 //! ```ignore
-//! // Get peer's endpoint record (from DHT, config file, etc.)
-//! let peer_record: EndpointRecord = /* ... */;
+//! use corium::{Node, Keypair};
 //!
-//! // Connect—NAT traversal is automatic!
-//! let conn = network.smart_connect(&peer_record).await?;
+//! let keypair = Keypair::generate();
+//! let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
 //!
-//! // Use the connection
-//! let (mut send, mut recv) = conn.connection().open_bi().await?;
-//! send.write_all(b"hello").await?;
+//! // Subscribe and receive messages
+//! node.subscribe("my-topic").await?;
+//! let mut rx = node.take_message_receiver().await?;
+//! tokio::spawn(async move {
+//!     while let Some(msg) = rx.recv().await {
+//!         println!("Received: {:?}", msg.data);
+//!     }
+//! });
+//!
+//! // Publish messages
+//! node.publish("my-topic", b"hello!".to_vec()).await?;
 //! ```
 //!
-//! See the [README](https://github.com/flavioaiello/corium) for more examples.
+//! ## Advanced Usage
+//!
+//! For power users who need lower-level access, the library also exports:
+//!
+//! - [`DhtNode`]: Direct DHT operations
+//! - [`QuinnNetwork`]: QUIC transport layer
+//! - [`GossipSub`]: PubSub implementation
+//!
+//! Most users should use [`Node`] which wires these together automatically.
 
 /// Returns the current time in milliseconds since UNIX_EPOCH.
 ///
@@ -135,6 +97,7 @@ pub mod net;
 pub mod protocol;
 pub mod pubsub;
 pub mod relay;
+pub(crate) mod server;
 pub mod node;
 
 pub use core::{
@@ -171,9 +134,12 @@ pub use relay::{
     DIRECT_CONNECT_TIMEOUT, ICE_CHECK_INTERVAL, ICE_KEEPALIVE_INTERVAL, MAX_RELAY_SESSIONS,
     RELAY_SESSION_TIMEOUT, STUN_TIMEOUT, TURN_ALLOCATION_LIFETIME,
 };
-pub use node::{MeshNode, PubSubHandler};
+// Primary API - unified Node facade
+pub use node::{Node, PubSubHandler};
 pub use pubsub::{
     GossipConfig, GossipSub, MessageId, PubSubMessage, ReceivedMessage, SignatureError,
     sign_pubsub_message, verify_pubsub_signature,
     DEFAULT_GOSSIP_INTERVAL, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MESH_DEGREE,
 };
+// Re-export TelemetrySnapshot for telemetry access
+pub use core::TelemetrySnapshot;

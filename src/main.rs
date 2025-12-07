@@ -27,16 +27,11 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use futures::future;
-use quinn::Endpoint;
 use tokio::time::{self, Duration};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use corium::{
-    create_client_config, create_server_config, generate_ed25519_cert,
-    Contact, MeshNode, DhtNode, Keypair, QuinnNetwork, Identity,
-};
+use corium::{Contact, Identity, Keypair, Node};
 
 /// A bootstrap peer specification.
 /// 
@@ -88,14 +83,6 @@ struct Args {
     #[arg(short = 'B', long = "bootstrap", value_name = "PEER")]
     bootstrap: Vec<BootstrapPeer>,
 
-    /// Bucket size / replication factor (k parameter)
-    #[arg(short, long, default_value = "20")]
-    k: usize,
-
-    /// Lookup parallelism (alpha parameter)
-    #[arg(short, long, default_value = "3")]
-    alpha: usize,
-
     /// Telemetry logging interval in seconds
     #[arg(short, long, default_value = "300")]
     telemetry_interval: u64,
@@ -107,7 +94,6 @@ async fn main() -> Result<()> {
 
     // Initialize tracing subscriber with env filter
     // Default to "info" level, can be overridden with RUST_LOG env var
-    // Use a custom writer that flushes after each write for unbuffered output
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -122,57 +108,25 @@ async fn main() -> Result<()> {
 
     // Generate Ed25519 keypair for node identity
     let keypair = Keypair::generate();
-    let identity = keypair.identity();
 
-    // Generate self-signed Ed25519 certificate for QUIC
-    let (certs, key) = generate_ed25519_cert(&keypair)?;
-    // Clone certs and key for client config (mutual TLS requires both sides)
-    let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
-    let server_config = create_server_config(certs, key)?;
-    // Client config enforces identity verification via SNI pinning.
-    let client_config = create_client_config(client_certs, client_key)?;
-
-    // Bind to specified address
-    let endpoint = Endpoint::server(server_config, args.bind)?;
-    let local_addr = endpoint.local_addr()?;
-
-    // Create our contact info for sharing with peers.
-    let self_contact = Contact {
-        identity,
-        addr: local_addr.to_string(),
-    };
-
-    // Log node startup in format: Node IP:PORT/IDENTITY
-    info!("Node {}/{}", local_addr, hex::encode(identity));
-    info!(k = args.k, alpha = args.alpha, "Parameters");
-
-    // Create the network layer and discovery node.
-    let network = QuinnNetwork::new(endpoint.clone(), self_contact.clone(), client_config);
-    let dht = DhtNode::new(identity, self_contact.clone(), network, args.k, args.alpha);
-
-    // Start the mesh node to accept incoming connections.
-    let node = MeshNode::new(dht.clone())
-        .context("failed to initialize relay server - CSPRNG unavailable")?;
-    let _node_handle = node.spawn(endpoint.clone());
+    // Start the node - this binds, creates endpoint, and starts accepting connections
+    let node = Node::bind(&args.bind.to_string(), keypair).await?;
 
     // Bootstrap from provided peers
     if !args.bootstrap.is_empty() {
         info!("Bootstrapping from {} peer(s)", args.bootstrap.len());
         
-        // Add all bootstrap contacts to routing table
-        // Identity is mandatory, so we can directly add verified contacts
-        for peer in &args.bootstrap {
-            let bootstrap_contact = Contact {
+        // Convert bootstrap peers to contacts
+        let bootstrap_contacts: Vec<Contact> = args.bootstrap.iter().map(|peer| {
+            info!("Bootstrap {}/{}", peer.addr, hex::encode(peer.identity));
+            Contact {
                 identity: peer.identity,
                 addr: peer.addr.to_string(),
-            };
-            info!("Bootstrap {}/{}", peer.addr, hex::encode(peer.identity));
-            dht.observe_contact(bootstrap_contact).await;
-        }
+            }
+        }).collect();
         
-        // Perform initial lookup to populate routing table
-        info!("Performing bootstrap lookup...");
-        match dht.iterative_find_node(identity).await {
+        // Bootstrap: adds peers and performs self-lookup
+        match node.bootstrap(&bootstrap_contacts).await {
             Ok(nodes) => {
                 info!(found = nodes.len(), "Bootstrap complete");
             }
@@ -182,28 +136,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spawn a background task to periodically log telemetry.
-    let telemetry_node = dht.clone();
+    // Periodically log telemetry
     let telemetry_interval = args.telemetry_interval;
-    tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(telemetry_interval));
-        loop {
-            interval.tick().await;
-            let snapshot = telemetry_node.telemetry_snapshot().await;
-            info!(
-                pressure = format!("{:.2}", snapshot.pressure),
-                stored_keys = snapshot.stored_keys,
-                tier_counts = ?snapshot.tier_counts,
-                tier_centroids = ?snapshot.tier_centroids,
-                k = snapshot.replication_factor,
-                alpha = snapshot.concurrency,
-                "telemetry snapshot"
-            );
-        }
-    });
-
-    // Park the main task indefinitely.
-    // A real application would expose an API for feeding peer contacts and performing lookups.
-    future::pending::<()>().await;
-    Ok(())
+    let mut interval = time::interval(Duration::from_secs(telemetry_interval));
+    loop {
+        interval.tick().await;
+        let snapshot = node.telemetry().await;
+        info!(
+            pressure = format!("{:.2}", snapshot.pressure),
+            stored_keys = snapshot.stored_keys,
+            tier_counts = ?snapshot.tier_counts,
+            tier_centroids = ?snapshot.tier_centroids,
+            k = snapshot.replication_factor,
+            alpha = snapshot.concurrency,
+            "telemetry snapshot"
+        );
+    }
 }
