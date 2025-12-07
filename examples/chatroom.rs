@@ -9,9 +9,10 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use corium::{
-    Contact, Identity, Keypair, Node,
-    advanced::{create_client_config, generate_ed25519_cert, hash_content},
+use corium::Node;
+use corium::tests::{
+    Contact, Identity, Keypair,
+    create_client_config, generate_ed25519_cert, hash_content,
 };
 
 /// CLI arguments for the chatroom example.
@@ -92,7 +93,7 @@ async fn main() -> Result<()> {
 
     // Bind full Corium node (facade handles server/DHT setup)
     let bind_addr = format!("0.0.0.0:{}", args.port);
-    let node = Node::bind(&bind_addr, keypair.clone()).await?;
+    let node = Node::bind_with_keypair(&bind_addr, keypair.clone()).await?;
     let endpoint = node.endpoint().clone();
     let local_addr = endpoint.local_addr()?;
 

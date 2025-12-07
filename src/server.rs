@@ -27,8 +27,7 @@
 //! server.run(endpoint).await?;
 //! ```
 
-use crate::net::holepunch::HolePunchRegistry;
-use crate::net::connection::ConnectionRateLimiter;
+use crate::net::{ConnectionRateLimiter, CryptoError, MAX_SESSIONS};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +40,6 @@ use crate::identity::Identity;
 use crate::net::extract_public_key_from_cert;
 use crate::messages::{DhtRequest, DhtResponse};
 use crate::pubsub::PubSubHandler;
-use crate::net::relay::CryptoError;
 
 /// Read timeout for inbound RPC streams (mitigates slowloris-style stalls).
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,8 +73,6 @@ pub(crate) struct Server<N: DhtNetwork> {
     udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
     /// Address of the UDP relay forwarder (for responses to clients).
     udp_forwarder_addr: Option<std::net::SocketAddr>,
-    /// Hole punch rendezvous registry.
-    hole_punch: Arc<HolePunchRegistry>,
     /// Connection rate limiter to prevent DoS.
     rate_limiter: ConnectionRateLimiter,
     /// Optional PubSub handler for GossipSub messages.
@@ -90,7 +86,6 @@ impl<N: DhtNetwork> Server<N> {
             node,
             udp_forwarder: None,
             udp_forwarder_addr: None,
-            hole_punch: Arc::new(HolePunchRegistry::new()),
             rate_limiter: ConnectionRateLimiter::new(),
             pubsub_handler: None,
         })
@@ -134,16 +129,6 @@ impl<N: DhtNetwork> Server<N> {
             forwarder.clone().spawn();
         }
 
-        // Spawn periodic cleanup task for hole punch registry
-        let punch_cleanup = self.hole_punch.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                punch_cleanup.cleanup_expired().await;
-            }
-        });
-
         while let Some(incoming) = endpoint.accept().await {
             // Rate limit incoming connections to prevent DoS
             let remote_addr = incoming.remote_address();
@@ -155,14 +140,12 @@ impl<N: DhtNetwork> Server<N> {
             }
             
             let node = self.node.clone();
-            let hole_punch = self.hole_punch.clone();
             let pubsub_handler = self.pubsub_handler.clone();
             let udp_forwarder = self.udp_forwarder.clone();
             let udp_forwarder_addr = self.udp_forwarder_addr;
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(
-                    node, hole_punch,
-                    pubsub_handler, udp_forwarder, udp_forwarder_addr, incoming
+                    node, pubsub_handler, udp_forwarder, udp_forwarder_addr, incoming
                 ).await {
                     warn!("connection error: {:?}", e);
                 }
@@ -202,7 +185,6 @@ fn extract_verified_identity(connection: &quinn::Connection) -> Option<Identity>
 /// Sybil attacks where a peer claims to be a different identity.
 async fn handle_connection<N: DhtNetwork>(
     node: DhtNode<N>,
-    hole_punch: Arc<HolePunchRegistry>,
     pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
     udp_forwarder_addr: Option<std::net::SocketAddr>,
@@ -243,7 +225,6 @@ async fn handle_connection<N: DhtNetwork>(
         };
 
         let node = node.clone();
-        let hole_punch = hole_punch.clone();
         let pubsub = pubsub_handler.clone();
         let forwarder = udp_forwarder.clone();
         let forwarder_addr = udp_forwarder_addr;
@@ -251,7 +232,7 @@ async fn handle_connection<N: DhtNetwork>(
         let verified_id = verified_identity;
         tokio::spawn(async move {
             if let Err(e) = handle_stream(
-                node, hole_punch, pubsub, 
+                node, pubsub, 
                 forwarder, forwarder_addr, stream, remote_addr, verified_id
             ).await {
                 // Stream errors are common (peer disconnect) but useful for troubleshooting
@@ -271,7 +252,6 @@ async fn handle_connection<N: DhtNetwork>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream<N: DhtNetwork>(
     node: DhtNode<N>,
-    hole_punch: Arc<HolePunchRegistry>,
     pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<crate::net::UdpRelayForwarder>>,
     udp_forwarder_addr: Option<std::net::SocketAddr>,
@@ -338,7 +318,7 @@ async fn handle_stream<N: DhtNetwork>(
 
     // Handle the request and produce a response
     let response = handle_request(
-        node, hole_punch, 
+        node, 
         request, remote_addr, verified_identity, 
         pubsub_handler, udp_forwarder, udp_forwarder_addr
     ).await;
@@ -357,7 +337,6 @@ async fn handle_stream<N: DhtNetwork>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_request<N: DhtNetwork>(
     node: DhtNode<N>,
-    hole_punch: Arc<HolePunchRegistry>,
     request: DhtRequest,
     remote_addr: std::net::SocketAddr,
     _verified_identity: Identity,
@@ -447,7 +426,7 @@ async fn handle_request<N: DhtNetwork>(
             
             // Check current session count
             let session_count = forwarder.session_count().await;
-            if session_count >= crate::net::relay::MAX_SESSIONS {
+            if session_count >= MAX_SESSIONS {
                 return DhtResponse::RelayRejected { 
                     reason: "relay server at capacity".to_string() 
                 };
@@ -506,64 +485,6 @@ async fn handle_request<N: DhtNetwork>(
                 addr: remote_addr.to_string(),
             }
         }
-        DhtRequest::HolePunchRegister {
-            from_peer,
-            target_peer,
-            our_public_addr,
-            punch_id,
-        } => {
-            debug!(
-                from = ?hex::encode(&from_peer.as_bytes()[..8]),
-                target = ?hex::encode(&target_peer.as_bytes()[..8]),
-                punch_id = ?hex::encode(&punch_id[..8]),
-                public_addr = %our_public_addr,
-                "handling HOLE_PUNCH_REGISTER request"
-            );
-            
-            // Use the registry to register or match with existing peer
-            match hole_punch.register(punch_id, from_peer, target_peer, our_public_addr).await {
-                Ok(Some((peer_addr, start_time_ms))) => {
-                    // Both peers registered - return ready response
-                    DhtResponse::HolePunchReady {
-                        punch_id,
-                        peer_addr,
-                        start_time_ms,
-                    }
-                }
-                Ok(None) => {
-                    // First peer - waiting for the other
-                    DhtResponse::HolePunchWaiting { punch_id }
-                }
-                Err(reason) => {
-                    // Rate limited
-                    DhtResponse::HolePunchFailed {
-                        reason: reason.to_string(),
-                    }
-                }
-            }
-        }
-        DhtRequest::HolePunchStart { punch_id } => {
-            debug!(
-                punch_id = ?hex::encode(&punch_id[..8]),
-                "handling HOLE_PUNCH_START request"
-            );
-            
-            // Check if punch is ready
-            match hole_punch.check_ready(&punch_id).await {
-                Some((peer_addr, start_time_ms)) => {
-                    DhtResponse::HolePunchReady {
-                        punch_id,
-                        peer_addr,
-                        start_time_ms,
-                    }
-                }
-                None => {
-                    DhtResponse::HolePunchFailed {
-                        reason: "Punch not ready or expired".to_string(),
-                    }
-                }
-            }
-        }
         DhtRequest::PubSub { from, message } => {
             // Dispatch PubSub messages to the registered handler (GossipSub layer)
             // The handler is responsible for:
@@ -603,6 +524,7 @@ async fn handle_request<N: DhtNetwork>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::MAX_CONNECTIONS_PER_IP_PER_SECOND;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
@@ -611,7 +533,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
         // Should allow up to MAX_CONNECTIONS_PER_IP_PER_SECOND (20)
-        for _ in 0..crate::net::connection::MAX_CONNECTIONS_PER_IP_PER_SECOND {
+        for _ in 0..MAX_CONNECTIONS_PER_IP_PER_SECOND {
             assert!(limiter.allow(ip).await);
         }
         
@@ -621,5 +543,128 @@ mod tests {
         // Different IP should be allowed
         let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         assert!(limiter.allow(ip2).await);
+    }
+
+    // ========================================================================
+    // Rate Limiter Boundary Condition Tests (from tests/security_gaps.rs)
+    // ========================================================================
+
+    /// Maximum connections per IP per second.
+    const TEST_MAX_CONNECTIONS_PER_IP: usize = 10;
+
+    /// Maximum global connections per second.
+    const TEST_MAX_GLOBAL_CONNECTIONS: usize = 100;
+
+    /// Maximum IPs to track.
+    const TEST_MAX_TRACKED_IPS: usize = 1000;
+
+    #[test]
+    fn per_ip_limit_exact_boundary() {
+        let allowed_count = TEST_MAX_CONNECTIONS_PER_IP;
+        let rejected_count = 1;
+
+        assert_eq!(
+            allowed_count + rejected_count,
+            TEST_MAX_CONNECTIONS_PER_IP + 1,
+            "Test configuration error"
+        );
+    }
+
+    #[test]
+    fn global_limit_exact_boundary() {
+        let ips_needed = TEST_MAX_GLOBAL_CONNECTIONS / TEST_MAX_CONNECTIONS_PER_IP;
+
+        assert_eq!(ips_needed, 10, "Should need 10 IPs to hit global limit");
+
+        let total_allowed = TEST_MAX_GLOBAL_CONNECTIONS;
+        assert_eq!(total_allowed, 100);
+    }
+
+    #[test]
+    fn ip_tracking_lru_eviction() {
+        let ips_to_fill_cache = TEST_MAX_TRACKED_IPS;
+        let extra_ip = 1;
+
+        assert!(
+            ips_to_fill_cache + extra_ip > TEST_MAX_TRACKED_IPS,
+            "Need more IPs than cache size to trigger eviction"
+        );
+    }
+
+    #[test]
+    fn rate_limit_window_expiration() {
+        use std::time::Duration;
+
+        let window_duration = Duration::from_secs(1);
+        let time_after_window = Duration::from_millis(1001);
+
+        assert!(
+            time_after_window > window_duration,
+            "Time after window should exceed window duration"
+        );
+    }
+
+    #[test]
+    fn rapid_burst_handling() {
+        let burst_connections = TEST_MAX_CONNECTIONS_PER_IP + 5;
+        let expected_allowed = TEST_MAX_CONNECTIONS_PER_IP;
+        let expected_rejected = 5;
+
+        assert_eq!(
+            expected_allowed + expected_rejected,
+            burst_connections,
+            "Burst should be partially rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_rate_limit_checks() {
+        use tokio::sync::Barrier;
+        use std::sync::Arc;
+
+        let barrier = Arc::new(Barrier::new(20));
+        let mut handles = vec![];
+
+        for _ in 0..20 {
+            let barrier = barrier.clone();
+            let handle = tokio::spawn(async move {
+                barrier.wait().await;
+                true
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        assert_eq!(results.len(), 20);
+        for result in results {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn ipv4_vs_ipv6_separate_limits() {
+        let ipv4: IpAddr = "192.168.1.1".parse().unwrap();
+        let ipv6: IpAddr = "::1".parse().unwrap();
+
+        assert_ne!(ipv4, ipv6);
+
+        let ipv4_mapped_ipv6: IpAddr = "::ffff:192.168.1.1".parse().unwrap();
+
+        assert_ne!(ipv4, ipv4_mapped_ipv6);
+    }
+
+    #[test]
+    fn sustained_load_over_time() {
+        let seconds_of_load = 10;
+        let connections_per_second = TEST_MAX_CONNECTIONS_PER_IP;
+
+        let total_allowed = seconds_of_load * connections_per_second;
+
+        assert_eq!(
+            total_allowed, 100,
+            "Should allow {} connections over {} seconds",
+            total_allowed, seconds_of_load
+        );
     }
 }

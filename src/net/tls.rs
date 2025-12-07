@@ -282,13 +282,7 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
+        vec![rustls::SignatureScheme::ED25519]
     }
 
     fn client_auth_mandatory(&self) -> bool {
@@ -452,13 +446,118 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            // Keep other schemes for backwards compatibility
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+// ============================================================================
+// TLS Certificate Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Keypair;
+    use std::collections::HashSet;
+
+    // ========================================================================
+    // P3: SNI Identity Pinning Tests
+    // ========================================================================
+
+    /// P3: Certificate contains the same public key as Identity.
+    #[test]
+    fn certificate_contains_identity_public_key() {
+        for _ in 0..50 {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            
+            let (certs, _key) = generate_ed25519_cert(&keypair)
+                .expect("cert generation must succeed");
+            
+            let cert_der = certs[0].as_ref();
+            let extracted_pk = extract_public_key_from_cert(cert_der)
+                .expect("public key extraction must succeed");
+            
+            assert_eq!(
+                extracted_pk,
+                *identity.as_bytes(),
+                "P3 violation: Certificate public key differs from Identity"
+            );
+        }
+    }
+
+    /// P3: verify_identity accepts matching certificate.
+    #[test]
+    fn verify_identity_accepts_matching_cert() {
+        for _ in 0..50 {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            let public_key = keypair.public_key_bytes();
+            
+            assert!(
+                crate::identity::verify_identity(&identity, &public_key),
+                "P3 violation: verify_identity rejected matching public key"
+            );
+        }
+    }
+
+    /// P3: verify_identity rejects mismatched certificate.
+    #[test]
+    fn verify_identity_rejects_mismatched_cert() {
+        for _ in 0..50 {
+            let keypair1 = Keypair::generate();
+            let keypair2 = Keypair::generate();
+            
+            let identity1 = keypair1.identity();
+            let public_key2 = keypair2.public_key_bytes();
+            
+            assert!(
+                !crate::identity::verify_identity(&identity1, &public_key2),
+                "P3 violation: verify_identity accepted mismatched public key"
+            );
+        }
+    }
+
+    /// P4: Identity is cryptographically bound to the keypair via certificate.
+    #[test]
+    fn identity_bound_to_keypair_via_cert() {
+        for _ in 0..50 {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            
+            // Generate certificate from keypair
+            let (certs, _) = generate_ed25519_cert(&keypair)
+                .expect("cert generation must succeed");
+            
+            // Extract public key from certificate
+            let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
+                .expect("pk extraction must succeed");
+            
+            // Verify identity matches certificate public key
+            assert!(
+                crate::identity::verify_identity(&identity, &cert_pk),
+                "P4 violation: Identity not bound to keypair via certificate"
+            );
+        }
+    }
+
+    /// P4: Different keypairs produce certificates with different public keys.
+    #[test]
+    fn different_keypairs_different_cert_public_keys() {
+        let mut public_keys = HashSet::new();
+        
+        for _ in 0..100 {
+            let keypair = Keypair::generate();
+            let (certs, _) = generate_ed25519_cert(&keypair)
+                .expect("cert generation must succeed");
+            
+            let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
+                .expect("pk extraction must succeed");
+            
+            assert!(
+                public_keys.insert(cert_pk),
+                "P4 violation: Certificate public key collision between different keypairs"
+            );
+        }
     }
 }

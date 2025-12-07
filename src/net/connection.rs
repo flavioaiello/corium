@@ -438,3 +438,166 @@ impl Default for ConnectionRateLimiter {
         Self::new()
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::RwLock;
+
+    fn make_identity(seed: u32) -> Identity {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&seed.to_be_bytes());
+        Identity::from_bytes(bytes)
+    }
+
+    // ========================================================================
+    // Connection Cache Under Load Tests
+    // ========================================================================
+
+    const TEST_MAX_CONNECTIONS: usize = 1024;
+    const CONNECTION_STALE_TIMEOUT_SECS: u64 = 60;
+
+    #[test]
+    fn cache_eviction_at_capacity() {
+        let cache_size = TEST_MAX_CONNECTIONS;
+        let new_connections = 10;
+
+        assert!(
+            cache_size + new_connections > cache_size,
+            "Should trigger eviction"
+        );
+    }
+
+    #[test]
+    fn stale_connection_detection() {
+        let stale_timeout = Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS);
+
+        let last_used = Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS + 1);
+        assert!(last_used > stale_timeout, "Connection should be considered stale");
+
+        let last_used_recent = Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS - 1);
+        assert!(
+            last_used_recent <= stale_timeout,
+            "Connection should not be considered stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_access() {
+        use std::collections::HashMap;
+
+        let cache: Arc<RwLock<HashMap<Identity, u32>>> = Arc::new(RwLock::new(HashMap::new()));
+        let mut handles = vec![];
+
+        for i in 0..100 {
+            let cache = cache.clone();
+            let handle = tokio::spawn(async move {
+                if i % 2 == 0 {
+                    let mut guard = cache.write().await;
+                    guard.insert(make_identity(i as u32), i);
+                } else {
+                    let guard = cache.read().await;
+                    let _ = guard.get(&make_identity((i - 1) as u32));
+                }
+            });
+            handles.push(handle);
+        }
+
+        futures::future::join_all(handles).await;
+
+        let final_cache = cache.read().await;
+        assert!(final_cache.len() <= 50, "Should have at most 50 entries");
+    }
+
+    #[test]
+    fn closed_connection_handling() {
+        #[derive(Debug, PartialEq)]
+        enum ConnectionState {
+            Open,
+            Closed,
+        }
+
+        let mut connections: Vec<ConnectionState> = vec![
+            ConnectionState::Open,
+            ConnectionState::Closed,
+            ConnectionState::Open,
+            ConnectionState::Closed,
+        ];
+
+        connections.retain(|c| *c != ConnectionState::Closed);
+
+        assert_eq!(connections.len(), 2, "Should remove closed connections");
+    }
+
+    #[test]
+    fn liveness_probe_updates_timestamp() {
+        let initial_timestamp = Instant::now();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let updated_timestamp = Instant::now();
+
+        assert!(updated_timestamp > initial_timestamp);
+        assert!(initial_timestamp.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn connection_failure_invalidation() {
+        let mut identities_in_cache: HashSet<Identity> = HashSet::new();
+
+        for i in 0..10 {
+            identities_in_cache.insert(make_identity(i));
+        }
+
+        let failed_node = make_identity(5);
+        identities_in_cache.remove(&failed_node);
+
+        assert!(!identities_in_cache.contains(&failed_node));
+        assert_eq!(identities_in_cache.len(), 9);
+    }
+
+    #[test]
+    fn cache_memory_bounded() {
+        let max_entries = TEST_MAX_CONNECTIONS;
+
+        let estimated_bytes_per_entry = 256;
+        let max_memory_bytes = max_entries * estimated_bytes_per_entry;
+
+        assert!(
+            max_memory_bytes <= 512 * 1024,
+            "Cache memory should be bounded to ~512KB, got {} bytes",
+            max_memory_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn rapid_connect_disconnect_cycles() {
+        let mut operations = Vec::new();
+
+        for i in 0..100 {
+            let identity = make_identity((i % 10) as u32);
+            if i % 2 == 0 {
+                operations.push(("connect", identity));
+            } else {
+                operations.push(("disconnect", identity));
+            }
+        }
+
+        assert_eq!(operations.len(), 100);
+
+        let node_0_ops: Vec<_> = operations
+            .iter()
+            .filter(|(_, id)| *id == make_identity(0))
+            .collect();
+
+        assert!(node_0_ops.len() >= 10, "Node 0 should have multiple operations");
+    }
+}

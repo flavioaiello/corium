@@ -31,3 +31,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.12"
 bincode = "1.3"
 getrandom = "0.2"
+
+[features]
+default = []
+# Expose internal APIs for testing. Not covered by semver.
+tests = []
+
+[dev-dependencies]
+futures = "0.3"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+[[example]]
+name = "chatroom"
+required-features = ["tests"]
+
+[[test]]
+name = "scale"
+required-features = ["tests"]

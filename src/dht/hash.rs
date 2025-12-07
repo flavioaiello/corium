@@ -15,23 +15,6 @@ pub type Key = [u8; 32];
 /// Maximum age for EndpointRecords to prevent replay attacks (24 hours).
 const ENDPOINT_RECORD_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// Check if an Identity is valid (not a placeholder or obviously invalid).
-///
-/// # Security
-///
-/// Used to prevent routing table pollution from placeholder IDs.
-/// Returns false for:
-/// - All-zeros (placeholder for unknown peers)
-/// - All-ones (reserved/invalid)
-///
-/// # Deprecated
-///
-/// Prefer using `Identity::is_valid()` directly.
-#[inline]
-pub fn is_valid_identity(id: &Identity) -> bool {
-    id.is_valid()
-}
-
 /// Compute a 32-byte BLAKE3 digest of the input data.
 pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
@@ -47,8 +30,8 @@ pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
 ///
 /// This is the standard way to derive a DHT key for storing content:
 ///
-/// ```
-/// use corium::hash_content;
+/// ```ignore
+/// use corium::internals::hash_content;
 ///
 /// let content = b"hello world";
 /// let key = hash_content(content);
@@ -84,8 +67,8 @@ pub fn xor_distance(a: &Identity, b: &Identity) -> [u8; 32] {
 ///
 /// # Example
 ///
-/// ```
-/// use corium::{hash_content, verify_key_value_pair};
+/// ```ignore
+/// use corium::internals::{hash_content, verify_key_value_pair};
 ///
 /// let content = b"my data";
 /// let key = hash_content(content);

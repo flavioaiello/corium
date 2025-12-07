@@ -7,7 +7,6 @@
 //! - Direct QUIC connections when network conditions allow
 //! - Automatic relay fallback when behind Symmetric NAT (CGNAT)
 //! - NAT type detection and connection strategy selection
-//! - Connection upgrade probing (relay → direct via new connection when conditions improve)
 //!
 //! # Module Structure
 //!
@@ -17,26 +16,24 @@
 //! | [`tls`] | TLS configuration, Ed25519 certificates, SNI identity pinning |
 //! | [`connection`] | Connection cache (LRU, 1000 max), health monitoring, rate limiting |
 //! | [`smartsock`] | Unified transport socket with seamless relay↔direct path switching |
-//! | [`holepunch`] | NAT hole punching coordination, rendezvous registry (5000 pending max) |
 //! | [`relay`] | UDP relay forwarder for CRLY-framed packet forwarding |
 //!
 //! # Re-exports
 //!
 //! Key types are re-exported for convenience:
 //! - [`PeerNetwork`]: Main network interface
-//! - [`SmartConnection`]: Transport-agnostic connection handle
+//! - [`SmartConnection`]: Connection status enum (Direct, RelayPending, Relayed)
 //! - [`UdpRelayForwarder`]: Relay packet forwarder for NAT traversal
 //! - [`ALPN`]: Protocol identifier (`corium`)
 //! - TLS utilities: `generate_ed25519_cert`, `create_server_config`, `create_client_config`
 
-pub mod connection;
-pub mod holepunch;
-pub mod relay;
-pub mod smartsock;
-pub mod tls;
-pub mod transport;
+mod connection;
+mod relay;
+mod smartsock;
+mod tls;
+mod transport;
 
-// Re-export types used by other internal modules and lib.rs
+// Re-export types for lib.rs public API
 pub use transport::{
     PeerNetwork,
     ALPN,
@@ -52,3 +49,8 @@ pub use relay::{
     UdpRelayForwarder, RelayInfo, NatType, NatReport, CryptoError,
     detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT,
 };
+
+// Crate-internal re-exports (used by node.rs, server.rs)
+pub(crate) use smartsock::SmartSock;
+pub(crate) use connection::{ConnectionRateLimiter, MAX_CONNECTIONS_PER_IP_PER_SECOND};
+pub(crate) use relay::MAX_SESSIONS;

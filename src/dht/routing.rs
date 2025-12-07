@@ -621,4 +621,165 @@ mod tests {
             "new peer should have used one token"
         );
     }
+
+    // ========================================================================
+    // RoutingTable Tests (moved from tests/routing_table.rs)
+    // ========================================================================
+
+    fn make_test_identity(byte: u8) -> Identity {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        Identity::from_bytes(id)
+    }
+
+    fn make_test_contact(byte: u8) -> Contact {
+        Contact {
+            identity: make_test_identity(byte),
+            addr: format!("node-{byte}"),
+        }
+    }
+
+    #[test]
+    fn routing_table_orders_contacts_by_distance() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 4);
+
+        let contacts = [make_test_contact(0x10), make_test_contact(0x20), make_test_contact(0x08)];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        let target = make_test_identity(0x18);
+        let closest = table.closest(&target, 3);
+        let ids: Vec<u8> = closest.iter().map(|c| c.identity.as_bytes()[0]).collect();
+        assert_eq!(ids, vec![0x10, 0x08, 0x20]);
+    }
+
+    #[test]
+    fn routing_table_respects_bucket_capacity() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 2);
+
+        let contacts = [make_test_contact(0x80), make_test_contact(0xC0), make_test_contact(0xA0)];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        let target = make_test_identity(0x90);
+        let closest = table.closest(&target, 10);
+        let ids: Vec<u8> = closest.iter().map(|c| c.identity.as_bytes()[0]).collect();
+        assert_eq!(closest.len(), 2);
+        assert!(ids.contains(&0x80));
+        assert!(ids.contains(&0xC0));
+    }
+
+    #[test]
+    fn routing_table_truncates_when_k_changes() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 4);
+
+        let contacts = [make_test_contact(0x80), make_test_contact(0x81), make_test_contact(0x82)];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        table.set_k(2);
+        let target = make_test_identity(0x80);
+        let closest = table.closest(&target, 10);
+        assert_eq!(closest.len(), 2);
+    }
+
+    // ========================================================================
+    // Sybil Attack on Routing Table Tests (from tests/security_gaps.rs)
+    // ========================================================================
+
+    /// Maximum bucket size (k parameter).
+    const MAX_K: usize = 30;
+
+    /// Number of buckets in routing table.
+    const NUM_BUCKETS: usize = 256;
+
+    /// Test that routing table has limited size.
+    #[test]
+    fn routing_table_size_bounded() {
+        let max_routing_table_size = MAX_K * NUM_BUCKETS;
+        assert_eq!(max_routing_table_size, 7680);
+        assert!(max_routing_table_size < 10_000, "Routing table should be bounded");
+    }
+
+    /// Test Sybil attack with targeted NodeIds.
+    #[test]
+    fn sybil_attack_targeted_bucket() {
+        let _target_bucket = 100;
+        let attacker_nodes = 100;
+
+        let nodes_in_bucket = std::cmp::min(attacker_nodes, MAX_K);
+
+        assert_eq!(nodes_in_bucket, 30, "Bucket should accept at most k nodes");
+    }
+
+    /// Test Sybil resistance through bucket distribution.
+    #[test]
+    fn sybil_bucket_distribution() {
+        let honest_identity = make_test_identity(0x01);
+
+        let mut bucket_counts = vec![0usize; NUM_BUCKETS];
+
+        for i in 0..1000u32 {
+            let attacker_id = make_test_identity(i.wrapping_mul(7919) as u8);
+            let bucket = bucket_index_for_test(honest_identity.as_bytes(), attacker_id.as_bytes());
+            bucket_counts[bucket] += 1;
+        }
+
+        let non_empty_buckets = bucket_counts.iter().filter(|&&c| c > 0).count();
+
+        assert!(
+            non_empty_buckets >= 5,
+            "Should distribute across multiple buckets, got {} non-empty buckets",
+            non_empty_buckets
+        );
+    }
+
+    /// Test bucket index calculation for Sybil resistance.
+    #[test]
+    fn bucket_index_calculation_correct() {
+        let self_id = make_test_identity(0x00);
+
+        // Same ID -> bucket 255 (closest - identical)
+        let same_id = make_test_identity(0x00);
+        assert_eq!(
+            bucket_index_for_test(self_id.as_bytes(), same_id.as_bytes()),
+            255,
+            "Same ID should be in bucket 255"
+        );
+
+        // First byte differs with MSB set
+        let msb_differs = Identity::from_bytes({
+            let mut b = [0u8; 32];
+            b[0] = 0x80;
+            b
+        });
+        assert_eq!(
+            bucket_index_for_test(self_id.as_bytes(), msb_differs.as_bytes()),
+            0,
+            "MSB differs should be bucket 0"
+        );
+    }
+
+    /// Calculate bucket index for a node ID relative to self.
+    fn bucket_index_for_test(self_id: &[u8; 32], other: &[u8; 32]) -> usize {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = self_id[i] ^ other[i];
+        }
+
+        for (byte_idx, &byte) in xor.iter().enumerate() {
+            if byte != 0 {
+                let bit_idx = byte.leading_zeros() as usize;
+                return byte_idx * 8 + bit_idx;
+            }
+        }
+
+        255
+    }
 }

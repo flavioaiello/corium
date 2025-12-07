@@ -10,13 +10,13 @@
 //! - **Adaptive Parameters**: Dynamic `k` (10-30) and `α` (2-5) adjustment based on network churn
 //! - **Node State Machine**: [`DhtNode`] orchestrating iterative lookups, replication, and address publishing
 
-pub mod hash;
-pub mod tiering;
-pub mod storage;
-pub mod params;
-pub mod routing;
-pub mod network;
-pub mod node;
+mod hash;
+mod tiering;
+mod storage;
+mod params;
+mod routing;
+mod network;
+mod node;
 
 // Re-export types used by other internal modules and lib.rs
 pub use hash::{hash_content, verify_key_value_pair, Key};

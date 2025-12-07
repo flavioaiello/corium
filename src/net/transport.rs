@@ -7,7 +7,6 @@
 //! - Direct QUIC connections when network conditions allow
 //! - Automatic relay fallback when behind Symmetric NAT (CGNAT)
 //! - NAT type detection and connection strategy selection
-//! - Connection upgrade probing (relay → direct when conditions improve)
 //!
 //! # Why Use `smart_connect` Instead of Raw QUIC?
 //!
@@ -24,9 +23,8 @@
 //!
 //! The returned [`SmartConnection`] transparently handles:
 //! - **Public IP / Full Cone NAT**: Direct QUIC connection
-//! - **Restricted Cone NAT**: Direct with hole-punching coordination  
+//! - **Restricted Cone NAT**: Direct connection (no coordination needed)
 //! - **Symmetric NAT (CGNAT)**: Automatic relay with E2E encryption
-//! - **Mixed topologies**: Optimal path selection based on RTT
 //!
 //! # Cryptographic Addressing
 //!
@@ -36,19 +34,16 @@
 //! 2. **Smart Connect**: Call `smart_connect(&record)` — handles all connectivity
 //! 3. **Verify**: TLS certificate verification happens automatically
 //!
-//! # NAT Traversal (Handled Automatically)
+//! # NAT Traversal Strategy
 //!
-//! When direct connection fails, the network uses relay-based traversal:
+//! The network uses a relay-based NAT traversal strategy:
 //!
-//! 1. **Direct first**: Always try direct UDP connection
-//! 2. **Relay fallback**: If blocked by NAT, connect via relay
-//! 3. **Upgrade probing**: Periodically attempt new direct connection
-//! 4. **Session handoff**: When direct succeeds, close relay session and switch
+//! 1. **Direct first**: Try direct UDP connection with 5s timeout
+//! 2. **Relay fallback**: If blocked by NAT, connect via relay node
+//! 3. **E2E encryption**: Relay forwards encrypted packets it cannot decrypt
 //!
-//! Note: "Upgrade" creates a new connection (relay and peer are different hosts).
-//! QUIC migration only allows changing source IP within the same connection.
-//!
-//! This reduces relay load and latency when NAT conditions change.
+//! For CGNAT ↔ CGNAT scenarios, relay is used automatically since direct
+//! connections are unreliable with Symmetric NAT.
 //!
 //! # Protocol
 //!
@@ -58,7 +53,6 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
 
 use lru::LruCache;
 
@@ -95,9 +89,6 @@ pub use super::tls::{
     extract_public_key_from_cert,
     verify_peer_identity,
 };
-
-/// How often to attempt upgrading relayed connections to direct.
-pub const UPGRADE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum size of an RPC response in bytes (1 MB).
 /// Larger than request to accommodate FIND_VALUE responses with data.

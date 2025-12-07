@@ -1,168 +1,123 @@
 //! # Corium
 //!
-//! A mesh networking library with automatic NAT traversal.
+//! A mesh networking library with automatic NAT traversal and pubsub.
 //!
 //! ## Quick Start
 //!
-//! The [`Node`] type is the primary API. It provides a simple, high-level
-//! interface for mesh networking:
-//!
 //! ```ignore
-//! use corium::{Node, Keypair};
+//! use corium::Node;
 //!
-//! // Generate or load identity
-//! let keypair = Keypair::generate();
+//! // Create a node (auto-generates identity)
+//! let node = Node::bind("0.0.0.0:0").await?;
+//! println!("My identity: {}", node.identity());
 //!
-//! // Start the node
-//! let node = Node::bind("0.0.0.0:0", keypair).await?;
+//! // Bootstrap from a seed node
+//! node.bootstrap("a1b2c3d4e5f6...", "seed.example.com:9000").await?;
 //!
-//! // Store and retrieve data
-//! let key = node.put(b"hello world".to_vec()).await?;
-//! let value = node.get(&key).await?;
+//! // Subscribe to a topic
+//! node.subscribe("chat").await?;
 //!
-//! // Connect to peers with automatic NAT traversal
-//! let record = node.resolve_peer(&peer_identity).await?;
-//! let conn = node.connect(&record).await?;
-//! ```
-//!
-//! ## Ed25519 Identity
-//!
-//! Each node has a cryptographic identity based on an Ed25519 keypair. The Identity
-//! is the Ed25519 public key (32 bytes). This provides:
-//!
-//! - **Stable identity**: The Identity is tied to a cryptographic key, not an address
-//! - **Verifiable peers**: Peers can verify that a node owns its claimed Identity
-//! - **Secure transport**: TLS certificates use the same Ed25519 key
-//! - **Zero-hash model**: Identity IS the public key, eliminating hash computation
-//!
-//! ## NAT Traversal (Handled Automatically)
-//!
-//! Corium uses a multi-layered approach to NAT traversal, all handled internally
-//! by [`Node::connect`]:
-//!
-//! 1. **Direct First**: Always attempt direct UDP connection
-//! 2. **Relay Fallback**: When blocked by Symmetric NAT/CGNAT, connect via relay
-//! 3. **Parallel Probing**: Continuously probe all paths to find the best route
-//! 4. **QUIC Migration**: Seamlessly switch paths without reconnecting
-//!
-//! ## PubSub Messaging
-//!
-//! Enable GossipSub for pub/sub messaging:
-//!
-//! ```ignore
-//! use corium::{Node, Keypair};
-//!
-//! let keypair = Keypair::generate();
-//! let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
-//!
-//! // Subscribe and receive messages
-//! node.subscribe("my-topic").await?;
-//! let mut rx = node.take_message_receiver().await?;
+//! // Receive messages
+//! let mut rx = node.messages().await?;
 //! tokio::spawn(async move {
 //!     while let Some(msg) = rx.recv().await {
-//!         println!("Received: {:?}", msg.data);
+//!         println!("[{}] {}: {:?}", msg.topic, msg.from, msg.data);
 //!     }
 //! });
 //!
 //! // Publish messages
-//! node.publish("my-topic", b"hello!".to_vec()).await?;
+//! node.publish("chat", b"Hello!".to_vec()).await?;
+//!
+//! // Connect to a peer
+//! let conn = node.connect("abc123...", "192.168.1.50:9000").await?;
 //! ```
+//!
+//! ## Public API
+//!
+//! The public API consists of just 3 types:
+//!
+//! - [`Node`] - The mesh network node
+//! - [`Message`] - A received pubsub message
+//! - [`Connection`] - A QUIC connection to a peer
+//!
+//! For persistent identity, use [`Node::bind_with_keypair`].
 
-/// Returns the current time in milliseconds since UNIX_EPOCH.
-///
-/// Uses `unwrap_or_default()` instead of `unwrap()` to gracefully handle
-/// the edge case where the system clock is set before the UNIX epoch
-/// (returns 0 in that case rather than panicking).
+// Internal modules
+pub(crate) mod dht;
+pub(crate) mod identity;
+pub(crate) mod messages;
+pub(crate) mod net;
+pub(crate) mod node;
+pub(crate) mod pubsub;
+pub(crate) mod server;
+
+/// Returns the current time in milliseconds since UNIX_EPOCH (crate-internal).
 #[inline]
-pub fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-// Internal modules - not part of public API
-pub(crate) mod dht;
-pub(crate) mod identity;
-pub(crate) mod messages;
-pub(crate) mod net;
-pub(crate) mod pubsub;
-pub(crate) mod server;
-
-// Public facade
-pub mod node;
-
 // ============================================================================
-// Public API - only types needed by Node facade users
+// Public API - minimal surface for Node users
 // ============================================================================
 
-// Primary API - the Node facade
-pub use node::{Node, PubSubHandler};
+/// The mesh network node - primary API.
+pub use node::Node;
 
-// Identity types - needed for Node::bind(), identity management
-pub use identity::{Identity, Keypair, EndpointRecord, RelayEndpoint};
+/// A received pubsub message.
+pub use node::Message;
 
-// DHT types - used in Node method signatures
-pub use dht::{Contact, Key, TelemetrySnapshot, hash_content, verify_key_value_pair};
-
-// Connection types - returned from Node::connect()
-pub use net::SmartConnection;
-
-// PubSub types - used with Node pubsub methods
-pub use pubsub::{MessageId, ReceivedMessage};
+/// QUIC connection to a peer.
+pub use quinn::Connection;
 
 // ============================================================================
-// Advanced API - for power users who need lower-level access
+// Test Support - exposed only with feature flag
 // ============================================================================
 
-/// Advanced module for power users who need direct access to internal components.
+/// Internal access for testing.
 ///
-/// Most users should use the [`Node`] facade instead. This module is for:
-/// - Building custom networking protocols on top of QUIC
-/// - Direct DHT operations without the Node wrapper
-/// - Custom pubsub handlers
-/// - Advanced NAT traversal scenarios
-///
-/// # Example
-///
-/// ```ignore
-/// use corium::advanced::{generate_ed25519_cert, create_client_config, PeerNetwork};
-///
-/// // Build custom QUIC client
-/// let (certs, key) = generate_ed25519_cert(&keypair)?;
-/// let config = create_client_config(certs, key)?;
-/// ```
-pub mod advanced {
-    // TLS/certificate utilities
-    pub use crate::net::{
-        create_client_config, create_server_config, generate_ed25519_cert,
-        extract_public_key_from_cert, verify_peer_identity, ALPN,
-    };
-    
-    // Network layer
-    pub use crate::net::PeerNetwork;
+/// **Warning**: This module is not covered by semver guarantees.
+/// Enable with `features = ["tests"]` in Cargo.toml.
+#[cfg(feature = "tests")]
+pub mod tests {
+    // Identity
+    pub use crate::identity::{Keypair, Identity, EndpointRecord, RelayEndpoint, verify_identity};
     
     // DHT
-    pub use crate::dht::{DhtNode, DhtNetwork, RoutingTable, hash_content};
-    
-    // PubSub
-    pub use crate::pubsub::{
-        GossipSub, GossipConfig, PubSubMessage, SignatureError,
-        sign_pubsub_message, verify_pubsub_signature,
+    pub use crate::dht::{
+        DhtNode, DhtNetwork, RoutingTable, Contact, Key,
+        TelemetrySnapshot, hash_content, verify_key_value_pair,
     };
     
-    // Relay/NAT (from src/net/relay.rs)
+    // Network
     pub use crate::net::{
+        PeerNetwork, SmartConnection,
+        create_client_config, create_server_config, generate_ed25519_cert,
+        extract_public_key_from_cert, verify_peer_identity, ALPN,
         UdpRelayForwarder, RelayInfo, NatType, NatReport, CryptoError,
         detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT,
     };
     
-    // Identity (for low-level operations)
-    pub use crate::identity::{Keypair, verify_identity, Identity};
-    
-    // Wire protocol (for custom protocol implementations)
-    pub use crate::messages::{
-        deserialize_request, deserialize_response, serialize,
-        DhtRequest, DhtResponse, MAX_DESERIALIZE_SIZE,
+    // PubSub
+    pub use crate::pubsub::{
+        GossipSub, GossipConfig, PubSubMessage, PubSubHandler,
+        MessageId, ReceivedMessage, SignatureError,
+        sign_pubsub_message, verify_pubsub_signature,
     };
+    
+    // Wire protocol
+    pub use crate::messages::{
+        DhtRequest, DhtResponse,
+        deserialize_request, deserialize_response, serialize,
+        MAX_DESERIALIZE_SIZE,
+    };
+    
+    /// Time utility.
+    #[inline]
+    pub fn now_ms() -> u64 {
+        crate::now_ms()
+    }
 }

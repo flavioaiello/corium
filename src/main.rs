@@ -31,7 +31,7 @@ use tokio::time::{self, Duration};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use corium::{Contact, Identity, Keypair, Node};
+use corium::Node;
 
 /// A bootstrap peer specification.
 /// 
@@ -43,7 +43,7 @@ use corium::{Contact, Identity, Keypair, Node};
 #[derive(Clone, Debug)]
 struct BootstrapPeer {
     addr: SocketAddr,
-    identity: Identity,
+    identity: String,
 }
 
 impl FromStr for BootstrapPeer {
@@ -56,14 +56,15 @@ impl FromStr for BootstrapPeer {
         
         let addr: SocketAddr = addr_part.parse()
             .context("invalid socket address")?;
+        
+        // Validate identity is valid hex
         let id_bytes = hex::decode(id_part)
             .context("invalid hex Identity")?;
         if id_bytes.len() != 32 {
             anyhow::bail!("Identity must be 64 hex characters (32 bytes)");
         }
-        let mut identity_bytes = [0u8; 32];
-        identity_bytes.copy_from_slice(&id_bytes);
-        Ok(BootstrapPeer { addr, identity: Identity::from_bytes(identity_bytes) })
+        
+        Ok(BootstrapPeer { addr, identity: id_part.to_string() })
     }
 }
 
@@ -106,32 +107,19 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Generate Ed25519 keypair for node identity
-    let keypair = Keypair::generate();
-
-    // Start the node - this binds, creates endpoint, and starts accepting connections
-    let node = Node::bind(&args.bind.to_string(), keypair).await?;
+    // Start the node (auto-generates identity)
+    let node = Node::bind(&args.bind.to_string()).await?;
+    info!("Node identity: {}", node.identity());
 
     // Bootstrap from provided peers
-    if !args.bootstrap.is_empty() {
-        info!("Bootstrapping from {} peer(s)", args.bootstrap.len());
-        
-        // Convert bootstrap peers to contacts
-        let bootstrap_contacts: Vec<Contact> = args.bootstrap.iter().map(|peer| {
-            info!("Bootstrap {}/{}", peer.addr, hex::encode(peer.identity));
-            Contact {
-                identity: peer.identity,
-                addr: peer.addr.to_string(),
-            }
-        }).collect();
-        
-        // Bootstrap: adds peers and performs self-lookup
-        match node.bootstrap(&bootstrap_contacts).await {
-            Ok(nodes) => {
-                info!(found = nodes.len(), "Bootstrap complete");
+    for peer in &args.bootstrap {
+        info!("Bootstrapping from {}/{}", peer.addr, &peer.identity[..16]);
+        match node.bootstrap(&peer.identity, &peer.addr.to_string()).await {
+            Ok(()) => {
+                info!("Bootstrap complete");
             }
             Err(e) => {
-                warn!(error = %e, "Bootstrap lookup failed");
+                warn!(error = %e, "Bootstrap failed");
             }
         }
     }

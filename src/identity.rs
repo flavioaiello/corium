@@ -55,8 +55,8 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use corium::Keypair;
+//! ```ignore
+//! use corium::internals::Keypair;
 //!
 //! // Generate a new random keypair
 //! let keypair = Keypair::generate();
@@ -308,8 +308,8 @@ impl Identity {
     ///
     /// # Example
     ///
-    /// ```
-    /// use corium::Identity;
+    /// ```ignore
+    /// use corium::internals::Identity;
     ///
     /// let valid = Identity::from_bytes([1u8; 32]);
     /// assert!(valid.is_valid());
@@ -926,5 +926,349 @@ mod tests {
         let mut tampered = record.clone();
         tampered.signature[0] ^= 1;
         assert!(!tampered.verify(), "P5 violation: signature tampering not detected");
+    }
+
+    // ========================================================================
+    // Identity Security Tests (from tests/security.rs)
+    // ========================================================================
+
+    /// Test that different keypairs produce different Identities (collision resistance).
+    #[test]
+    fn keypair_collision_resistance() {
+        use std::collections::HashSet;
+        let mut identities = HashSet::new();
+
+        for _ in 0..1000 {
+            let keypair = Keypair::generate();
+            let identity = keypair.identity();
+            assert!(
+                identities.insert(identity),
+                "Identity collision detected - this should be astronomically unlikely"
+            );
+        }
+    }
+
+    /// Test that Identity is deterministically derived from public key.
+    #[test]
+    fn identity_deterministic_derivation() {
+        let keypair = Keypair::generate();
+        let public_key = keypair.public_key_bytes();
+
+        let identity_1 = keypair.identity();
+        let identity_2 = keypair.identity();
+
+        // In zero-hash model, Identity bytes ARE the public key
+        assert_eq!(identity_1, identity_2);
+        assert_eq!(identity_1.as_bytes(), &public_key);
+    }
+
+    /// Test that keypair reconstruction from secret key preserves identity.
+    #[test]
+    fn keypair_reconstruction_preserves_identity() {
+        let original = Keypair::generate();
+        let secret = original.secret_key_bytes();
+
+        let reconstructed = Keypair::from_secret_key_bytes(&secret);
+
+        assert_eq!(original.public_key_bytes(), reconstructed.public_key_bytes());
+        assert_eq!(original.identity(), reconstructed.identity());
+
+        // Both should produce identical signatures
+        let message = b"test message";
+        let sig1 = original.sign(message);
+        let sig2 = reconstructed.sign(message);
+        assert_eq!(sig1.to_bytes(), sig2.to_bytes());
+    }
+
+    /// Test that verify_identity correctly validates Identity-public key binding.
+    #[test]
+    fn identity_verification_security() {
+        let keypair = Keypair::generate();
+        let identity = keypair.identity();
+        let public_key = keypair.public_key_bytes();
+
+        assert!(verify_identity(&identity, &public_key));
+
+        let other_keypair = Keypair::generate();
+        assert!(!verify_identity(&identity, &other_keypair.public_key_bytes()));
+
+        let mut bad_bytes = *identity.as_bytes();
+        bad_bytes[0] ^= 0xFF;
+        let bad_identity = Identity::from_bytes(bad_bytes);
+        assert!(!verify_identity(&bad_identity, &public_key));
+    }
+
+    /// Test that signatures cannot be forged.
+    #[test]
+    fn signature_unforgeability() {
+        let keypair = Keypair::generate();
+        let message = b"important message";
+        let signature = keypair.sign(message);
+
+        assert!(keypair.verify(message, &signature));
+
+        let modified_message = b"modified message";
+        assert!(!keypair.verify(modified_message, &signature));
+
+        let other_keypair = Keypair::generate();
+        assert!(!other_keypair.verify(message, &signature));
+    }
+
+    /// Test Identity hex decoding rejects invalid input.
+    #[test]
+    fn identity_hex_rejects_invalid() {
+        assert!(Identity::from_hex("abcd").is_err());
+        let long_hex = "a".repeat(70);
+        assert!(Identity::from_hex(&long_hex).is_err());
+        assert!(Identity::from_hex(&"g".repeat(64)).is_err());
+    }
+
+    // ========================================================================
+    // Endpoint Record Security Tests (from tests/security.rs)
+    // ========================================================================
+
+    /// Test that valid endpoint records verify successfully.
+    #[test]
+    fn valid_record_verifies() {
+        let keypair = Keypair::generate();
+        let addrs = vec!["192.168.1.1:8080".to_string()];
+
+        let record = keypair.create_endpoint_record(addrs);
+
+        assert!(record.verify());
+        assert!(record.verify_fresh(3600)); // 1 hour max age
+    }
+
+    /// Test that records with relay information verify correctly.
+    #[test]
+    fn record_with_relays_verifies() {
+        let keypair = Keypair::generate();
+        let relay_keypair = Keypair::generate();
+
+        let relays = vec![RelayEndpoint {
+            relay_identity: relay_keypair.identity(),
+            relay_addrs: vec!["10.0.0.1:9000".to_string()],
+        }];
+
+        let record =
+            keypair.create_endpoint_record_with_relays(vec!["192.168.1.1:8080".to_string()], relays);
+
+        assert!(record.verify());
+        assert!(record.has_relays());
+        assert!(record.has_direct_addrs());
+    }
+
+    /// Test that tampered addresses cause verification failure.
+    #[test]
+    fn tampered_addresses_fail_verification() {
+        let keypair = Keypair::generate();
+        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+
+        record.addrs = vec!["attacker.com:8080".to_string()];
+
+        assert!(!record.verify());
+    }
+
+    /// Test that records signed by wrong key fail verification.
+    #[test]
+    fn wrong_signer_fails_verification() {
+        let keypair = Keypair::generate();
+        let attacker_keypair = Keypair::generate();
+
+        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+
+        let attacker_record =
+            attacker_keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        record.signature = attacker_record.signature;
+
+        assert!(!record.verify());
+    }
+
+    /// Test replay attack prevention - old records should be rejected.
+    #[test]
+    fn replay_attack_prevention() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let keypair = Keypair::generate();
+        let identity = keypair.identity();
+        let addrs = vec!["192.168.1.1:8080".to_string()];
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_timestamp = now_ms - (2 * 60 * 60 * 1000); // 2 hours ago
+
+        let mut data = Vec::new();
+        data.extend_from_slice(identity.as_bytes());
+        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
+        for addr in &addrs {
+            let addr_bytes = addr.as_bytes();
+            data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(addr_bytes);
+        }
+        data.extend_from_slice(&(0u32).to_le_bytes()); // no relays
+        data.extend_from_slice(&old_timestamp.to_le_bytes());
+
+        let signature = keypair.sign(&data);
+
+        let old_record = EndpointRecord {
+            identity,
+            addrs,
+            relays: vec![],
+            timestamp: old_timestamp,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        assert!(old_record.verify()); // Signature is valid
+        assert!(!old_record.verify_fresh(3600)); // But too old (> 1 hour)
+    }
+
+    /// Test that future-dated records are rejected (clock skew attack).
+    #[test]
+    fn future_dated_records_rejected() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let keypair = Keypair::generate();
+        let identity = keypair.identity();
+        let addrs = vec!["192.168.1.1:8080".to_string()];
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future_timestamp = now_ms + (2 * 60 * 60 * 1000); // 2 hours ahead
+
+        let mut data = Vec::new();
+        data.extend_from_slice(identity.as_bytes());
+        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
+        for addr in &addrs {
+            let addr_bytes = addr.as_bytes();
+            data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(addr_bytes);
+        }
+        data.extend_from_slice(&(0u32).to_le_bytes());
+        data.extend_from_slice(&future_timestamp.to_le_bytes());
+
+        let signature = keypair.sign(&data);
+
+        let future_record = EndpointRecord {
+            identity,
+            addrs,
+            relays: vec![],
+            timestamp: future_timestamp,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        assert!(!future_record.verify_fresh(3600)); // Should fail freshness check
+    }
+
+    /// Test structure validation limits.
+    #[test]
+    fn structure_validation_limits() {
+        let keypair = Keypair::generate();
+
+        let too_many_addrs: Vec<String> = (0..20).map(|i| format!("10.0.0.{}:8080", i)).collect();
+        let record = keypair.create_endpoint_record(too_many_addrs);
+        assert!(!record.validate_structure());
+
+        let long_addr = "a".repeat(300);
+        let record = keypair.create_endpoint_record(vec![long_addr]);
+        assert!(!record.validate_structure());
+
+        let record = keypair.create_endpoint_record(vec!["".to_string()]);
+        assert!(!record.validate_structure());
+    }
+
+    /// Test that signature length validation works.
+    #[test]
+    fn invalid_signature_length_rejected() {
+        let keypair = Keypair::generate();
+        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+
+        record.signature = record.signature[..32].to_vec();
+
+        assert!(!record.validate_structure());
+        assert!(!record.verify());
+    }
+
+    /// Test address concatenation attack prevention.
+    #[test]
+    fn address_concatenation_attack_prevented() {
+        let keypair = Keypair::generate();
+
+        let record1 = keypair.create_endpoint_record(vec![
+            "192.168.1.1".to_string(),
+            ":8080".to_string(),
+        ]);
+
+        let record2 = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+
+        assert_ne!(record1.signature, record2.signature);
+
+        assert!(record1.verify());
+        assert!(record2.verify());
+    }
+
+    /// Test that Identity must match cryptographic public key (Sybil prevention).
+    #[test]
+    fn identity_must_match_public_key() {
+        let keypair = Keypair::generate();
+        let correct_identity = keypair.identity();
+        let public_key = keypair.public_key_bytes();
+
+        let attacker_claimed_id = Identity::from_bytes([0xFF; 32]);
+
+        assert!(!verify_identity(&attacker_claimed_id, &public_key));
+        assert!(verify_identity(&correct_identity, &public_key));
+    }
+
+    /// Test signature malleability resistance.
+    #[test]
+    fn signature_malleability_resistance() {
+        let keypair = Keypair::generate();
+        let message = b"test message";
+        let signature = keypair.sign(message);
+        let sig_bytes = signature.to_bytes();
+
+        let mut modified_sig = sig_bytes;
+        modified_sig[0] ^= 0x01;
+
+        let modified = ed25519_dalek::Signature::from_bytes(&modified_sig);
+
+        assert_ne!(modified.to_bytes(), sig_bytes);
+        assert!(!keypair.verify(message, &modified));
+        assert!(keypair.verify(message, &signature));
+    }
+
+    /// Test cross-identity replay prevention.
+    #[test]
+    fn cross_identity_replay_prevention() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+
+        let message = b"important transaction";
+        let alice_signature = alice.sign(message);
+
+        assert!(!bob.verify(message, &alice_signature));
+        assert!(alice.verify(message, &alice_signature));
+    }
+
+    /// Test that all-zeros and all-ones Identities don't match real keypairs.
+    #[test]
+    fn special_identity_edge_cases() {
+        let all_zeros = Identity::from_bytes([0u8; 32]);
+        let all_ones = Identity::from_bytes([0xFF; 32]);
+
+        let keypair = Keypair::generate();
+
+        assert!(
+            !verify_identity(&all_zeros, &keypair.public_key_bytes()),
+            "All-zeros Identity should not verify against any real keypair"
+        );
+        assert!(
+            !verify_identity(&all_ones, &keypair.public_key_bytes()),
+            "All-ones Identity should not verify against any real keypair"
+        );
     }
 }

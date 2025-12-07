@@ -6,23 +6,31 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use quinn::Endpoint;
+use quinn::{Connection, Endpoint};
 use tracing::{info, warn};
 
 use crate::dht::{Contact, DhtNode, Key, TelemetrySnapshot};
 use crate::identity::{EndpointRecord, Identity, Keypair};
-use crate::net::{PeerNetwork, smartsock::SmartSock};
+use crate::net::{PeerNetwork, SmartSock};
 use crate::pubsub::{GossipConfig, GossipSub, ReceivedMessage};
 use crate::net::UdpRelayForwarder;
 use crate::server::Server;
-
-// Re-export PubSubHandler for users who want to implement custom handlers
-pub use crate::pubsub::PubSubHandler;
 
 /// Default Kademlia bucket size / replication factor.
 const DEFAULT_K: usize = 20;
 /// Default lookup parallelism.
 const DEFAULT_ALPHA: usize = 3;
+
+/// A received pubsub message with string-based identity.
+#[derive(Clone, Debug)]
+pub struct Message {
+    /// The topic this message was published to.
+    pub topic: String,
+    /// The publisher's identity (hex-encoded, 64 chars).
+    pub from: String,
+    /// The message payload.
+    pub data: Vec<u8>,
+}
 
 /// Unified node for mesh networking.
 ///
@@ -54,12 +62,12 @@ const DEFAULT_ALPHA: usize = 3;
 ///
 /// ```ignore
 /// // Enable pub/sub messaging
-/// let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
+/// let node = Node::bind("0.0.0.0:0").await?;
 ///
 /// // Subscribe and publish
-/// node.subscribe("my-topic").await?;
-/// let mut rx = node.take_message_receiver().await?;
-/// node.publish("my-topic", b"hello!".to_vec()).await?;
+/// node.subscribe("chat").await?;
+/// let mut rx = node.messages().await?;
+/// node.publish("chat", b"hello!".to_vec()).await?;
 /// ```
 ///
 /// # Architecture
@@ -94,41 +102,38 @@ pub struct Node {
 }
 
 impl Node {
-    /// Bind to a socket address and start the node.
+    /// Create a node with pubsub enabled.
     ///
-    /// Uses default configuration (k=20, alpha=3, no pubsub).
-    /// For pub/sub support, use [`Node::bind_with_pubsub`].
+    /// Generates an ephemeral Ed25519 identity. For persistent identity,
+    /// use the advanced API with `Keypair`.
     ///
     /// # Arguments
     ///
     /// * `addr` - Socket address to bind to (e.g., "0.0.0.0:0" for random port)
-    /// * `keypair` - Ed25519 keypair for node identity and signing
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let keypair = Keypair::generate();
-    /// let node = Node::bind("0.0.0.0:0", keypair).await?;
+    /// let node = Node::bind("0.0.0.0:0").await?;
+    /// println!("My identity: {}", node.identity());
     /// ```
-    pub async fn bind(addr: &str, keypair: Keypair) -> Result<Self> {
-        Self::create(addr, keypair, false).await
+    pub async fn bind(addr: &str) -> Result<Self> {
+        let keypair = Keypair::generate();
+        Self::create(addr, keypair, true).await
     }
 
-    /// Bind to a socket address and start the node with pub/sub enabled.
+    /// Create a node with a provided keypair (for persistent identity).
     ///
-    /// # Arguments
-    ///
-    /// * `addr` - Socket address to bind to (e.g., "0.0.0.0:0" for random port)
-    /// * `keypair` - Ed25519 keypair for node identity and signing
+    /// This is for advanced usage when you need a stable identity across restarts.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let keypair = Keypair::generate();
-    /// let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
-    /// node.subscribe("my-topic").await?;
+    /// use corium::advanced::Keypair;
+    /// let keypair = Keypair::generate();  // or load from disk
+    /// let node = Node::bind_with_keypair("0.0.0.0:0", keypair).await?;
     /// ```
-    pub async fn bind_with_pubsub(addr: &str, keypair: Keypair) -> Result<Self> {
+    pub async fn bind_with_keypair(addr: &str, keypair: Keypair) -> Result<Self> {
         Self::create(addr, keypair, true).await
     }
 
@@ -231,19 +236,9 @@ impl Node {
     // Identity & Info
     // =========================================================================
     
-    /// Get the node's Identity (Ed25519 public key).
-    pub fn identity(&self) -> Identity {
-        self.keypair.identity()
-    }
-    
-    /// Get the node's keypair.
-    pub fn keypair(&self) -> &Keypair {
-        &self.keypair
-    }
-    
-    /// Get the node's contact information.
-    pub fn contact(&self) -> &Contact {
-        &self.contact
+    /// Get this node's identity as a hex string (64 chars).
+    pub fn identity(&self) -> String {
+        hex::encode(self.keypair.identity())
     }
     
     /// Get the local socket address the node is bound to.
@@ -252,18 +247,26 @@ impl Node {
             .context("failed to get local address")
     }
     
-    /// Get the QUIC endpoint for advanced usage.
-    ///
-    /// This is provided for power users who need direct endpoint access.
-    /// Most users should not need this.
+    // =========================================================================
+    // Advanced accessors (for power users)
+    // =========================================================================
+    
+    /// Get the node's keypair (advanced).
+    pub fn keypair(&self) -> &Keypair {
+        &self.keypair
+    }
+    
+    /// Get the node's contact information (advanced).
+    pub fn contact(&self) -> &Contact {
+        &self.contact
+    }
+    
+    /// Get the QUIC endpoint (advanced).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
     
-    /// Get the SmartSock for path management.
-    ///
-    /// SmartSock provides seamless relay↔direct path switching.
-    /// Use this to register peers and update path preferences.
+    /// Get the SmartSock for path management (advanced).
     pub fn smartsock(&self) -> &Arc<SmartSock> {
         &self.smartsock
     }
@@ -379,61 +382,82 @@ impl Node {
         self.dht.observe_contact(contact).await
     }
     
-    /// Bootstrap from a list of known peers.
+    /// Bootstrap from a seed node.
     ///
-    /// This adds the peers to the routing table and performs an initial
-    /// lookup to populate the routing table with additional nodes.
+    /// Connects to the seed node to discover other peers and populate
+    /// the routing table.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - Hex-encoded peer identity (64 characters)
+    /// * `addr` - Socket address (e.g., "192.168.1.100:9000")
     ///
     /// # Example
     ///
     /// ```ignore
-    /// node.bootstrap(&[
-    ///     Contact { identity: peer1, addr: "192.168.1.100:9000".to_string() },
-    ///     Contact { identity: peer2, addr: "192.168.1.101:9000".to_string() },
-    /// ]).await?;
+    /// node.bootstrap("a1b2c3d4...", "seed.example.com:9000").await?;
     /// ```
-    pub async fn bootstrap(&self, peers: &[Contact]) -> Result<Vec<Contact>> {
-        for peer in peers {
-            self.dht.observe_contact(peer.clone()).await;
+    pub async fn bootstrap(&self, identity: &str, addr: &str) -> Result<()> {
+        let identity_bytes = hex::decode(identity)
+            .context("invalid identity: must be 64 hex characters")?;
+        if identity_bytes.len() != 32 {
+            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
         }
+        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        // Automatically detect NAT type using bootstrap peers
-        if peers.len() >= 2 {
-            self.network.detect_nat(peers).await;
-        }
+        let contact = Contact {
+            identity: peer_identity,
+            addr: addr.to_string(),
+        };
+        
+        self.dht.observe_contact(contact.clone()).await;
+        
+        // Detect NAT type if possible
+        self.network.detect_nat(&[contact]).await;
         
         // Perform self-lookup to populate routing table
-        self.dht.iterative_find_node(self.identity()).await
+        let self_identity = self.keypair.identity();
+        self.dht.iterative_find_node(self_identity).await?;
+        
+        Ok(())
     }
     
     // =========================================================================
     // Connections
     // =========================================================================
     
-    /// Connect to a peer using smart connectivity.
-    ///
-    /// This method abstracts all transport complexity:
-    /// - Direct connection if possible
-    /// - NAT traversal (hole punching) when needed
-    /// - Relay fallback for CGNAT/Symmetric NAT
+    /// Connect to a peer.
     ///
     /// # Arguments
     ///
-    /// * `record` - The peer's endpoint record (from `resolve_peer`)
-    ///
-    /// # Returns
-    ///
-    /// A `SmartConnection` that works regardless of NAT topology.
+    /// * `identity` - Hex-encoded peer identity (64 characters)
+    /// * `addr` - Socket address
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let record = node.resolve_peer(&peer_id).await?.unwrap();
-    /// let conn = node.connect(&record).await?;
-    /// println!("Connected: direct={}", conn.is_direct());
+    /// let conn = node.connect("a1b2c3d4...", "192.168.1.50:9000").await?;
+    /// let (mut send, mut recv) = conn.open_bi().await?;
     /// ```
-    pub async fn connect(&self, record: &EndpointRecord) -> Result<crate::net::SmartConnection> {
-        self.network.smart_connect(record).await
+    pub async fn connect(&self, identity: &str, addr: &str) -> Result<Connection> {
+        let identity_bytes = hex::decode(identity)
+            .context("invalid identity: must be 64 hex characters")?;
+        if identity_bytes.len() != 32 {
+            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
+        }
+        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
+        
+        // Create minimal EndpointRecord for connection
+        let record = EndpointRecord {
+            identity: peer_identity,
+            addrs: vec![addr.to_string()],
+            relays: vec![],
+            timestamp: crate::now_ms(),
+            signature: vec![], // Not needed for outbound connection
+        };
+        
+        let smart = self.network.smart_connect(&record).await?;
+        Ok(smart.connection().clone())
     }
     
     /// Get our public address (if detected).
@@ -451,88 +475,81 @@ impl Node {
     
     /// Subscribe to a topic.
     ///
-    /// This registers interest in a topic. Messages for subscribed topics
-    /// are received through the message receiver obtained from
-    /// `take_message_receiver()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if pubsub is not enabled on this node.
+    /// Messages for subscribed topics are received through the receiver
+    /// obtained from [`messages()`][Self::messages].
     ///
     /// # Example
     ///
     /// ```ignore
-    /// node.subscribe("my-topic").await?;
+    /// node.subscribe("chat").await?;
     /// ```
     pub async fn subscribe(&self, topic: &str) -> Result<()> {
         let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled - use Node::bind_with_pubsub")?;
+            .context("pubsub not enabled")?;
         pubsub.subscribe(topic).await
     }
     
     /// Publish a message to a topic.
     ///
     /// The message will be signed with the node's keypair and propagated
-    /// through the GossipSub mesh to all subscribers.
-    ///
-    /// # Returns
-    ///
-    /// The MessageId of the published message.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if pubsub is not enabled or message signing fails.
+    /// through the mesh to all subscribers.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let msg_id = node.publish("my-topic", b"hello everyone!".to_vec()).await?;
+    /// node.publish("chat", b"Hello everyone!".to_vec()).await?;
     /// ```
-    pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<crate::pubsub::MessageId> {
+    pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
         let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled - use Node::bind_with_pubsub")?;
-        pubsub.publish(topic, data).await
+            .context("pubsub not enabled")?;
+        pubsub.publish(topic, data).await?;
+        Ok(())
     }
     
     /// Unsubscribe from a topic.
-    ///
-    /// Stops receiving messages for this topic and leaves the mesh.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if pubsub is not enabled.
     pub async fn unsubscribe(&self, topic: &str) -> Result<()> {
         let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled - use Node::bind_with_pubsub")?;
+            .context("pubsub not enabled")?;
         pubsub.unsubscribe(topic).await?;
         Ok(())
     }
     
-    /// Take the pubsub message receiver.
+    /// Get the message receiver.
     ///
-    /// This can only be called once. The receiver will receive all messages
-    /// for topics the node is subscribed to.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if pubsub is not enabled or if the receiver was
-    /// already taken.
+    /// Call once to get a receiver for incoming pubsub messages.
+    /// Messages contain the topic, sender identity (hex), and data.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let mut rx = node.take_message_receiver().await?;
-    /// tokio::spawn(async move {
-    ///     while let Some(msg) = rx.recv().await {
-    ///         println!("[{}] {}: {:?}", msg.topic, hex::encode(&msg.from.as_bytes()[..8]), msg.data);
-    ///     }
-    /// });
+    /// let mut rx = node.messages().await?;
+    /// while let Some(msg) = rx.recv().await {
+    ///     println!("[{}] {}: {:?}", msg.topic, msg.from, msg.data);
+    /// }
     /// ```
-    pub async fn take_message_receiver(&self) -> Result<tokio::sync::mpsc::Receiver<ReceivedMessage>> {
+    pub async fn messages(&self) -> Result<tokio::sync::mpsc::Receiver<Message>> {
         let receiver_mutex = self.pubsub_receiver.as_ref()
-            .context("pubsub not enabled - use Node::bind_with_pubsub")?;
+            .context("pubsub not enabled")?;
         let mut guard = receiver_mutex.lock().await;
-        guard.take().context("message receiver already taken")
+        let internal_rx = guard.take().context("message receiver already taken")?;
+        
+        // Create a channel that converts internal ReceivedMessage to public Message
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut internal_rx = internal_rx;
+            while let Some(msg) = internal_rx.recv().await {
+                let public_msg = Message {
+                    topic: msg.topic,
+                    from: hex::encode(msg.source.as_bytes()),
+                    data: msg.data,
+                };
+                if tx.send(public_msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        
+        Ok(rx)
     }
     
     /// Check if pubsub is enabled on this node.

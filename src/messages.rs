@@ -112,25 +112,6 @@ pub enum DhtRequest {
     /// The relay/server responds with the observed source address of this request.
     /// This enables NAT type detection and public address discovery.
     WhatIsMyAddr,
-    /// Hole punch coordination request.
-    ///
-    /// Sent to a rendezvous server to coordinate simultaneous connection.
-    /// Both peers register, then receive a signal to start connecting.
-    HolePunchRegister {
-        /// Our peer ID.
-        from_peer: Identity,
-        /// Peer we want to connect to.
-        target_peer: Identity,
-        /// Our public address (from STUN).
-        our_public_addr: String,
-        /// Unique punch session ID.
-        punch_id: [u8; 16],
-    },
-    /// Signal that peer should start hole punch attempt.
-    HolePunchStart {
-        /// The punch session ID.
-        punch_id: [u8; 16],
-    },
     /// PubSub message (Graft, Prune, Publish, IHave, IWant, etc.).
     ///
     /// Used by the GossipSub layer for topic-based publish/subscribe.
@@ -155,8 +136,6 @@ impl DhtRequest {
             DhtRequest::Store { from, .. } => Some(from.identity),
             DhtRequest::RelayConnect { from_peer, .. } => Some(*from_peer),
             DhtRequest::WhatIsMyAddr => None,
-            DhtRequest::HolePunchRegister { from_peer, .. } => Some(*from_peer),
-            DhtRequest::HolePunchStart { .. } => None,
             DhtRequest::PubSub { from, .. } => Some(*from),
         }
     }
@@ -200,29 +179,10 @@ pub enum DhtResponse {
     /// Response to WhatIsMyAddr with the observed public address.
     ///
     /// This is the STUN-like response containing the client's public IP:port
-    /// as seen by the server. Useful for NAT detection and hole punching.
+    /// as seen by the server. Useful for NAT detection.
     YourAddr {
         /// The observed address in "ip:port" format.
         addr: String,
-    },
-    /// Hole punch registration accepted, waiting for peer.
-    HolePunchWaiting {
-        /// The punch session ID.
-        punch_id: [u8; 16],
-    },
-    /// Both peers registered, start punching now!
-    HolePunchReady {
-        /// The punch session ID.
-        punch_id: [u8; 16],
-        /// Peer's public address to punch towards.
-        peer_addr: String,
-        /// Synchronized start time (Unix millis).
-        start_time_ms: u64,
-    },
-    /// Hole punch failed or timed out.
-    HolePunchFailed {
-        /// Reason for failure.
-        reason: String,
     },
     /// Acknowledgement for PubSub messages.
     ///
@@ -236,4 +196,170 @@ pub enum DhtResponse {
         /// Human-readable error message.
         message: String,
     },
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dht::Contact;
+    use crate::identity::{Identity, Keypair};
+
+    fn make_identity(seed: u32) -> Identity {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&seed.to_be_bytes());
+        Identity::from_bytes(bytes)
+    }
+
+    /// Test that bounded deserialization works for normal payloads.
+    #[test]
+    fn bounded_deserialization_normal_payloads() {
+        let request = DhtRequest::Store {
+            from: Contact {
+                identity: make_identity(1),
+                addr: "127.0.0.1:8080".to_string(),
+            },
+            key: [0u8; 32],
+            value: vec![0u8; 100],
+        };
+
+        let bytes = serialize(&request).unwrap();
+        assert!(deserialize_request(&bytes).is_ok());
+    }
+
+    /// Test that malformed data is rejected gracefully.
+    #[test]
+    fn malformed_data_rejected() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
+        assert!(deserialize_request(&garbage).is_err());
+
+        let request = DhtRequest::Ping {
+            from: Contact {
+                identity: make_identity(1),
+                addr: "127.0.0.1:8080".to_string(),
+            },
+        };
+        let bytes = serialize(&request).unwrap();
+        let truncated = &bytes[..bytes.len() / 2];
+        assert!(deserialize_request(truncated).is_err());
+    }
+
+    /// Test that response deserialization works.
+    #[test]
+    fn response_deserialization() {
+        let response = DhtResponse::Nodes(vec![Contact {
+            identity: make_identity(1),
+            addr: "127.0.0.1:8080".to_string(),
+        }]);
+        let bytes = bincode::serialize(&response).unwrap();
+        assert!(deserialize_response(&bytes).is_ok());
+    }
+
+    /// Test that all request types roundtrip correctly.
+    #[test]
+    fn request_types_roundtrip() {
+        let contact = Contact {
+            identity: make_identity(1),
+            addr: "127.0.0.1:8080".to_string(),
+        };
+        let keypair = Keypair::generate();
+        let identity = keypair.identity();
+
+        let requests = vec![
+            DhtRequest::Ping { from: contact.clone() },
+            DhtRequest::FindNode {
+                from: contact.clone(),
+                target: make_identity(2),
+            },
+            DhtRequest::FindValue {
+                from: contact.clone(),
+                key: [0u8; 32],
+            },
+            DhtRequest::Store {
+                from: contact.clone(),
+                key: [0u8; 32],
+                value: b"test".to_vec(),
+            },
+            DhtRequest::RelayConnect {
+                from_peer: identity,
+                target_peer: identity,
+                session_id: [0u8; 16],
+            },
+            DhtRequest::WhatIsMyAddr,
+        ];
+
+        for req in requests {
+            let bytes = serialize(&req).unwrap();
+            let decoded = deserialize_request(&bytes).unwrap();
+            let _ = format!("{:?}", decoded);
+        }
+    }
+
+    /// Test sender_identity extraction from requests.
+    #[test]
+    fn sender_identity_extraction() {
+        let contact = Contact {
+            identity: make_identity(42),
+            addr: "127.0.0.1:8080".to_string(),
+        };
+
+        let ping = DhtRequest::Ping { from: contact.clone() };
+        assert_eq!(ping.sender_identity(), Some(make_identity(42)));
+
+        let find_node = DhtRequest::FindNode {
+            from: contact.clone(),
+            target: make_identity(1),
+        };
+        assert_eq!(find_node.sender_identity(), Some(make_identity(42)));
+
+        let what_is_my_addr = DhtRequest::WhatIsMyAddr;
+        assert_eq!(what_is_my_addr.sender_identity(), None);
+    }
+
+    /// Test content addressing integrity.
+    #[test]
+    fn content_addressing_integrity() {
+        use crate::dht::{hash_content, verify_key_value_pair};
+
+        let data = b"original content";
+        let key = hash_content(data);
+
+        assert!(verify_key_value_pair(&key, data));
+
+        let corrupted = b"corrupted content";
+        assert!(!verify_key_value_pair(&key, corrupted));
+    }
+
+    /// Test empty data hashing.
+    #[test]
+    fn empty_data_hashing() {
+        use crate::dht::{hash_content, verify_key_value_pair};
+
+        let empty = b"";
+        let key = hash_content(empty);
+
+        assert!(verify_key_value_pair(&key, empty));
+        assert!(!verify_key_value_pair(&key, b"not empty"));
+    }
+
+    /// Test hash collision resistance.
+    #[test]
+    fn hash_collision_resistance() {
+        use crate::dht::hash_content;
+
+        let data1 = b"data one";
+        let data2 = b"data two";
+
+        let hash1 = hash_content(data1);
+        let hash2 = hash_content(data2);
+
+        assert_ne!(hash1, hash2);
+
+        let data3 = b"data onf"; // One bit different
+        let hash3 = hash_content(data3);
+        assert_ne!(hash1, hash3);
+    }
 }
