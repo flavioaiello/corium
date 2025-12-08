@@ -524,7 +524,7 @@ async fn handle_request<N: DhtNetwork>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::MAX_CONNECTIONS_PER_IP_PER_SECOND;
+    use crate::net::connection::MAX_CONNECTIONS_PER_IP_PER_SECOND;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]

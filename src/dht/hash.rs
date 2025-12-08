@@ -59,11 +59,31 @@ pub fn xor_distance(a: &Identity, b: &Identity) -> [u8; 32] {
 /// 1. **Content-addressed data**: `key == BLAKE3(value)` for immutable storage
 /// 2. **Signed EndpointRecord**: `key == identity && record.verify_fresh()` for mutable peer addresses
 ///
-/// # Security
+/// # Security Model
 ///
-/// For EndpointRecords, this function verifies both the cryptographic signature
-/// AND timestamp freshness (max 24 hours) to prevent replay attacks where attackers
-/// re-publish old records to redirect traffic to stale addresses.
+/// The DHT stores two types of data with different security requirements:
+///
+/// ## Immutable Content (Mode 1)
+/// - Key = BLAKE3(value), providing content-addressing
+/// - Any peer can store any content (key derived from content)
+/// - Data integrity guaranteed by hash verification
+/// - Used for: files, messages, arbitrary data
+///
+/// ## Mutable EndpointRecords (Mode 2)
+/// - Key = Identity (Ed25519 public key bytes)
+/// - Only the identity owner can store at their key (signature required)
+/// - **Replay Attack Prevention**: Records older than 24 hours are rejected
+///   even if the signature is valid, preventing attackers from re-publishing
+///   old records to redirect traffic to stale/compromised addresses
+/// - Used for: peer address resolution, NAT traversal coordination
+///
+/// # Threat Model
+///
+/// Without timestamp freshness checking, an attacker who observes a valid
+/// EndpointRecord could replay it indefinitely, potentially:
+/// - Redirecting traffic to addresses the peer no longer controls
+/// - Forcing connections through attacker-controlled relays
+/// - Preventing peers from updating their addresses after IP changes
 ///
 /// # Example
 ///

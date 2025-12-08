@@ -12,36 +12,43 @@
 //! - **Tiering**: Latency-based peer classification using dynamic k-means clustering (1-7 tiers)
 //! - **Adaptive Parameters**: Dynamic `k` (10-30) and `α` (2-5) adjustment based on network churn
 //! - **Node State Machine**: [`DhtNode`] orchestrating iterative lookups, replication, and address publishing
+//!
+//! # Security Architecture
+//!
+//! The DHT implements defense-in-depth against common P2P attacks:
+//!
+//! ## Sybil Attack Protection
+//! - **Identity = Ed25519 public key**: Creating identities requires generating valid keypairs
+//! - **Per-peer rate limiting**: Each peer can only insert 50 contacts/minute into routing table
+//! - **Per-peer storage quotas**: Each peer can only store 1 MB / 100 entries
+//!
+//! ## Eclipse Attack Protection  
+//! - **Routing table insertion limits**: Prevents flooding with malicious contacts
+//! - **Ping-before-evict**: Long-lived nodes are preferred over new contacts
+//! - **Bucket refresh**: Stale buckets are refreshed to discover legitimate peers
+//!
+//! ## Storage Exhaustion Protection
+//! - **Maximum value size**: 1 MB per value
+//! - **Pressure monitoring**: Automatic eviction when memory/disk pressure exceeds threshold
+//! - **Popularity-based eviction**: Frequently accessed data survives longer
+//! - **Bounded collections**: All HashMaps have maximum size limits
+//!
+//! ## Replay Attack Protection
+//! - **Timestamp freshness**: EndpointRecords expire after 24 hours
+//! - **Signature verification**: All mutable records require valid Ed25519 signatures
+//! - **Content verification**: Immutable data verified via BLAKE3 hash
 
-mod hash;
-mod tiering;
-mod storage;
-mod params;
-mod routing;
-mod network;
-mod node;
+pub(crate) mod hash;
+pub(crate) mod tiering;
+pub(crate) mod storage;
+pub(crate) mod params;
+pub(crate) mod routing;
+pub(crate) mod network;
+pub(crate) mod node;
 
-// Re-export types used by other internal modules and lib.rs
-// When "tests" feature is enabled, export as `pub` for lib.rs::tests module
-#[cfg(feature = "tests")]
-pub use hash::{hash_content, verify_key_value_pair, Key};
-#[cfg(feature = "tests")]
-pub use params::TelemetrySnapshot;
-#[cfg(feature = "tests")]
-pub use routing::{RoutingTable, Contact};
-#[cfg(feature = "tests")]
-pub use network::DhtNetwork;
-#[cfg(feature = "tests")]
-pub use node::DhtNode;
-
-// When "tests" feature is disabled, export as `pub(crate)` for internal use only
-#[cfg(not(feature = "tests"))]
-pub(crate) use hash::{hash_content, verify_key_value_pair, Key};
-#[cfg(not(feature = "tests"))]
+// Re-export types used by other internal modules
+pub(crate) use hash::{hash_content, Key};
 pub(crate) use params::TelemetrySnapshot;
-#[cfg(not(feature = "tests"))]
-pub(crate) use routing::{RoutingTable, Contact};
-#[cfg(not(feature = "tests"))]
+pub(crate) use routing::Contact;
 pub(crate) use network::DhtNetwork;
-#[cfg(not(feature = "tests"))]
 pub(crate) use node::DhtNode;

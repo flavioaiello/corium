@@ -322,7 +322,7 @@ mod tests {
     /// Test content addressing integrity.
     #[test]
     fn content_addressing_integrity() {
-        use crate::dht::{hash_content, verify_key_value_pair};
+        use crate::dht::hash::{hash_content, verify_key_value_pair};
 
         let data = b"original content";
         let key = hash_content(data);
@@ -336,7 +336,7 @@ mod tests {
     /// Test empty data hashing.
     #[test]
     fn empty_data_hashing() {
-        use crate::dht::{hash_content, verify_key_value_pair};
+        use crate::dht::hash::{hash_content, verify_key_value_pair};
 
         let empty = b"";
         let key = hash_content(empty);

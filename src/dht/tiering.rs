@@ -2,6 +2,27 @@
 //!
 //! Peers are assigned to tiers based on observed RTT latency, enabling
 //! latency-aware routing where fast peers are preferred.
+//!
+//! # Algorithm
+//!
+//! The tiering system uses dynamic k-means clustering:
+//! 1. **Sample collection**: Up to 32 RTT samples per peer
+//! 2. **Periodic recomputation**: Every 5 minutes
+//! 3. **Dynamic tier count**: 1-7 tiers selected via BIC-like penalty
+//! 4. **Stale cleanup**: Peers not seen in 24 hours are removed
+//!
+//! # Security Model
+//!
+//! Tiering data is bounded to prevent memory exhaustion:
+//! - **MAX_TIERING_TRACKED_PEERS**: 10,000 peers maximum
+//! - **MAX_RTT_SAMPLES_PER_NODE**: 32 samples per peer
+//! - **Batch eviction**: Oldest 20% of peers evicted when 10% over capacity
+//!
+//! # Performance
+//!
+//! - Tier assignments: O(1) lookup via HashMap
+//! - Recomputation: O(n × k × iterations) where n=peers, k=tiers
+//! - Eviction: O(n) partial sort, amortized across registrations
 
 use std::collections::{HashMap, VecDeque};
 use tokio::time::{Duration, Instant};

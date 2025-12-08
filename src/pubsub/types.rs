@@ -2,6 +2,31 @@
 //!
 //! This module contains the internal data structures used by GossipSub
 //! for message caching, topic state tracking, and rate limiting.
+//!
+//! # Security Model
+//!
+//! All collection types in this module implement bounded insertion to prevent
+//! memory exhaustion attacks.
+//!
+//! ## Bounded Collections
+//!
+//! | Type | Bound | Enforcement |
+//! |------|-------|-------------|
+//! | `TopicState.mesh + peers` | 1,000 | `try_insert_peer()` returns false at limit |
+//! | Rate limit timestamps | 1 second window | Old entries pruned on each check |
+//! | Rate limit entries | 10,000 | LRU eviction in gossipsub.rs |
+//!
+//! ## Rate Limiting Algorithm
+//!
+//! The `PeerRateLimit` struct uses a sliding window algorithm:
+//!
+//! 1. **Window**: 1 second (`RATE_LIMIT_WINDOW`)
+//! 2. **Cleanup**: Timestamps older than window are pruned
+//! 3. **Check**: If timestamps.len() >= limit, reject
+//! 4. **Record**: Add current timestamp to deque
+//! 5. **Staleness**: Entries unused for 5 minutes are eligible for cleanup
+//!
+//! Separate rate limits for publish vs IWant prevent amplification attacks.
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;

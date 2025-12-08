@@ -2,6 +2,36 @@
 //!
 //! Defines the wire protocol messages used by GossipSub for mesh management
 //! and message propagation.
+//!
+//! # Security Model
+//!
+//! ## Message Types
+//!
+//! | Message | Security Properties |
+//! |---------|---------------------|
+//! | `Subscribe` | Topic validated for length/content |
+//! | `Unsubscribe` | Topic validated for length/content |
+//! | `Graft` | Bounded mesh insertion |
+//! | `Prune` | Suggested peers bounded by capacity |
+//! | `Publish` | Ed25519 signature verified before accept |
+//! | `IHave` | Message IDs bounded, topic validated |
+//! | `IWant` | Rate-limited, response bytes capped |
+//!
+//! ## Publish Message Fields
+//!
+//! ```text
+//! Publish {
+//!     topic: String,      // Validated: non-empty, ≤256 chars, ASCII only
+//!     msg_id: [u8; 32],   // BLAKE3(source || seqno || data)
+//!     source: Identity,   // Original publisher (not forwarder)
+//!     seqno: u64,         // Monotonic per source (wraps safely)
+//!     data: Vec<u8>,      // Payload, ≤64KB
+//!     signature: Vec<u8>, // Ed25519(topic || seqno || data), 64 bytes
+//! }
+//! ```
+//!
+//! The `source` field is the ORIGINAL publisher, not the immediate sender.
+//! This allows signature verification across multiple hops.
 
 use serde::{Deserialize, Serialize};
 

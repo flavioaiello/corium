@@ -21,6 +21,29 @@
 //! - **Global limit**: 100 connections/second
 //! - **Per-IP limit**: 20 connections/second
 //! - **IP tracking**: LRU cache of 1,000 IPs
+//!
+//! # Security Model
+//!
+//! ## DoS Protection
+//!
+//! | Attack | Protection |
+//! |--------|------------|
+//! | Connection flood | Token bucket rate limiting (global + per-IP) |
+//! | Memory exhaustion | LRU cache bounds connection count |
+//! | Resource holding | Idle timeout triggers health check |
+//! | Dead connection reuse | Passive health check detects closed connections |
+//!
+//! ## Bounded Resources
+//!
+//! | Resource | Limit | Constant |
+//! |----------|-------|----------|
+//! | Cached connections | 1,000 | `MAX_CACHED_CONNECTIONS` |
+//! | Global connections/sec | 100 | `MAX_GLOBAL_CONNECTIONS_PER_SECOND` |
+//! | Per-IP connections/sec | 20 | `MAX_CONNECTIONS_PER_IP_PER_SECOND` |
+//! | Tracked IPs | 1,000 | `MAX_TRACKED_IPS` |
+//! | RTT samples | 10 | `RTT_SAMPLE_HISTORY_SIZE` |
+//! | Max healthy RTT | 2,000ms | `MAX_HEALTHY_RTT_MS` |
+//! | Consecutive failures | 3 | `MAX_CONSECUTIVE_FAILURES` |
 
 use std::net::{SocketAddr, IpAddr};
 use std::num::NonZeroUsize;

@@ -2,6 +2,30 @@
 //!
 //! This module defines the data structures used to store and retrieve
 //! topic subscriptions from the DHT.
+//!
+//! # Security Model
+//!
+//! ## Bounded Subscriber Lists
+//!
+//! The `TopicSubscribers` struct limits entries to `MAX_TOPIC_SUBSCRIBERS` (50)
+//! to prevent memory exhaustion from malicious DHT data.
+//!
+//! ## CRDT-Style Updates
+//!
+//! Subscription announcements use Last-Writer-Wins (LWW) semantics:
+//!
+//! 1. Each identity can only update its own entry
+//! 2. Timestamps determine which entry wins on conflict
+//! 3. Merge is commutative and idempotent
+//!
+//! This prevents:
+//! - **Subscription hijacking**: Cannot update another peer's entry
+//! - **Race conditions**: LWW provides deterministic conflict resolution
+//!
+//! ## Custom Deserialization
+//!
+//! `TopicSubscribers` implements custom `Deserialize` to truncate oversized
+//! lists from potentially corrupted or malicious DHT data.
 
 use serde::{Deserialize, Serialize};
 

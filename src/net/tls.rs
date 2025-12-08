@@ -5,6 +5,28 @@
 //! - Server and client TLS configuration for QUIC
 //! - SNI-based identity pinning for peer verification
 //! - Certificate verifiers for mutual TLS
+//!
+//! # Security Model
+//!
+//! This module implements the **Zero-Hash Identity Model** where Identity = Ed25519 public key.
+//!
+//! ## Formal Security Properties
+//!
+//! | Property | Description |
+//! |----------|-------------|
+//! | **P1: Identity Binding** | Certificate SPKI contains exactly the Identity's Ed25519 public key |
+//! | **P2: TLS Signature** | Handshake proves possession of private key matching certificate |
+//! | **P3: SNI Pinning** | Client encodes expected Identity in SNI; verifier rejects mismatch |
+//! | **P4: Mutual Auth** | Both parties present certificates; bidirectional identity verification |
+//!
+//! ## Attack Prevention
+//!
+//! | Attack | Protection |
+//! |--------|------------|
+//! | Identity spoofing | P3: Certificate public key must match SNI-encoded identity |
+//! | MITM | P2: Attacker cannot produce valid TLS signature without private key |
+//! | Certificate substitution | P1+P3: SPKI extraction, not CN parsing |
+//! | Impersonation | P4: Server also verifies client certificate |
 
 use std::sync::Arc;
 

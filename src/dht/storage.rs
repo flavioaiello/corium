@@ -2,6 +2,26 @@
 //!
 //! Provides content-addressed storage with per-peer quotas, rate limiting,
 //! and popularity-based eviction to prevent storage exhaustion attacks.
+//!
+//! # Security Model
+//!
+//! This module implements multiple layers of protection against storage abuse:
+//!
+//! | Protection | Limit | Purpose |
+//! |------------|-------|----------|
+//! | Max value size | 1 MB | Prevents large-value attacks |
+//! | Per-peer quota | 1 MB / 100 entries | Prevents single-peer exhaustion |
+//! | Per-peer rate limit | 20 req/min | Prevents rapid-fire STORE attacks |
+//! | Pressure threshold | 0.75 | Triggers automatic eviction |
+//! | Popularity eviction | >3 accesses | Protects frequently used data |
+//! | TTL expiration | 24 hours | Limits stale data accumulation |
+//!
+//! # Bounded Resource Usage
+//!
+//! All internal collections are bounded to prevent memory exhaustion:
+//! - `LOCAL_STORE_MAX_ENTRIES`: 100,000 cache entries
+//! - `MAX_TRACKED_PEERS`: 10,000 peers for quota tracking
+//! - `MAX_EVICTION_ITERATIONS`: 10,000 (safety bound for eviction loop)
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;

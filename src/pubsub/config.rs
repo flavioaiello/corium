@@ -2,6 +2,46 @@
 //!
 //! This module contains all the tunable parameters for GossipSub behavior,
 //! including mesh sizes, rate limits, and flood protection constants.
+//!
+//! # Security Model
+//!
+//! All constants in this module are security-critical bounds that prevent
+//! resource exhaustion attacks. Modifying these values can affect security.
+//!
+//! ## Rate Limiting Constants
+//!
+//! | Constant | Value | Purpose |
+//! |----------|-------|----------|
+//! | `DEFAULT_PUBLISH_RATE_LIMIT` | 100/s | Local publish flood prevention |
+//! | `DEFAULT_FORWARD_RATE_LIMIT` | 1000/s | Forward flood prevention |
+//! | `DEFAULT_PER_PEER_RATE_LIMIT` | 50/s | Per-peer flood prevention |
+//! | `DEFAULT_IWANT_RATE_LIMIT` | 5/s | Amplification attack prevention |
+//!
+//! ## Amplification Attack Prevention
+//!
+//! | Constant | Value | Purpose |
+//! |----------|-------|----------|
+//! | `DEFAULT_MAX_IWANT_MESSAGES` | 10 | Limits message IDs per IWant request |
+//! | `MAX_IWANT_RESPONSE_BYTES` | 256 KB | Caps total response regardless of count |
+//!
+//! ## Memory Exhaustion Prevention
+//!
+//! | Constant | Value | Purpose |
+//! |----------|-------|----------|
+//! | `MAX_TOPICS` | 10,000 | Prevents topic explosion attacks |
+//! | `MAX_PEERS_PER_TOPIC` | 1,000 | Bounds per-topic memory |
+//! | `MAX_SUBSCRIPTIONS_PER_PEER` | 100 | Limits peer subscription count |
+//! | `MAX_OUTBOUND_PER_PEER` | 100 | Bounds queued messages per peer |
+//! | `MAX_TOTAL_OUTBOUND_MESSAGES` | 50,000 | Global outbound queue limit |
+//! | `MAX_RATE_LIMIT_ENTRIES` | 10,000 | Bounds rate limiter state |
+//! | `DEFAULT_MESSAGE_CACHE_SIZE` | 10,000 | LRU dedup cache limit |
+//!
+//! ## Input Validation
+//!
+//! | Constant | Value | Purpose |
+//! |----------|-------|----------|
+//! | `MAX_MESSAGE_SIZE` | 64 KB | Prevents oversized message DoS |
+//! | `MAX_TOPIC_LENGTH` | 256 | Prevents oversized topic names |
 
 use std::time::Duration;
 

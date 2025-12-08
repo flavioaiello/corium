@@ -2,6 +2,66 @@
 //!
 //! This module contains the main GossipSub router that manages topic subscriptions,
 //! message routing, and mesh maintenance.
+//!
+//! # Security Model
+//!
+//! ## Message Authentication Flow
+//!
+//! ```text
+//! Publisher                    Forwarder                    Subscriber
+//!     |                            |                            |
+//!     |-- sign(topic||seqno||data) |                            |
+//!     |-- Publish{sig, ...} ------>|                            |
+//!     |                            |-- verify(sig, source) ---->|
+//!     |                            |-- Publish{sig, ...} ------>|
+//!     |                            |                            |-- verify(sig, source)
+//! ```
+//!
+//! Every node verifies the Ed25519 signature before accepting or forwarding.
+//!
+//! ## Rate Limiting Layers
+//!
+//! ```text
+//! Incoming Message
+//!       |
+//!       v
+//! [1] Per-Peer Rate Check (50 msg/s) --> DROP if exceeded
+//!       |
+//!       v
+//! [2] Signature Verification --> DROP if invalid
+//!       |
+//!       v
+//! [3] Deduplication Check --> DROP if seen
+//!       |
+//!       v
+//! [4] Message Size Check --> DROP if > 64KB
+//!       |
+//!       v
+//! ACCEPT and Forward
+//! ```
+//!
+//! ## IWant Amplification Prevention
+//!
+//! ```text
+//! Attacker                     Victim
+//!     |                            |
+//!     |-- IWant{1000 msg_ids} ---->| [1] Reject: > MAX_IWANT_MESSAGES * 2
+//!     |                            |
+//!     |-- IWant{10 msg_ids} x100 ->| [2] Rate limit: > IWANT_RATE_LIMIT/s
+//!     |                            |
+//!     |-- IWant{10 large msgs} --->| [3] Byte limit: stop at MAX_IWANT_RESPONSE_BYTES
+//! ```
+//!
+//! ## Bounded State Growth
+//!
+//! | Operation | Bound Enforced |
+//! |-----------|----------------|
+//! | Topic creation | `MAX_TOPICS` check, evict empty topics |
+//! | Peer insertion | `try_insert_peer()` capacity check |
+//! | Subscribe | `MAX_SUBSCRIPTIONS_PER_PEER` check |
+//! | Queue message | `MAX_OUTBOUND_PER_PEER`, drop oldest half |
+//! | Global queue | `MAX_TOTAL_OUTBOUND_MESSAGES`, evict largest |
+//! | Rate limit entry | `MAX_RATE_LIMIT_ENTRIES`, stale cleanup |
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;

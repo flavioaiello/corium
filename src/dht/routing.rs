@@ -4,11 +4,29 @@
 //! 256 k-buckets for 256-bit identities, LRU-style bucket management,
 //! and per-peer insertion rate limiting (50 contacts/minute/peer).
 //!
-//! # Security
+//! # Security Model
 //!
-//! Per-peer rate limiting prevents routing table flooding attacks where
-//! a malicious peer returns excessive contacts in FindNode responses.
-//! Each peer has a token bucket that replenishes at 50 tokens/minute.
+//! The routing table implements multiple protections against routing attacks:
+//!
+//! ## Sybil/Eclipse Attack Prevention
+//! - **Per-peer rate limiting**: Each peer can only contribute 50 contacts/minute
+//!   to our routing table, preventing flooding via FIND_NODE responses
+//! - **Token bucket algorithm**: Rate limits use token buckets with gradual
+//!   replenishment, not hard windows, for smoother limiting
+//! - **LRU tracking**: Rate limiter tracks up to 1,000 peers with LRU eviction
+//!
+//! ## Routing Table Stability
+//! - **Ping-before-evict**: When a bucket is full, we ping the oldest contact
+//!   before deciding to evict it or discard the new contact
+//! - **Long-lived preference**: Kademlia prefers older, proven contacts over
+//!   newly discovered ones for routing stability
+//! - **Bucket refresh**: Stale buckets trigger FIND_NODE for random IDs in
+//!   that bucket's range to discover legitimate peers
+//!
+//! ## Bounded Resources
+//! - **256 buckets × k contacts**: Maximum routing table size is 256 × k
+//! - **Adaptive k (10-30)**: Bucket size adjusts based on network conditions
+//! - **Rate limiter LRU**: Tracks at most 1,000 peers for rate limiting
 
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;

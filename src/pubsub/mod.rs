@@ -29,15 +29,62 @@
 //! - **Fanout**: When publishing to a topic we're not subscribed to, use cached peers
 //! - **Gossip**: Periodically exchange "I have" metadata to repair mesh gaps
 //!
-//! # Security
+//! # Security Architecture
 //!
-//! All published messages are cryptographically signed by the source's private key.
+//! The pubsub module implements defense-in-depth against common P2P messaging attacks:
+//!
+//! ## Message Authentication
+//!
+//! All published messages are cryptographically signed by the source's private key:
+//!
+//! | Component | Protection |
+//! |-----------|------------|
+//! | Signature scheme | Ed25519 (64 bytes) |
+//! | Signed data | `len(topic) || topic || seqno || len(data) || data` |
+//! | Verification | Every node verifies before accepting or forwarding |
+//!
 //! This prevents:
-//! - **Identity spoofing**: Cannot claim to be someone else
-//! - **Message forgery**: Cannot create messages on behalf of others  
+//! - **Identity spoofing**: Cannot claim to be someone else without their private key
+//! - **Message forgery**: Cannot create messages on behalf of others
 //! - **Dedup cache poisoning**: Cannot inject fake seqnos for other identities
 //!
-//! Every node verifies signatures before accepting or forwarding messages.
+//! ## Rate Limiting (Three-Tier)
+//!
+//! | Limit | Value | Description |
+//! |-------|-------|-------------|
+//! | Publish rate | 100/s | Local publishes (`DEFAULT_PUBLISH_RATE_LIMIT`) |
+//! | Forward rate | 1000/s | Forwarded messages (`DEFAULT_FORWARD_RATE_LIMIT`) |
+//! | Per-peer rate | 50/s | Any single peer (`DEFAULT_PER_PEER_RATE_LIMIT`) |
+//! | IWant rate | 5/s | Per-peer IWant requests (`DEFAULT_IWANT_RATE_LIMIT`) |
+//!
+//! ## Amplification Attack Prevention
+//!
+//! | Protection | Limit | Description |
+//! |------------|-------|-------------|
+//! | IWant message count | 10 | `DEFAULT_MAX_IWANT_MESSAGES` per request |
+//! | IWant response bytes | 256 KB | `MAX_IWANT_RESPONSE_BYTES` cap |
+//! | Separate IWant rate | 5/s | Prevents rapid-fire IWant floods |
+//!
+//! ## Bounded Resources
+//!
+//! | Resource | Limit | Constant |
+//! |----------|-------|----------|
+//! | Topics | 10,000 | `MAX_TOPICS` |
+//! | Peers per topic | 1,000 | `MAX_PEERS_PER_TOPIC` |
+//! | Subscriptions per peer | 100 | `MAX_SUBSCRIPTIONS_PER_PEER` |
+//! | Outbound per peer | 100 | `MAX_OUTBOUND_PER_PEER` |
+//! | Total outbound | 50,000 | `MAX_TOTAL_OUTBOUND_MESSAGES` |
+//! | Rate limit entries | 10,000 | `MAX_RATE_LIMIT_ENTRIES` |
+//! | Message cache | 10,000 | `DEFAULT_MESSAGE_CACHE_SIZE` |
+//! | Message size | 64 KB | `MAX_MESSAGE_SIZE` |
+//! | Topic name | 256 chars | `MAX_TOPIC_LENGTH` |
+//!
+//! ## Topic Validation
+//!
+//! Topic names are validated via `is_valid_topic()`:
+//! - Non-empty
+//! - Max 256 characters
+//! - Printable ASCII only (prevents injection attacks)
 //!
 //! # Example
 //!
@@ -62,32 +109,16 @@
 //! }
 //! ```
 
-mod config;
-mod gossipsub;
-mod message;
-mod signature;
-mod subscription;
-mod types;
+pub(crate) mod config;
+pub(crate) mod gossipsub;
+pub(crate) mod message;
+pub(crate) mod signature;
+pub(crate) mod subscription;
+pub(crate) mod types;
 
-// Re-export types for tests feature (pub) or internal use (pub(crate))
-#[cfg(feature = "tests")]
-pub use config::GossipConfig;
-#[cfg(feature = "tests")]
-pub use gossipsub::{GossipSub, PubSubHandler};
-#[cfg(feature = "tests")]
-pub use message::{MessageId, PubSubMessage};
-#[cfg(feature = "tests")]
-pub use signature::{SignatureError, sign_pubsub_message, verify_pubsub_signature};
-#[cfg(feature = "tests")]
-pub use types::ReceivedMessage;
-
-#[cfg(not(feature = "tests"))]
+// Re-export types for internal use
 pub(crate) use config::GossipConfig;
-#[cfg(not(feature = "tests"))]
 pub(crate) use gossipsub::{GossipSub, PubSubHandler};
-#[cfg(not(feature = "tests"))]
-pub(crate) use message::{MessageId, PubSubMessage};
-#[cfg(not(feature = "tests"))]
-pub(crate) use signature::{SignatureError, sign_pubsub_message, verify_pubsub_signature};
-#[cfg(not(feature = "tests"))]
+pub(crate) use message::PubSubMessage;
 pub(crate) use types::ReceivedMessage;
+

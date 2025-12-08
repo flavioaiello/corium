@@ -3,12 +3,36 @@
 //! All published messages are cryptographically signed by the source's private key.
 //! This module provides the signing and verification primitives.
 //!
-//! # Security
+//! # Security Model
 //!
-//! Message signatures prevent:
-//! - **Identity spoofing**: Cannot claim to be someone else
-//! - **Message forgery**: Cannot create messages on behalf of others
-//! - **Dedup cache poisoning**: Cannot inject fake seqnos for other identities
+//! ## Signature Format
+//!
+//! | Component | Description |
+//! |-----------|-------------|
+//! | Algorithm | Ed25519 |
+//! | Signature size | 64 bytes |
+//! | Verification | `verify_strict` (rejects malleable signatures) |
+//!
+//! ## Signed Data Structure
+//!
+//! ```text
+//! signed_data = len(topic):u32 || topic:bytes || seqno:u64 || len(data):u32 || data:bytes
+//! ```
+//!
+//! Length prefixes prevent concatenation/extension attacks where:
+//! - `topic="a", data="bc"` could be confused with `topic="ab", data="c"`
+//!
+//! ## Attack Prevention
+//!
+//! | Attack | Protection |
+//! |--------|------------|
+//! | Identity spoofing | Signature proves possession of private key |
+//! | Message forgery | Cannot sign without source's private key |
+//! | Topic substitution | Topic is included in signed data |
+//! | Seqno manipulation | Seqno is included in signed data |
+//! | Data tampering | Data is included in signed data |
+//! | Concatenation attack | Length prefixes prevent ambiguity |
+//! | Signature malleability | `verify_strict` rejects malleable forms |
 
 use ed25519_dalek::{Signature, VerifyingKey};
 

@@ -43,30 +43,15 @@
 //! For persistent identity, use [`Node::bind_with_keypair`] with a keypair
 //! from the `tests` feature module.
 
-// Internal modules - conditionally pub when tests feature is enabled
-#[cfg(feature = "tests")]
-pub mod dht;
-#[cfg(feature = "tests")]
-pub mod identity;
-#[cfg(feature = "tests")]
-pub mod messages;
-#[cfg(feature = "tests")]
-pub mod net;
-#[cfg(feature = "tests")]
-pub mod pubsub;
+// ============================================================================
+// Internal Modules - all crate-private by default
+// ============================================================================
 
-#[cfg(not(feature = "tests"))]
 pub(crate) mod dht;
-#[cfg(not(feature = "tests"))]
 pub(crate) mod identity;
-#[cfg(not(feature = "tests"))]
 pub(crate) mod messages;
-#[cfg(not(feature = "tests"))]
 pub(crate) mod net;
-#[cfg(not(feature = "tests"))]
 pub(crate) mod pubsub;
-
-// Always crate-internal (never exposed via tests feature)
 pub(crate) mod node;
 pub(crate) mod server;
 
@@ -102,32 +87,39 @@ pub use quinn::Connection;
 /// Enable with `features = ["tests"]` in Cargo.toml.
 #[cfg(feature = "tests")]
 pub mod tests {
-    // Identity
+    // Identity (already pub items from pub(crate) identity module)
     pub use crate::identity::{Keypair, Identity, EndpointRecord, RelayEndpoint, verify_identity};
     
-    // DHT
-    pub use crate::dht::{
-        DhtNode, DhtNetwork, RoutingTable, Contact, Key,
-        TelemetrySnapshot, hash_content, verify_key_value_pair,
-    };
+    // DHT (access via pub(crate) submodules)
+    pub use crate::dht::node::DhtNode;
+    pub use crate::dht::network::DhtNetwork;
+    pub use crate::dht::routing::{RoutingTable, Contact};
+    pub use crate::dht::hash::{Key, hash_content, verify_key_value_pair};
+    pub use crate::dht::params::TelemetrySnapshot;
     
-    // Network
-    pub use crate::net::{
-        PeerNetwork, SmartConnection,
-        create_client_config, create_server_config, generate_ed25519_cert,
-        extract_public_key_from_cert, verify_peer_identity, ALPN,
+    // Network (access via pub(crate) submodules)
+    pub use crate::net::transport::PeerNetwork;
+    pub use crate::net::tls::{
+        ALPN, generate_ed25519_cert,
+        create_server_config, create_client_config,
+        extract_public_key_from_cert, verify_peer_identity,
+    };
+    pub use crate::net::connection::SmartConnection;
+    pub use crate::net::relay::{
         UdpRelayForwarder, RelayInfo, NatType, NatReport, CryptoError,
         detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT,
     };
     
-    // PubSub
-    pub use crate::pubsub::{
-        GossipSub, GossipConfig, PubSubMessage, PubSubHandler,
-        MessageId, ReceivedMessage, SignatureError,
-        sign_pubsub_message, verify_pubsub_signature,
+    // PubSub (access via pub(crate) submodules)
+    pub use crate::pubsub::gossipsub::{GossipSub, PubSubHandler};
+    pub use crate::pubsub::config::GossipConfig;
+    pub use crate::pubsub::message::{MessageId, PubSubMessage};
+    pub use crate::pubsub::types::ReceivedMessage;
+    pub use crate::pubsub::signature::{
+        SignatureError, sign_pubsub_message, verify_pubsub_signature,
     };
     
-    // Wire protocol
+    // Wire protocol (access via pub items in pub(crate) messages module)
     pub use crate::messages::{
         DhtRequest, DhtResponse,
         deserialize_request, deserialize_response, serialize,

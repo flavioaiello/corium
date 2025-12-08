@@ -11,7 +11,7 @@ Connect to peers with a single method call—Corium handles NAT detection, hole 
 
 ```rust
 // Connect to any peer—works behind any NAT!
-let conn = network.smart_connect(&peer_record).await?;
+let conn = node.connect("peer_identity_hex", "192.168.1.50:9000").await?;
 ```
 
 ---
@@ -21,7 +21,7 @@ let conn = network.smart_connect(&peer_record).await?;
 | Challenge | Corium Solution |
 |-----------|-----------------|
 | "Peer is behind CGNAT" | Automatic relay fallback with E2E encryption |
-| "Which transport to use?" | `smart_connect` abstracts QUIC/relay/hole-punch |
+| "Which transport to use?" | `node.connect()` abstracts QUIC/relay/hole-punch |
 | "How to find peers?" | Built-in Kademlia DHT with signed endpoint records |
 | "NAT type varies" | Runtime detection, strategy per-connection |
 | "Connection drops" | QUIC migration, path probing, auto-upgrade |
@@ -33,16 +33,13 @@ let conn = network.smart_connect(&peer_record).await?;
 ### 1. Create a Node
 
 ```rust
-use corium::{Node, Keypair};
+use corium::Node;
 
-// Generate identity
-let keypair = Keypair::generate();
-
-// Start the node (binds to random port)
-let node = Node::bind("0.0.0.0:0", keypair).await?;
+// Create node with auto-generated identity
+let node = Node::bind("0.0.0.0:0").await?;
 
 println!("Node listening on {}", node.local_addr()?);
-println!("Identity: {}", hex::encode(node.identity().as_bytes()));
+println!("Identity: {}", node.identity());
 ```
 
 ### 2. Store and Retrieve Data
@@ -60,20 +57,13 @@ if let Some(data) = node.get(&key).await? {
 ### 3. Connect to Peers
 
 ```rust
-use corium::SmartConnection;
+// Connect to a peer by identity and address
+// NAT traversal is automatic!
+let conn = node.connect("a1b2c3d4...", "192.168.1.50:9000").await?;
 
-// Resolve peer's endpoint record from DHT
-let peer_record = node.resolve_peer(&peer_identity).await?.unwrap();
-
-// Connect—NAT traversal is automatic!
-let conn = node.connect(&peer_record).await?;
-
-// Check connection type
-match &conn {
-    SmartConnection::Direct(c) => println!("Direct to {}", c.remote_address()),
-    SmartConnection::Relayed { .. } => println!("Via relay (E2E encrypted)"),
-    _ => {}
-}
+// Use the QUIC connection
+let (mut send, mut recv) = conn.open_bi().await?;
+send.write_all(b"Hello!").await?;
 ```
 
 **That's it.** You don't need to:
@@ -85,19 +75,18 @@ match &conn {
 ### 4. PubSub Messaging
 
 ```rust
-use corium::{Node, Keypair};
+use corium::Node;
 
-let keypair = Keypair::generate();
-let node = Node::bind_with_pubsub("0.0.0.0:0", keypair).await?;
+let node = Node::bind("0.0.0.0:0").await?;
 
 // Subscribe to a topic
 node.subscribe("my-topic").await?;
 
 // Receive messages
-let mut rx = node.take_message_receiver().await?;
+let mut rx = node.messages().await?;
 tokio::spawn(async move {
     while let Some(msg) = rx.recv().await {
-        println!("[{}] {}", msg.topic, String::from_utf8_lossy(&msg.data));
+        println!("[{}] {}: {:?}", msg.topic, msg.from, msg.data);
     }
 });
 
@@ -114,12 +103,11 @@ node.publish("my-topic", b"Hello everyone!".to_vec()).await?;
 // 1. Each user publishes their endpoint
 node.publish_address(vec![my_addr.to_string()]).await?;
 
-// 2. To message someone, resolve their identity and connect
-let peer_record = node.resolve_peer(&recipient).await?.unwrap();
-let conn = node.connect(&peer_record).await?;
+// 2. To message someone, connect by identity and address
+let conn = node.connect("peer_identity_hex", "192.168.1.50:9000").await?;
 
 // 3. Send message over the connection
-let (mut send, _) = conn.connection().open_bi().await?;
+let (mut send, _) = conn.open_bi().await?;
 send.write_all(message_bytes).await?;
 ```
 
@@ -142,10 +130,10 @@ You don't need to understand this—`node.connect()` handles it. But if you're c
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Your Code: network.smart_connect(&peer_record)             │
+│  Your Code: node.connect(identity, addr)                    │
 ├─────────────────────────────────────────────────────────────┤
 │  1. Try Direct Connection (UDP/QUIC)                        │
-│     ├─ Success? → Return SmartConnection::Direct            │
+│     ├─ Success? → Return Connection                         │
 │     └─ Failed/Timeout? → Continue to step 2                 │
 ├─────────────────────────────────────────────────────────────┤
 │  2. Check NAT Type                                          │
@@ -155,7 +143,7 @@ You don't need to understand this—`node.connect()` handles it. But if you're c
 │  3. Relay Fallback                                          │
 │     ├─ Connect to relay node (outbound, traverses NAT)      │
 │     ├─ Peer connects to same relay                          │
-│     └─ Return SmartConnection::Relayed (E2E encrypted)      │
+│     └─ Return relayed connection (E2E encrypted)            │
 ├─────────────────────────────────────────────────────────────┤
 │  4. Background Upgrade                                      │
 │     └─ Periodically probe for direct path, migrate if found │
@@ -190,7 +178,7 @@ You don't need to understand this—`node.connect()` handles it. But if you're c
 - **Lazy push gossip** via IHave/IWant for reliable delivery
 
 ### NAT Traversal
-- **ICE-lite implementation** with candidate gathering and connectivity checks
+- **Path probing** with candidate gathering and connectivity checks
 - **STUN-like address discovery** via `WhatIsMyAddr` protocol
 - **TURN-style relay** with session management for symmetric NAT/CGNAT
 - **Hole punching coordination** with synchronized connection attempts
@@ -429,11 +417,10 @@ are configured automatically based on network conditions.
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_RELAY_SESSIONS` | 100 | Max concurrent relay sessions |
-| `RELAY_SESSION_TIMEOUT` | 5m | Idle session expiration |
-| `ICE_CHECK_INTERVAL` | 50ms | ICE connectivity check interval |
-| `ICE_KEEPALIVE_INTERVAL` | 15s | ICE keepalive interval |
-| `TURN_ALLOCATION_LIFETIME` | 10m | TURN allocation lifetime |
+| `MAX_SESSIONS` | 10,000 | Max concurrent relay sessions |
+| `SESSION_TIMEOUT` | 5m | Idle session expiration |
+| `RELAY_HEADER_SIZE` | 20 bytes | Magic (4) + session_id (16) |
+| `MAX_RELAY_FRAME_SIZE` | 1,400 bytes | MTU-safe frame size |
 
 ### PubSub Constants (Public)
 
@@ -491,7 +478,7 @@ pub const ALPN: &[u8] = b"corium";
 
 ## NAT Traversal
 
-Corium implements comprehensive NAT traversal using ICE-like techniques with QUIC-native transport:
+Corium implements comprehensive NAT traversal using path probing with QUIC-native transport:
 
 ### How It Works
 
@@ -546,35 +533,14 @@ When relay is needed, Corium dynamically selects the best relay node using a sco
 | Load | Medium | Relay's current session load (0-100ms penalty) |
 | Tier level | Low | DHT tiering level (20ms penalty per tier) |
 
-```rust
-use corium::{RelayClient, RelayInfo, Identity};
-
-// Relay selection score (lower is better)
-// score = rtt_ms + (load * 100) + (tier * 20)
-
-let client = RelayClient::new();
-
-// Update known relays - automatically sorted by score
-client.update_relays(discovered_relays).await;
-
-// Update relay metrics from DHT tiering system
-client.update_relay_rtt(&relay_identity, rtt_ms, tier_level).await;
-
-// Get best relays for connection (sorted by score)
-let best_relays = client.get_relays(3).await;
-if let Some(best) = best_relays.first() {
-    println!("Best relay: {} (score: {:.1})", 
-        best.relay_addrs[0], 
-        best.selection_score());
-}
-
-// Get only relays with measured latency
-let measured = client.get_measured_relays(3).await;
-```
+Relay selection uses the formula: `score = rtt_ms + (load * 100) + (tier * 20)` (lower is better).
 
 Relay nodes publish their capabilities to the DHT:
 
 ```rust
+// Available via `tests` feature
+use corium::tests::RelayInfo;
+
 pub struct RelayInfo {
     pub relay_peer: Identity,      // Relay's peer ID
     pub relay_addrs: Vec<String>,  // Relay addresses
@@ -582,15 +548,11 @@ pub struct RelayInfo {
     pub accepting: bool,           // Accepting new sessions?
     pub rtt_ms: Option<f32>,       // Observed RTT (from tiering)
     pub tier: Option<u8>,          // Tiering level (0 = fastest)
-    pub capabilities: RelayCapabilities,
 }
 
-pub struct RelayCapabilities {
-    pub stun: bool,              // Supports STUN binding
-    pub turn: bool,              // Supports TURN relay
-    pub ice_lite: bool,          // Supports ICE-lite
-    pub max_bandwidth_kbps: u32, // Bandwidth limit (0 = unlimited)
-    pub region: Option<String>,  // Geographic region hint
+impl RelayInfo {
+    /// Calculate relay selection score (lower is better)
+    pub fn selection_score(&self) -> f32;
 }
 ```
 
@@ -604,15 +566,16 @@ pub struct RelayCapabilities {
 | `PortRestrictedCone` | Only (host, port) we've sent to can reply | ✓ Works |
 | `Symmetric` | Different mapping per destination (CGNAT) | ✗ Needs relay |
 
-### Smart Connections
+### Smart Connections (Advanced)
+
+For advanced usage with the `tests` feature, you can access the underlying `SmartConnection`:
 
 ```rust
-use corium::SmartConnection;
+// Requires `tests` feature
+use corium::tests::SmartConnection;
 
-// Automatically chooses direct or relay based on NAT
-let connection = network.smart_connect(&endpoint_record).await?;
-
-match &connection {
+// Access via PeerNetwork (internal API)
+match &smart_connection {
     SmartConnection::Direct(conn) => {
         println!("Direct connection to {}", conn.remote_address());
     }
@@ -645,19 +608,13 @@ Path probing happens automatically in the background:
 
 ```rust
 // SmartSock is integrated into the Node automatically
-let node = Node::bind("0.0.0.0:0", keypair).await?;
+let node = Node::bind("0.0.0.0:0").await?;
 
 // Path probing starts automatically when you connect to a peer
-let conn = node.connect(&peer_record).await?;
+let conn = node.connect("peer_identity_hex", "192.168.1.50:9000").await?;
 
-// Access SmartSock for advanced path management
+// Access SmartSock for advanced path management (advanced)
 let smartsock = node.smartsock();
-
-// Register additional direct addresses for a peer
-smartsock.add_direct_candidate(&peer_identity, new_addr).await;
-
-// Check if using relay or direct
-// (SmartSock switches transparently - you don't need to check)
 ```
 
 ---
@@ -671,7 +628,7 @@ Corium includes a GossipSub-style publish/subscribe system for topic-based messa
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Application                             │
-│              subscribe(), publish(), on_message()           │
+│              subscribe(), publish(), messages()             │
 ├─────────────────────────────────────────────────────────────┤
 │                      GossipSub                              │
 │         Topic meshes, message routing, deduplication        │
@@ -693,42 +650,41 @@ Corium includes a GossipSub-style publish/subscribe system for topic-based messa
 ### Usage
 
 ```rust
-use std::sync::Arc;
-use corium::pubsub::{GossipSub, GossipConfig};
-use corium::identity::Keypair;
+use corium::Node;
 
-// Create pubsub layer on top of discovery node
-let keypair = Keypair::generate();
-let config = GossipConfig::default();
-let mut pubsub = GossipSub::new(dht.clone(), keypair, config);
-
-// Take the message receiver for incoming messages
-let mut receiver = pubsub.take_message_receiver().unwrap();
-
-// Wrap in Arc for shared access
-let pubsub = Arc::new(pubsub);
-
-// Spawn heartbeat task for mesh maintenance
-let pubsub_heartbeat = pubsub.clone();
-tokio::spawn(async move {
-    pubsub_heartbeat.run_heartbeat().await;
-});
+// Create node (pubsub enabled by default)
+let node = Node::bind("0.0.0.0:0").await?;
 
 // Subscribe to a topic
-pubsub.subscribe("chat/lobby").await?;
+node.subscribe("chat/lobby").await?;
 
-// Publish a message (automatically signed by keypair)
-let msg_id = pubsub.publish("chat/lobby", b"Hello, world!".to_vec()).await?;
+// Get message receiver
+let mut rx = node.messages().await?;
+
+// Publish a message (automatically signed)
+node.publish("chat/lobby", b"Hello, world!".to_vec()).await?;
 
 // Handle incoming messages (signatures verified automatically)
-while let Some(msg) = receiver.recv().await {
-    println!("[{}] {}: {:?}", msg.topic, msg.source, msg.data);
+while let Some(msg) = rx.recv().await {
+    println!("[{}] {}: {:?}", msg.topic, msg.from, msg.data);
 }
+```
+
+### Advanced Usage (Tests Feature)
+
+For low-level access to GossipSub internals, use the `tests` feature:
+
+```rust
+// Requires `tests` feature
+use corium::tests::{GossipSub, GossipConfig};
 ```
 
 ### Configuration
 
+Configuration is handled internally with sensible defaults:
+
 ```rust
+// Internal configuration (not directly accessible without `tests` feature)
 pub struct GossipConfig {
     pub mesh_degree: usize,         // Target peers per topic (default: 6)
     pub mesh_degree_low: usize,     // Min before seeking more (default: 4)
@@ -759,19 +715,28 @@ pub struct GossipConfig {
 ## Telemetry
 
 ```rust
-#[derive(Clone, Debug, Default)]
-pub struct TelemetrySnapshot {
-    pub tier_centroids: Vec<f32>,    // Latency tier centers (ms)
-    pub tier_counts: Vec<usize>,     // Nodes per tier
-    pub pressure: f32,               // Current pressure (0.0-1.0)
-    pub stored_keys: usize,          // Keys in local storage
-    pub replication_factor: usize,   // Current k
-    pub concurrency: usize,          // Current alpha
-}
+use corium::Node;
 
-// Get a snapshot
-let snapshot = dht.telemetry_snapshot().await;
+let node = Node::bind("0.0.0.0:0").await?;
+
+// Get a telemetry snapshot
+let snapshot = node.telemetry().await;
+
+println!("Stored keys: {}", snapshot.stored_keys);
+println!("Pressure: {:.2}", snapshot.pressure);
+println!("k={}, alpha={}", snapshot.replication_factor, snapshot.concurrency);
 ```
+
+The `TelemetrySnapshot` contains:
+
+| Field | Description |
+|-------|-------------|
+| `tier_centroids` | Latency tier centers (ms) |
+| `tier_counts` | Nodes per tier |
+| `pressure` | Current pressure (0.0-1.0) |
+| `stored_keys` | Keys in local storage |
+| `replication_factor` | Current k |
+| `concurrency` | Current alpha |
 
 ---
 
@@ -913,6 +878,16 @@ Corium prevents Sybil attacks by cryptographically binding each peer's Identity 
 5. **Request validation**: Every RPC request's `from` Contact must match the verified Identity from the TLS handshake
 
 This prevents attackers from claiming arbitrary Identities—they can only use Identities matching keys they control. The zero-hash property eliminates hash collision concerns entirely.
+
+**Formal Security Properties** (verified by tests in `src/identity.rs`):
+
+| Property | Guarantee |
+|----------|-----------|
+| **P1: Identity Binding** | `Identity = PublicKey` (exact 32-byte equality, no transformation) |
+| **P2: Zero-Hash** | XOR distance computed directly on raw public key bytes |
+| **P3: SNI Pinning** | TLS SNI = hex(Identity) binds connection to claimed identity |
+| **P4: Sybil Protection** | `verify_identity(id, pk)` uses constant-time comparison |
+| **P5: EndpointRecord Auth** | Length-prefixed signatures prevent malleability attacks |
 
 ### Protocol Security
 
@@ -1070,15 +1045,19 @@ Graceful degradation instead of panics:
 
 ### Security Test Coverage
 
-Dedicated test suites verify security properties:
+Security tests are integrated into the library test suite:
 
 ```bash
-cargo test --test security          # Core cryptographic security
-cargo test --test security_pubsub   # PubSub security tests
-cargo test --test security_relay    # Relay/ICE security tests
-cargo test --test security_gaps     # Clock skew, rate limiting, Sybil tests
-cargo test --test formal_verification  # Formal property tests
+# Run all unit tests including security tests
+cargo test --lib
+
+# Run integration tests
+cargo test --test api
+cargo test --test scale
 ```
+
+Security-critical code (identity verification, signature validation, rate limiting) 
+is tested inline with comprehensive test coverage in each module.
 
 ---
 
@@ -1090,40 +1069,30 @@ The test suite includes comprehensive coverage for DHT, security, and networking
 # Run all tests
 cargo test
 
+# Run unit tests only
+cargo test --lib
+
+# Run integration tests
+cargo test --test api
+cargo test --test scale
+
 # Run with output
 cargo test -- --nocapture
 
-# Run specific test suites
-cargo test --test integration          # Integration tests
-cargo test --test routing_table        # Routing table tests
-cargo test --test security             # Core security tests
-cargo test --test security_pubsub      # PubSub security tests
-cargo test --test security_relay       # Relay/ICE security tests
-cargo test --test security_gaps        # Security hardening tests
-cargo test --test formal_verification  # Formal property tests
-cargo test --test data_distribution    # DHT data distribution tests
-cargo test --test iterative_find_node_scale  # Scalability tests
-
 # Run with specific log level
 RUST_LOG=debug cargo test
-
-# Run benchmarks (if available)
-cargo bench
 ```
 
 ### Test Categories
 
-| Test File | Focus |
-|-----------|-------|
-| `integration.rs` | End-to-end DHT operations |
-| `routing_table.rs` | Kademlia routing table behavior |
-| `security.rs` | Core security properties |
-| `security_pubsub.rs` | PubSub message signing/verification |
-| `security_relay.rs` | ICE/STUN/TURN security |
-| `security_gaps.rs` | Edge cases and hardening |
-| `formal_verification.rs` | Formal property verification |
-| `data_distribution.rs` | DHT data distribution |
-| `iterative_find_node_scale.rs` | Scalability testing |
+| Location | Focus |
+|----------|-------|
+| `src/identity.rs` | Identity security, signature verification, replay prevention |
+| `src/dht/*.rs` | Routing table, storage, tiering |
+| `src/net/*.rs` | TLS, relay, path probing |
+| `src/pubsub/*.rs` | Message signing, rate limiting |
+| `tests/api.rs` | Public API integration tests |
+| `tests/scale.rs` | Scalability testing |
 
 ---
 

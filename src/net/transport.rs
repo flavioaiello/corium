@@ -80,29 +80,21 @@ use crate::identity::{EndpointRecord, Identity};
 use crate::messages::{DhtRequest, DhtResponse};
 use crate::net::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
 
-// Re-export TLS utilities - pub when tests feature, pub(crate) otherwise
-#[cfg(feature = "tests")]
-pub use super::tls::{
-    ALPN,
-    generate_ed25519_cert,
-    create_server_config,
-    create_client_config,
-    extract_public_key_from_cert,
-    verify_peer_identity,
-};
-
-#[cfg(not(feature = "tests"))]
+// Re-export TLS utilities for internal use (tests backdoor accesses tls module directly)
 pub(crate) use super::tls::{
-    ALPN,
     generate_ed25519_cert,
     create_server_config,
     create_client_config,
     extract_public_key_from_cert,
-    verify_peer_identity,
 };
 
 /// Maximum size of an RPC response in bytes (1 MB).
 /// Larger than request to accommodate FIND_VALUE responses with data.
+///
+/// # Security
+///
+/// Bounded deserialization prevents memory exhaustion from malicious
+/// length prefixes. This limit is enforced before allocation.
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 /// Maximum number of contacts allowed in a single response.
@@ -117,6 +109,11 @@ const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 ///
 /// Set to 100, which is 5x the typical k=20 value. Legitimate nodes
 /// should never return more than k contacts.
+///
+/// # Defensive Handling
+///
+/// Oversized responses are truncated rather than rejected to be tolerant
+/// of edge cases while still bounding resource consumption.
 const MAX_CONTACTS_PER_RESPONSE: usize = 100;
 
 /// Maximum size of a value in FIND_VALUE responses.
