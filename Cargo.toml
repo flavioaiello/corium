@@ -44,7 +44,3 @@ parking_lot = "0.12"
 
 [[example]]
 name = "chatroom"
-
-[[test]]
-name = "scale"
-required-features = ["tests"]

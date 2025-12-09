@@ -1,50 +1,16 @@
-//! Topic subscription records for DHT storage.
-//!
-//! This module defines the data structures used to store and retrieve
-//! topic subscriptions from the DHT.
-//!
-//! # Security Model
-//!
-//! ## Bounded Subscriber Lists
-//!
-//! The `TopicSubscribers` struct limits entries to `MAX_TOPIC_SUBSCRIBERS` (50)
-//! to prevent memory exhaustion from malicious DHT data.
-//!
-//! ## CRDT-Style Updates
-//!
-//! Subscription announcements use Last-Writer-Wins (LWW) semantics:
-//!
-//! 1. Each identity can only update its own entry
-//! 2. Timestamps determine which entry wins on conflict
-//! 3. Merge is commutative and idempotent
-//!
-//! This prevents:
-//! - **Subscription hijacking**: Cannot update another peer's entry
-//! - **Race conditions**: LWW provides deterministic conflict resolution
-//!
-//! ## Custom Deserialization
-//!
-//! `TopicSubscribers` implements custom `Deserialize` to truncate oversized
-//! lists from potentially corrupted or malicious DHT data.
-
 use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 
-/// Maximum subscribers to track per topic in DHT.
 const MAX_TOPIC_SUBSCRIBERS: usize = 50;
 
-/// A single subscriber entry in a topic record.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriberEntry {
-    /// The subscriber's identity.
     pub identity: Identity,
-    /// Timestamp when this entry was created/updated.
     pub timestamp: u64,
 }
 
 impl SubscriberEntry {
-    /// Create a new subscriber entry with current timestamp.
     pub fn new(identity: Identity) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -54,22 +20,16 @@ impl SubscriberEntry {
     }
 }
 
-/// A topic subscription record stored in the DHT.
-/// Contains a list of all known subscribers for a topic.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TopicSubscribers {
-    /// List of subscribers with their timestamps.
     pub subscribers: Vec<SubscriberEntry>,
 }
 
-// Custom deserialization to validate and truncate subscriber list
-// This prevents memory spikes from malicious/corrupted DHT data
 impl<'de> Deserialize<'de> for TopicSubscribers {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // Deserialize to a raw representation first
         #[derive(Deserialize)]
         struct RawTopicSubscribers {
             subscribers: Vec<SubscriberEntry>,
@@ -77,7 +37,6 @@ impl<'de> Deserialize<'de> for TopicSubscribers {
         
         let raw = RawTopicSubscribers::deserialize(deserializer)?;
         
-        // Truncate to MAX_TOPIC_SUBSCRIBERS to prevent memory exhaustion
         let subscribers = if raw.subscribers.len() > MAX_TOPIC_SUBSCRIBERS {
             raw.subscribers.into_iter().take(MAX_TOPIC_SUBSCRIBERS).collect()
         } else {
@@ -89,23 +48,17 @@ impl<'de> Deserialize<'de> for TopicSubscribers {
 }
 
 impl TopicSubscribers {
-    /// Create a new empty subscriber list.
     pub fn new() -> Self {
         Self { subscribers: Vec::new() }
     }
 
-    /// Add or update a subscriber in the list.
     #[allow(dead_code)]  // Tested and ready for future use
     pub fn add_subscriber(&mut self, identity: Identity) {
-        // Remove existing entry for this identity if present
         self.subscribers.retain(|e| e.identity != identity);
         
-        // Add new entry
         self.subscribers.push(SubscriberEntry::new(identity));
         
-        // Limit size by removing oldest entries
         while self.subscribers.len() > MAX_TOPIC_SUBSCRIBERS {
-            // Find and remove oldest
             if let Some(oldest_idx) = self.subscribers
                 .iter()
                 .enumerate()
@@ -117,15 +70,12 @@ impl TopicSubscribers {
         }
     }
 
-    /// Remove a subscriber from the list.
     pub fn remove_subscriber(&mut self, identity: &Identity) {
         self.subscribers.retain(|e| &e.identity != identity);
     }
 
-    /// Merge another subscriber list into this one (keeps newest entries).
     pub fn merge(&mut self, other: TopicSubscribers) {
         for entry in other.subscribers {
-            // Only add if newer than existing or not present
             if let Some(existing) = self.subscribers.iter_mut().find(|e| e.identity == entry.identity) {
                 if entry.timestamp > existing.timestamp {
                     existing.timestamp = entry.timestamp;
@@ -135,7 +85,6 @@ impl TopicSubscribers {
             }
         }
         
-        // Limit size
         while self.subscribers.len() > MAX_TOPIC_SUBSCRIBERS {
             if let Some(oldest_idx) = self.subscribers
                 .iter()
@@ -148,7 +97,6 @@ impl TopicSubscribers {
         }
     }
 
-    /// Get list of subscriber identities.
     pub fn get_subscribers(&self) -> Vec<Identity> {
         self.subscribers
             .iter()
@@ -157,19 +105,14 @@ impl TopicSubscribers {
     }
 }
 
-/// Legacy single-subscriber record (kept for backward compatibility).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TopicSubscription {
-    /// The subscriber's identity.
     pub subscriber: Identity,
-    /// Topics subscribed to.
     pub topics: Vec<String>,
-    /// Timestamp when record was created.
     pub timestamp: u64,
 }
 
 impl TopicSubscription {
-    /// Create a new subscription record.
     #[allow(dead_code)]  // Tested and kept for backward compatibility
     pub fn new(subscriber: Identity, topics: Vec<String>) -> Self {
         let timestamp = std::time::SystemTime::now()
@@ -240,11 +183,9 @@ mod tests {
         
         let id1 = Identity::from_bytes([1u8; 32]);
         
-        // Add same subscriber twice
         subscribers.add_subscriber(id1);
         subscribers.add_subscriber(id1);
         
-        // Should still only have one entry
         assert_eq!(subscribers.subscribers.len(), 1);
     }
 
@@ -282,10 +223,8 @@ mod tests {
         subscribers.add_subscriber(id1);
         subscribers.add_subscriber(id2);
         
-        // Serialize
         let data = bincode::serialize(&subscribers).expect("serialize failed");
         
-        // Deserialize
         let restored: TopicSubscribers = bincode::deserialize(&data).expect("deserialize failed");
         
         let result = restored.get_subscribers();
@@ -298,14 +237,12 @@ mod tests {
     fn topic_subscribers_limits_size() {
         let mut subscribers = TopicSubscribers::new();
         
-        // Add more than MAX_TOPIC_SUBSCRIBERS
         for i in 0..60 {
             let mut bytes = [0u8; 32];
             bytes[0] = i;
             subscribers.add_subscriber(Identity::from_bytes(bytes));
         }
         
-        // Should be limited to MAX_TOPIC_SUBSCRIBERS
         assert!(subscribers.subscribers.len() <= MAX_TOPIC_SUBSCRIBERS);
     }
 
@@ -315,10 +252,8 @@ mod tests {
         let topics = vec!["topic1".to_string(), "topic2".to_string()];
         let record = TopicSubscription::new(identity, topics.clone());
         
-        // Serialize
         let data = bincode::serialize(&record).expect("serialization failed");
         
-        // Deserialize
         let restored: TopicSubscription = bincode::deserialize(&data).expect("deserialization failed");
         
         assert_eq!(restored.subscriber, identity);

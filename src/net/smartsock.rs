@@ -1,33 +1,3 @@
-//! SmartSock: Unified transport abstraction for seamless path switching.
-//!
-//! This module implements [`SmartSock`], which provides:
-//!
-//! - **Transparent path switching**: Relay↔direct without reconnection
-//! - **True E2E encryption**: Relay cannot decrypt traffic
-//! - **Fake address mapping**: Quinn sees stable addresses, we translate to real paths
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     Quinn Endpoint                              │
-//! │  Sees: SmartAddr (fd00:c0r1:um::<peer_id>)                     │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │                     SmartSock                                   │
-//! │  Translates: SmartAddr ↔ Real transport (UDP or Relay tunnel)  │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  UDP Socket  │  Relay Tunnels (raw encrypted QUIC forwarding)  │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Fake Address Scheme
-//!
-//! We use a Unique Local Address (ULA) range that will never conflict with real IPs:
-//! - Prefix: `fd00:c0r1:um00::/48` (corium in hex-ish)
-//! - Format: `fd00:c0r1:um00:PPPP:PPPP:PPPP:PPPP:PPPP` where P = peer_id bytes
-//!
-//! Quinn connects to these fake addresses; SmartSock translates to real paths.
-
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::io::{self, IoSliceMut};
@@ -43,80 +13,42 @@ use tokio::sync::RwLock;
 
 use crate::identity::Identity;
 
-// =============================================================================
-// Constants
-// =============================================================================
-
-/// Magic bytes for relay tunnel frames: "CRLY" (Corium ReLaY)
 const RELAY_MAGIC: [u8; 4] = *b"CRLY";
 
-/// Relay frame header size: magic (4) + session_id (16) = 20 bytes
 const RELAY_HEADER_SIZE: usize = 20;
 
-/// Maximum relay frame size (MTU-safe)
 const MAX_RELAY_FRAME_SIZE: usize = 1400;
 
-// -----------------------------------------------------------------------------
-// Path Probing Constants
-// -----------------------------------------------------------------------------
-
-/// Magic bytes for path probe messages: "SMPR" (SmartSock PRobe)
 const PROBE_MAGIC: [u8; 4] = *b"SMPR";
 
-/// Probe message type: request
 const PROBE_TYPE_REQUEST: u8 = 0x01;
 
-/// Probe message type: response  
 const PROBE_TYPE_RESPONSE: u8 = 0x02;
 
-/// Probe header size: magic (4) + type (1) + tx_id (8) + timestamp (8) = 21 bytes
 const PROBE_HEADER_SIZE: usize = 21;
 
-/// Interval between path probes
 pub const PATH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Timeout for considering a path stale
 pub const PATH_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum probe failures before marking path as failed
 pub const MAX_PROBE_FAILURES: u32 = 3;
 
-/// RTT threshold (ms) - relay must be this much faster to beat direct
 const RELAY_RTT_ADVANTAGE_MS: f32 = 50.0;
 
-/// EMA smoothing factor for RTT (weight of old value)
 const RTT_EMA_OLD: f32 = 0.8;
 
-/// EMA smoothing factor for RTT (weight of new sample)
 const RTT_EMA_NEW: f32 = 0.2;
 
-// =============================================================================
-// RelayTunnel: Connection to a relay for forwarding packets
-// =============================================================================
-
-/// A tunnel through a relay for E2E encrypted packet forwarding.
-///
-/// The relay sees only:
-/// - Session ID (16 bytes) - for routing to the other peer
-/// - Opaque payload - the raw encrypted QUIC packet
-///
-/// This enables true E2E encryption: relay cannot decrypt the payload.
 #[derive(Debug, Clone)]
 pub struct RelayTunnel {
-    /// Session ID for this tunnel (shared with peer via signaling)
     pub session_id: [u8; 16],
-    /// Address of the relay server
     pub relay_addr: SocketAddr,
-    /// The peer at the other end of the tunnel
     pub peer_identity: Identity,
-    /// When this tunnel was established
     pub established_at: Instant,
-    /// Last activity on this tunnel
     pub last_activity: Instant,
 }
 
 impl RelayTunnel {
-    /// Create a new relay tunnel.
     pub fn new(session_id: [u8; 16], relay_addr: SocketAddr, peer_identity: Identity) -> Self {
         let now = Instant::now();
         Self {
@@ -128,9 +60,6 @@ impl RelayTunnel {
         }
     }
     
-    /// Encode a QUIC packet into a relay frame.
-    ///
-    /// Format: [CRLY magic: 4][session_id: 16][payload: N]
     pub fn encode_frame(&self, quic_packet: &[u8]) -> Vec<u8> {
         let mut frame = Vec::with_capacity(RELAY_HEADER_SIZE + quic_packet.len());
         frame.extend_from_slice(&RELAY_MAGIC);
@@ -139,48 +68,31 @@ impl RelayTunnel {
         frame
     }
     
-    /// Decode a relay frame, returning the session_id and payload.
-    ///
-    /// Returns None if the frame is malformed or not a relay frame.
     pub fn decode_frame(data: &[u8]) -> Option<([u8; 16], &[u8])> {
         if data.len() < RELAY_HEADER_SIZE {
             return None;
         }
         
-        // Check magic
         if data[0..4] != RELAY_MAGIC {
             return None;
         }
         
-        // Extract session_id
         let mut session_id = [0u8; 16];
         session_id.copy_from_slice(&data[4..20]);
         
-        // Payload is the rest
         let payload = &data[RELAY_HEADER_SIZE..];
         
         Some((session_id, payload))
     }
 }
 
-// =============================================================================
-// PathProbe: RTT measurement messages
-// =============================================================================
-
-/// A path probe request for RTT measurement.
-///
-/// Sent periodically to each candidate path to measure latency and detect
-/// reachability. The peer echoes back the tx_id and timestamp in a PathProbeResponse.
 #[derive(Debug, Clone)]
 pub struct PathProbeRequest {
-    /// Transaction ID to match response
     pub tx_id: u64,
-    /// Timestamp when probe was sent (ms since epoch)
     pub timestamp_ms: u64,
 }
 
 impl PathProbeRequest {
-    /// Create a new probe request with the given transaction ID.
     pub fn new(tx_id: u64) -> Self {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -189,9 +101,6 @@ impl PathProbeRequest {
         Self { tx_id, timestamp_ms }
     }
     
-    /// Encode to wire format.
-    ///
-    /// Format: [SMPR magic: 4][type: 1][tx_id: 8][timestamp_ms: 8] = 21 bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(PROBE_HEADER_SIZE);
         buf.extend_from_slice(&PROBE_MAGIC);
@@ -201,7 +110,6 @@ impl PathProbeRequest {
         buf
     }
     
-    /// Decode from wire format.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < PROBE_HEADER_SIZE {
             return None;
@@ -215,25 +123,19 @@ impl PathProbeRequest {
         })
     }
     
-    /// Check if data looks like a probe request (quick magic check).
     pub fn is_probe_request(data: &[u8]) -> bool {
         data.len() >= 5 && &data[0..4] == &PROBE_MAGIC && data[4] == PROBE_TYPE_REQUEST
     }
 }
 
-/// A path probe response echoing the request.
 #[derive(Debug, Clone)]
 pub struct PathProbeResponse {
-    /// Transaction ID echoed from request
     pub tx_id: u64,
-    /// Original timestamp echoed from request
     pub echo_timestamp_ms: u64,
-    /// Observed source address of the probe sender
     pub observed_addr: SocketAddr,
 }
 
 impl PathProbeResponse {
-    /// Create a response to a probe request.
     pub fn from_request(req: &PathProbeRequest, observed_addr: SocketAddr) -> Self {
         Self {
             tx_id: req.tx_id,
@@ -242,9 +144,6 @@ impl PathProbeResponse {
         }
     }
     
-    /// Encode to wire format.
-    ///
-    /// Format: [SMPR magic: 4][type: 1][tx_id: 8][timestamp_ms: 8][addr_type: 1][addr: 4 or 16][port: 2]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
         buf.extend_from_slice(&PROBE_MAGIC);
@@ -267,7 +166,6 @@ impl PathProbeResponse {
         buf
     }
     
-    /// Decode from wire format.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < PROBE_HEADER_SIZE + 1 {
             return None;
@@ -299,12 +197,10 @@ impl PathProbeResponse {
         Some(Self { tx_id, echo_timestamp_ms, observed_addr })
     }
     
-    /// Check if data looks like a probe response (quick magic check).
     pub fn is_probe_response(data: &[u8]) -> bool {
         data.len() >= 5 && &data[0..4] == &PROBE_MAGIC && data[4] == PROBE_TYPE_RESPONSE
     }
     
-    /// Calculate RTT in milliseconds from the echo timestamp.
     pub fn rtt_ms(&self) -> f32 {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -314,48 +210,28 @@ impl PathProbeResponse {
     }
 }
 
-// =============================================================================
-// PathCandidateState: Per-path probing state
-// =============================================================================
-
-/// State of a path candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathCandidateState {
-    /// Not yet probed
     Unknown,
-    /// Probe sent, waiting for response
     Probing,
-    /// Received successful response
     Active,
-    /// Too many failures
     Failed,
 }
 
-/// A candidate path to a peer with RTT tracking.
 #[derive(Debug, Clone)]
 pub struct PathCandidateInfo {
-    /// Address of this path endpoint
     pub addr: SocketAddr,
-    /// Whether this is a relay path
     pub is_relay: bool,
-    /// For relay paths, the session ID
     pub session_id: Option<[u8; 16]>,
-    /// Current state
     pub state: PathCandidateState,
-    /// Smoothed RTT in milliseconds (EMA)
     pub rtt_ms: Option<f32>,
-    /// Last successful probe time
     pub last_success: Option<Instant>,
-    /// Last probe sent time
     pub last_probe: Option<Instant>,
-    /// Consecutive failure count
     pub failures: u32,
-    /// Current probe sequence number
     pub probe_seq: u64,
 }
 
 impl PathCandidateInfo {
-    /// Create a new direct path candidate.
     pub fn new_direct(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -370,7 +246,6 @@ impl PathCandidateInfo {
         }
     }
     
-    /// Create a new relay path candidate.
     pub fn new_relay(relay_addr: SocketAddr, session_id: [u8; 16]) -> Self {
         Self {
             addr: relay_addr,
@@ -385,7 +260,6 @@ impl PathCandidateInfo {
         }
     }
     
-    /// Check if this path needs a probe.
     pub fn needs_probe(&self) -> bool {
         match self.state {
             PathCandidateState::Failed => false,
@@ -398,7 +272,6 @@ impl PathCandidateInfo {
         }
     }
     
-    /// Check if this path is usable for sending.
     pub fn is_usable(&self) -> bool {
         matches!(self.state, PathCandidateState::Active | PathCandidateState::Probing)
             && self.last_success
@@ -406,7 +279,6 @@ impl PathCandidateInfo {
                 .unwrap_or(false)
     }
     
-    /// Record a successful probe response.
     pub fn record_success(&mut self, rtt: Duration) {
         let rtt_sample = rtt.as_secs_f32() * 1000.0;
         self.rtt_ms = Some(match self.rtt_ms {
@@ -418,7 +290,6 @@ impl PathCandidateInfo {
         self.failures = 0;
     }
     
-    /// Record a probe failure.
     pub fn record_failure(&mut self) {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= MAX_PROBE_FAILURES {
@@ -426,7 +297,6 @@ impl PathCandidateInfo {
         }
     }
     
-    /// Mark that a probe was sent.
     pub fn mark_probed(&mut self) {
         self.last_probe = Some(Instant::now());
         self.probe_seq = self.probe_seq.wrapping_add(1);
@@ -436,32 +306,18 @@ impl PathCandidateInfo {
     }
 }
 
-// =============================================================================
-// SmartAddr: Fake IPv6 address mapped to peer identity
-// =============================================================================
-
-/// Fake IPv6 address that Quinn sees, mapped to a real peer identity.
-///
-/// Uses ULA prefix `fd00:c0r1:um00::/48` to avoid conflicts with real addresses.
-/// The peer's 32-byte identity is hashed to fit in the remaining 80 bits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SmartAddr(SocketAddr);
 
 impl SmartAddr {
-    /// ULA prefix for SmartSock addresses: fd00:c0r1:um00::/48
     const PREFIX: [u8; 6] = [0xfd, 0x00, 0xc0, 0xf1, 0x00, 0x00];
     
-    /// Default port for SmartAddr (arbitrary, not used for routing)
     const DEFAULT_PORT: u16 = 1;
 
-    /// Create a SmartAddr from a peer identity.
-    ///
-    /// The identity is hashed to create a unique IPv6 address in our ULA range.
     pub fn from_identity(identity: &Identity) -> Self {
         let hash = blake3::hash(identity.as_bytes());
         let hash_bytes = hash.as_bytes();
         
-        // Build IPv6: fd00:c0r1:um00:HHHH:HHHH:HHHH:HHHH:HHHH
         let mut octets = [0u8; 16];
         octets[..6].copy_from_slice(&Self::PREFIX);
         octets[6..16].copy_from_slice(&hash_bytes[..10]);
@@ -470,7 +326,6 @@ impl SmartAddr {
         Self(SocketAddr::new(IpAddr::V6(ipv6), Self::DEFAULT_PORT))
     }
     
-    /// Check if a SocketAddr is a SmartAddr (in our ULA range).
     pub fn is_smart_addr(addr: &SocketAddr) -> bool {
         match addr.ip() {
             IpAddr::V6(v6) => {
@@ -481,7 +336,6 @@ impl SmartAddr {
         }
     }
     
-    /// Get the underlying SocketAddr.
     pub fn socket_addr(&self) -> SocketAddr {
         self.0
     }
@@ -499,16 +353,9 @@ impl From<SmartAddr> for SocketAddr {
     }
 }
 
-// =============================================================================
-// PathChoice: Which transport to use for a peer
-// =============================================================================
-
-/// The chosen path to reach a peer.
 #[derive(Debug, Clone)]
 pub enum PathChoice {
-    /// Direct UDP to peer's address
     Direct { addr: SocketAddr, rtt_ms: f32 },
-    /// Via relay tunnel (relay forwards raw QUIC packets)
     Relay { 
         relay_addr: SocketAddr, 
         session_id: [u8; 16],
@@ -516,32 +363,21 @@ pub enum PathChoice {
     },
 }
 
-/// Per-peer path state with RTT tracking.
 #[derive(Debug)]
 pub struct PeerPathState {
-    /// The peer's identity
     pub identity: Identity,
-    /// Known direct addresses for this peer
     pub direct_addrs: Vec<SocketAddr>,
-    /// Active relay tunnels for this peer (session_id -> RelayTunnel)
     pub relay_tunnels: HashMap<[u8; 16], RelayTunnel>,
-    /// Currently selected best path
     pub active_path: Option<PathChoice>,
-    /// Last successful send time
     pub last_send: Option<Instant>,
-    /// Last successful receive time  
     pub last_recv: Option<Instant>,
-    /// Path candidates with probe state (addr -> PathCandidateInfo)
     pub candidates: HashMap<SocketAddr, PathCandidateInfo>,
-    /// Pending probes awaiting response (tx_id -> (addr, sent_at))
     pub pending_probes: HashMap<u64, (SocketAddr, Instant)>,
-    /// Next probe transaction ID
     pub next_probe_id: u64,
 }
 
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
-        // Generate a random starting probe ID to prevent prediction
         let mut id_bytes = [0u8; 8];
         let _ = getrandom::getrandom(&mut id_bytes);
         let next_probe_id = u64::from_le_bytes(id_bytes);
@@ -559,20 +395,17 @@ impl PeerPathState {
         }
     }
     
-    /// Get the best address to send to, or None if no path is known.
     pub fn best_addr(&self) -> Option<SocketAddr> {
         match &self.active_path {
             Some(PathChoice::Direct { addr, .. }) => Some(*addr),
             Some(PathChoice::Relay { relay_addr, .. }) => Some(*relay_addr),
             None => {
-                // Fallback: try first direct, then first relay tunnel
                 self.direct_addrs.first().copied()
                     .or_else(|| self.relay_tunnels.values().next().map(|t| t.relay_addr))
             }
         }
     }
     
-    /// Get the active relay tunnel, if using relay path.
     pub fn active_tunnel(&self) -> Option<&RelayTunnel> {
         match &self.active_path {
             Some(PathChoice::Relay { session_id, .. }) => {
@@ -582,12 +415,10 @@ impl PeerPathState {
         }
     }
     
-    /// Check if currently using a relay path.
     pub fn is_relayed(&self) -> bool {
         matches!(self.active_path, Some(PathChoice::Relay { .. }))
     }
     
-    /// Add a direct path candidate.
     pub fn add_direct_candidate(&mut self, addr: SocketAddr) {
         if !self.candidates.contains_key(&addr) {
             self.candidates.insert(addr, PathCandidateInfo::new_direct(addr));
@@ -597,14 +428,12 @@ impl PeerPathState {
         }
     }
     
-    /// Add a relay path candidate.
     pub fn add_relay_candidate(&mut self, relay_addr: SocketAddr, session_id: [u8; 16]) {
         if !self.candidates.contains_key(&relay_addr) {
             self.candidates.insert(relay_addr, PathCandidateInfo::new_relay(relay_addr, session_id));
         }
     }
     
-    /// Get candidates that need probing.
     pub fn candidates_needing_probe(&self) -> Vec<SocketAddr> {
         self.candidates
             .iter()
@@ -613,7 +442,6 @@ impl PeerPathState {
             .collect()
     }
     
-    /// Generate a probe for a candidate, returning (tx_id, probe).
     pub fn generate_probe(&mut self, addr: SocketAddr) -> Option<(u64, PathProbeRequest)> {
         let candidate = self.candidates.get_mut(&addr)?;
         
@@ -626,8 +454,6 @@ impl PeerPathState {
         Some((tx_id, PathProbeRequest::new(tx_id)))
     }
     
-    /// Handle a probe response, updating RTT and path state.
-    /// Returns true if the path state changed significantly (might trigger path switch).
     pub fn handle_probe_response(&mut self, tx_id: u64, rtt: Duration) -> bool {
         let (addr, _sent_at) = match self.pending_probes.remove(&tx_id) {
             Some(info) => info,
@@ -650,11 +476,9 @@ impl PeerPathState {
             "probe response received"
         );
         
-        // Return true if path became active from non-active state
         was_failed || candidate.state == PathCandidateState::Active
     }
     
-    /// Expire old pending probes and record failures.
     pub fn expire_probes(&mut self, timeout: Duration) {
         let now = Instant::now();
         let expired: Vec<_> = self.pending_probes
@@ -671,8 +495,6 @@ impl PeerPathState {
         }
     }
     
-    /// Select the best path based on RTT and path type.
-    /// Returns Some(new_choice) if a better path is available.
     pub fn select_best_path(&self) -> Option<PathChoice> {
         let usable: Vec<_> = self.candidates
             .iter()
@@ -683,14 +505,12 @@ impl PeerPathState {
             return None;
         }
         
-        // Find best direct path
         let best_direct = usable.iter()
             .filter(|(_, c)| !c.is_relay)
             .min_by(|(_, a), (_, b)| {
                 a.rtt_ms.partial_cmp(&b.rtt_ms).unwrap_or(std::cmp::Ordering::Equal)
             });
         
-        // Find best relay path
         let best_relay = usable.iter()
             .filter(|(_, c)| c.is_relay)
             .min_by(|(_, a), (_, b)| {
@@ -702,7 +522,6 @@ impl PeerPathState {
                 let direct_rtt = direct.rtt_ms.unwrap_or(f32::MAX);
                 let relay_rtt = relay.rtt_ms.unwrap_or(f32::MAX);
                 
-                // Prefer direct unless relay is significantly faster
                 if relay_rtt + RELAY_RTT_ADVANTAGE_MS < direct_rtt {
                     Some(PathChoice::Relay {
                         relay_addr: relay.addr,
@@ -733,27 +552,21 @@ impl PeerPathState {
         }
     }
     
-    /// Check if we should switch to a better path.
-    /// Returns Some(new_path) if switch is recommended.
     pub fn maybe_switch_path(&mut self) -> Option<PathChoice> {
         let best = self.select_best_path()?;
         
         let should_switch = match (&self.active_path, &best) {
             (None, _) => true,
             (Some(PathChoice::Relay { .. }), PathChoice::Direct { .. }) => {
-                // Always prefer direct over relay
                 true
             }
             (Some(PathChoice::Direct { rtt_ms: old_rtt, .. }), PathChoice::Direct { rtt_ms: new_rtt, .. }) => {
-                // Switch direct paths if significantly better (10ms+)
                 *new_rtt + 10.0 < *old_rtt
             }
             (Some(PathChoice::Direct { rtt_ms: direct_rtt, .. }), PathChoice::Relay { rtt_ms: relay_rtt, .. }) => {
-                // Only switch from direct to relay if relay is much faster
                 *relay_rtt + RELAY_RTT_ADVANTAGE_MS < *direct_rtt
             }
             (Some(PathChoice::Relay { rtt_ms: old_rtt, .. }), PathChoice::Relay { rtt_ms: new_rtt, .. }) => {
-                // Switch relay paths if significantly better
                 *new_rtt + 20.0 < *old_rtt
             }
         };
@@ -773,38 +586,17 @@ impl PeerPathState {
     }
 }
 
-// =============================================================================
-// SmartSock: The unified socket abstraction
-// =============================================================================
-
-/// Unified socket that presents fake addresses to Quinn and translates to real paths.
-///
-/// Implements [`quinn::AsyncUdpSocket`] to integrate transparently with Quinn's
-/// endpoint. Quinn sees stable [`SmartAddr`] addresses; we translate sends/receives
-/// to the best available path (direct UDP or relay tunnel).
-///
-/// # Thread Safety
-///
-/// SmartSock is `Send + Sync` and can be shared across tasks. Internal state
-/// is protected by `RwLock`.
 pub struct SmartSock {
-    /// The underlying UDP socket for direct sends/receives
     inner: Arc<tokio::net::UdpSocket>,
     
-    /// Mapping: SmartAddr → peer path state
-    /// Used to translate outgoing packets to real destinations
     peers: RwLock<HashMap<SmartAddr, PeerPathState>>,
     
-    /// Reverse mapping: real SocketAddr → SmartAddr
-    /// Used to translate incoming packets to fake source addresses
     reverse_map: RwLock<HashMap<SocketAddr, SmartAddr>>,
     
-    /// Our local SmartAddr (for incoming connection handling)
     local_addr: SocketAddr,
 }
 
 impl SmartSock {
-    /// Create a new SmartSock bound to the given address.
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
@@ -817,9 +609,6 @@ impl SmartSock {
         })
     }
     
-    /// Register a peer with their identity and known addresses.
-    ///
-    /// Returns the SmartAddr that Quinn should use for this peer.
     pub async fn register_peer(
         &self,
         identity: Identity,
@@ -830,7 +619,6 @@ impl SmartSock {
         let mut state = PeerPathState::new(identity);
         state.direct_addrs = direct_addrs.clone();
         
-        // Set initial active path (prefer direct if available)
         if let Some(addr) = direct_addrs.first() {
             state.active_path = Some(PathChoice::Direct { 
                 addr: *addr, 
@@ -838,7 +626,6 @@ impl SmartSock {
             });
         }
         
-        // Update mappings
         {
             let mut peers = self.peers.write().await;
             peers.insert(smart_addr, state);
@@ -854,10 +641,6 @@ impl SmartSock {
         smart_addr
     }
     
-    /// Add a relay tunnel for a peer.
-    ///
-    /// This establishes a tunnel through the specified relay for E2E encrypted
-    /// packet forwarding to the peer.
     pub async fn add_relay_tunnel(
         &self,
         identity: &Identity,
@@ -871,10 +654,8 @@ impl SmartSock {
         let mut peers = self.peers.write().await;
         let state = peers.get_mut(&smart_addr)?;
         
-        // Add tunnel to peer's state
         state.relay_tunnels.insert(session_id, tunnel);
         
-        // Update reverse mapping so incoming relay frames can be translated
         drop(peers);
         {
             let mut reverse = self.reverse_map.write().await;
@@ -891,7 +672,6 @@ impl SmartSock {
         Some(smart_addr)
     }
     
-    /// Remove a relay tunnel.
     pub async fn remove_relay_tunnel(
         &self,
         identity: &Identity,
@@ -902,7 +682,6 @@ impl SmartSock {
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&smart_addr) {
             if let Some(tunnel) = state.relay_tunnels.remove(session_id) {
-                // Remove from reverse map
                 drop(peers);
                 let mut reverse = self.reverse_map.write().await;
                 reverse.remove(&tunnel.relay_addr);
@@ -916,7 +695,6 @@ impl SmartSock {
         }
     }
     
-    /// Set the active path for a peer to use a relay tunnel.
     pub async fn use_relay_path(
         &self,
         identity: &Identity,
@@ -943,7 +721,6 @@ impl SmartSock {
         false
     }
     
-    /// Set the active path for a peer to use direct UDP.
     pub async fn use_direct_path(
         &self,
         identity: &Identity,
@@ -967,7 +744,6 @@ impl SmartSock {
         false
     }
     
-    /// Update the best path for a peer.
     pub async fn update_path(&self, identity: &Identity, path: PathChoice) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;
@@ -981,11 +757,7 @@ impl SmartSock {
         }
     }
     
-    // =========================================================================
-    // Path Probing Methods
-    // =========================================================================
     
-    /// Add a direct path candidate for a peer.
     pub async fn add_direct_candidate(&self, identity: &Identity, addr: SocketAddr) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;
@@ -994,12 +766,10 @@ impl SmartSock {
         }
         drop(peers);
         
-        // Update reverse mapping
         let mut reverse = self.reverse_map.write().await;
         reverse.insert(addr, smart_addr);
     }
     
-    /// Add a relay path candidate for a peer.
     pub async fn add_relay_candidate(&self, identity: &Identity, relay_addr: SocketAddr, session_id: [u8; 16]) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;
@@ -1008,8 +778,6 @@ impl SmartSock {
         }
     }
     
-    /// Generate probes for all peers that need probing.
-    /// Returns a list of (destination_addr, probe_bytes) to send.
     pub async fn generate_probes(&self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut probes = Vec::new();
         let mut peers = self.peers.write().await;
@@ -1026,14 +794,11 @@ impl SmartSock {
         probes
     }
     
-    /// Send path probes to all peers that need probing.
-    /// This should be called periodically (e.g., every 5 seconds).
     pub async fn probe_all_paths(&self) -> io::Result<usize> {
         let probes = self.generate_probes().await;
         let count = probes.len();
         
         for (addr, probe_bytes) in probes {
-            // Send probe directly via UDP (not framed as relay)
             if let Err(e) = self.inner.send_to(&probe_bytes, addr).await {
                 tracing::trace!(
                     addr = %addr,
@@ -1046,16 +811,12 @@ impl SmartSock {
         Ok(count)
     }
     
-    /// Handle an incoming probe request by generating a response.
-    /// Returns the response bytes to send back to the sender.
     pub fn handle_probe_request(&self, data: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
         let request = PathProbeRequest::from_bytes(data)?;
         let response = PathProbeResponse::from_request(&request, from);
         Some(response.to_bytes())
     }
     
-    /// Handle an incoming probe response.
-    /// Returns true if any path state changed.
     pub async fn handle_probe_response(&self, data: &[u8]) -> bool {
         let response = match PathProbeResponse::from_bytes(data) {
             Some(r) => r,
@@ -1064,11 +825,9 @@ impl SmartSock {
         
         let rtt = Duration::from_millis(response.rtt_ms() as u64);
         
-        // Find the peer this probe belongs to and update state
         let mut peers = self.peers.write().await;
         for (_, state) in peers.iter_mut() {
             if state.handle_probe_response(response.tx_id, rtt) {
-                // Check if we should switch paths
                 state.maybe_switch_path();
                 return true;
             }
@@ -1077,7 +836,6 @@ impl SmartSock {
         false
     }
     
-    /// Expire old probes and record failures.
     pub async fn expire_probes(&self) {
         let timeout = PATH_PROBE_INTERVAL * 2;
         let mut peers = self.peers.write().await;
@@ -1086,7 +844,6 @@ impl SmartSock {
         }
     }
     
-    /// Trigger path switching for all peers that have better paths available.
     pub async fn switch_to_best_paths(&self) {
         let mut peers = self.peers.write().await;
         for (_, state) in peers.iter_mut() {
@@ -1094,7 +851,6 @@ impl SmartSock {
         }
     }
     
-    /// Spawn a background task that periodically probes paths and switches as needed.
     pub fn spawn_probe_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let sock = Arc::clone(self);
         tokio::spawn(async move {
@@ -1102,10 +858,8 @@ impl SmartSock {
             loop {
                 interval.tick().await;
                 
-                // Expire old probes
                 sock.expire_probes().await;
                 
-                // Send new probes
                 match sock.probe_all_paths().await {
                     Ok(count) if count > 0 => {
                         tracing::trace!(probes_sent = count, "path probing tick");
@@ -1116,40 +870,25 @@ impl SmartSock {
                     _ => {}
                 }
                 
-                // Check for path switches
                 sock.switch_to_best_paths().await;
             }
         })
     }
 
-    /// Get the real address to send to for a SmartAddr.
     async fn resolve_destination(&self, smart_addr: &SmartAddr) -> Option<SocketAddr> {
         let peers = self.peers.read().await;
         peers.get(smart_addr).and_then(|state| state.best_addr())
     }
     
-    /// Translate a real source address to its SmartAddr.
     async fn translate_source(&self, real_addr: SocketAddr) -> Option<SmartAddr> {
         let reverse = self.reverse_map.read().await;
         reverse.get(&real_addr).copied()
     }
     
-    /// Get the inner UDP socket (for use by UdpPoller).
     pub fn inner_socket(&self) -> &Arc<tokio::net::UdpSocket> {
         &self.inner
     }
     
-    /// Create a Quinn Endpoint using this SmartSock as the underlying transport.
-    ///
-    /// This is the key integration point: Quinn will see fake SmartAddrs while
-    /// we translate to real transport paths underneath.
-    ///
-    /// # Arguments
-    /// * `server_config` - QUIC server configuration (with TLS certs)
-    ///
-    /// # Returns
-    /// A tuple of (Endpoint, Arc<SmartSock>) so the caller can both use the
-    /// endpoint and register peers with the SmartSock.
     pub fn into_endpoint(
         self,
         server_config: quinn::ServerConfig,
@@ -1169,9 +908,6 @@ impl SmartSock {
         Ok((endpoint, smartsock))
     }
     
-    /// Bind and immediately create a Quinn Endpoint.
-    ///
-    /// Convenience method combining `bind()` and `into_endpoint()`.
     pub async fn bind_endpoint(
         addr: std::net::SocketAddr,
         server_config: quinn::ServerConfig,
@@ -1189,11 +925,6 @@ impl Debug for SmartSock {
     }
 }
 
-// =============================================================================
-// SmartSockPoller: Writable notification for SmartSock
-// =============================================================================
-
-/// Poller for SmartSock write readiness.
 struct SmartSockPoller {
     inner: Arc<tokio::net::UdpSocket>,
 }
@@ -1210,10 +941,6 @@ impl UdpPoller for SmartSockPoller {
     }
 }
 
-// =============================================================================
-// AsyncUdpSocket implementation for SmartSock
-// =============================================================================
-
 impl AsyncUdpSocket for SmartSock {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(SmartSockPoller {
@@ -1222,16 +949,12 @@ impl AsyncUdpSocket for SmartSock {
     }
     
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // Check if destination is a SmartAddr
         if SmartAddr::is_smart_addr(&transmit.destination) {
             let smart_addr = SmartAddr(transmit.destination);
             
-            // We need to resolve synchronously, but our mapping is async.
-            // For now, we'll use try_read which doesn't block.
             let peers_guard = match self.peers.try_read() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    // Lock contention - signal WouldBlock to retry
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "peer map locked"
@@ -1253,16 +976,13 @@ impl AsyncUdpSocket for SmartSock {
                 }
             };
             
-            // Check if using relay path and get tunnel info
             match &state.active_path {
                 Some(PathChoice::Relay { relay_addr, session_id, .. }) => {
-                    // Using relay - frame the packet
                     if let Some(tunnel) = state.relay_tunnels.get(session_id) {
                         let frame = tunnel.encode_frame(transmit.contents);
                         let relay_dest = *relay_addr;
                         drop(peers_guard);
                         
-                        // Send framed packet to relay
                         if frame.len() > MAX_RELAY_FRAME_SIZE {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -1281,14 +1001,12 @@ impl AsyncUdpSocket for SmartSock {
                     }
                 }
                 Some(PathChoice::Direct { addr, .. }) => {
-                    // Direct path - send raw
                     let dest = *addr;
                     drop(peers_guard);
                     self.inner.try_send_to(transmit.contents, dest)
                         .map(|_| ())
                 }
                 None => {
-                    // No active path - try best_addr fallback
                     if let Some(addr) = state.best_addr() {
                         drop(peers_guard);
                         self.inner.try_send_to(transmit.contents, addr)
@@ -1303,7 +1021,6 @@ impl AsyncUdpSocket for SmartSock {
                 }
             }
         } else {
-            // Regular address - send directly
             self.inner.try_send_to(transmit.contents, transmit.destination)
                 .map(|_| ())
         }
@@ -1320,27 +1037,19 @@ impl AsyncUdpSocket for SmartSock {
         let mut buf = [0u8; 65535];
         let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
         
-        // Use poll_recv_from to get the source address
         match self.inner.poll_recv_from(cx, &mut read_buf) {
             Poll::Ready(Ok(src_addr)) => {
                 let received = read_buf.filled();
                 
-                // Check if this is a path probe request (SMPR magic + type 0x01)
                 if PathProbeRequest::is_probe_request(received) {
-                    // Handle probe request: send response back
                     if let Some(response_bytes) = self.handle_probe_request(received, src_addr) {
-                        // Send response back (best effort, don't block)
                         let _ = self.inner.try_send_to(&response_bytes, src_addr);
                     }
-                    // Return Pending to get more data - probe requests are not for Quinn
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
                 
-                // Check if this is a path probe response (SMPR magic + type 0x02)
                 if PathProbeResponse::is_probe_response(received) {
-                    // Handle probe response asynchronously
-                    // We use try_write to avoid blocking - if it fails, we lose this probe
                     if let Some(response) = PathProbeResponse::from_bytes(received) {
                         let rtt = Duration::from_millis(response.rtt_ms() as u64);
                         if let Ok(mut peers) = self.peers.try_write() {
@@ -1352,23 +1061,18 @@ impl AsyncUdpSocket for SmartSock {
                             }
                         }
                     }
-                    // Return Pending to get more data - probe responses are not for Quinn
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
                 
-                // Check if this is a relay frame (starts with CRLY magic)
                 let (payload, translated_addr) = if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
-                    // Relay frame - look up which peer this session belongs to
                     let smart_addr = match self.reverse_map.try_read() {
                         Ok(guard) => {
-                            // First check if we have a mapping for the relay address
                             guard.get(&src_addr).copied()
                         }
                         Err(_) => None,
                     };
                     
-                    // If we found a smart_addr, verify the session_id matches
                     let verified_smart_addr = smart_addr.and_then(|sa| {
                         match self.peers.try_read() {
                             Ok(peers) => {
@@ -1389,7 +1093,6 @@ impl AsyncUdpSocket for SmartSock {
                     
                     (payload, addr)
                 } else {
-                    // Direct packet - translate source if known
                     let translated = match self.reverse_map.try_read() {
                         Ok(guard) => guard.get(&src_addr).map(|sa| sa.0).unwrap_or(src_addr),
                         Err(_) => src_addr,
@@ -1397,7 +1100,6 @@ impl AsyncUdpSocket for SmartSock {
                     (received, translated)
                 };
                 
-                // Copy payload to provided buffer
                 let copy_len = payload.len().min(bufs[0].len());
                 bufs[0][..copy_len].copy_from_slice(&payload[..copy_len]);
                 
@@ -1421,24 +1123,17 @@ impl AsyncUdpSocket for SmartSock {
     }
     
     fn max_transmit_segments(&self) -> usize {
-        // Single datagram for now, could add GSO support later
         1
     }
     
     fn max_receive_segments(&self) -> usize {
-        // Single datagram for now, could add GRO support later
         1
     }
     
     fn may_fragment(&self) -> bool {
-        // We don't set don't-fragment flags yet
         true
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1449,14 +1144,11 @@ mod tests {
         let identity = Identity::from([1u8; 32]);
         let addr = SmartAddr::from_identity(&identity);
         
-        // Should be in our ULA range
         assert!(SmartAddr::is_smart_addr(&addr.socket_addr()));
         
-        // Same identity should produce same address
         let addr2 = SmartAddr::from_identity(&identity);
         assert_eq!(addr.socket_addr(), addr2.socket_addr());
         
-        // Different identity should produce different address
         let other = Identity::from([2u8; 32]);
         let addr3 = SmartAddr::from_identity(&other);
         assert_ne!(addr.socket_addr(), addr3.socket_addr());
@@ -1469,7 +1161,6 @@ mod tests {
         
         assert!(SmartAddr::is_smart_addr(&smart.socket_addr()));
         
-        // Regular addresses should not be detected as SmartAddr
         let regular_v4: SocketAddr = "192.168.1.1:1234".parse().unwrap();
         let regular_v6: SocketAddr = "[2001:db8::1]:1234".parse().unwrap();
         
@@ -1485,23 +1176,17 @@ mod tests {
         
         let tunnel = RelayTunnel::new(session_id, relay_addr, identity);
         
-        // Test encoding
         let payload = b"Hello, QUIC packet!";
         let frame = tunnel.encode_frame(payload);
         
-        // Frame should have correct size
         assert_eq!(frame.len(), RELAY_HEADER_SIZE + payload.len());
         
-        // Frame should start with CRLY magic
         assert_eq!(&frame[0..4], &RELAY_MAGIC);
         
-        // Session ID should follow magic
         assert_eq!(&frame[4..20], &session_id);
         
-        // Payload should be at the end
         assert_eq!(&frame[RELAY_HEADER_SIZE..], payload.as_slice());
         
-        // Test decoding
         let decoded = RelayTunnel::decode_frame(&frame);
         assert!(decoded.is_some());
         
@@ -1512,18 +1197,14 @@ mod tests {
     
     #[test]
     fn test_relay_frame_decode_rejects_invalid() {
-        // Too short
         assert!(RelayTunnel::decode_frame(&[1, 2, 3]).is_none());
         
-        // Wrong magic
         let mut bad_magic = [0u8; 30];
         bad_magic[0..4].copy_from_slice(b"NOPE");
         assert!(RelayTunnel::decode_frame(&bad_magic).is_none());
         
-        // Empty frame
         assert!(RelayTunnel::decode_frame(&[]).is_none());
         
-        // Exactly header size (no payload) should still work
         let mut header_only = [0u8; RELAY_HEADER_SIZE];
         header_only[0..4].copy_from_slice(&RELAY_MAGIC);
         let result = RelayTunnel::decode_frame(&header_only);
@@ -1557,18 +1238,15 @@ mod tests {
         let probe = PathProbeRequest::new(12345);
         let bytes = probe.to_bytes();
         
-        // Check magic and type
         assert_eq!(&bytes[0..4], &PROBE_MAGIC);
         assert_eq!(bytes[4], PROBE_TYPE_REQUEST);
         
-        // Decode
         let decoded = PathProbeRequest::from_bytes(&bytes);
         assert!(decoded.is_some());
         let decoded = decoded.unwrap();
         assert_eq!(decoded.tx_id, 12345);
         assert_eq!(decoded.timestamp_ms, probe.timestamp_ms);
         
-        // Check detection
         assert!(PathProbeRequest::is_probe_request(&bytes));
         assert!(!PathProbeResponse::is_probe_response(&bytes));
     }
@@ -1581,11 +1259,9 @@ mod tests {
         
         let bytes = response.to_bytes();
         
-        // Check magic and type
         assert_eq!(&bytes[0..4], &PROBE_MAGIC);
         assert_eq!(bytes[4], PROBE_TYPE_RESPONSE);
         
-        // Decode
         let decoded = PathProbeResponse::from_bytes(&bytes);
         assert!(decoded.is_some());
         let decoded = decoded.unwrap();
@@ -1593,7 +1269,6 @@ mod tests {
         assert_eq!(decoded.echo_timestamp_ms, request.timestamp_ms);
         assert_eq!(decoded.observed_addr, observed);
         
-        // Check detection
         assert!(PathProbeResponse::is_probe_response(&bytes));
         assert!(!PathProbeRequest::is_probe_request(&bytes));
     }
@@ -1615,29 +1290,23 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let mut candidate = PathCandidateInfo::new_direct(addr);
         
-        // Initial state
         assert_eq!(candidate.state, PathCandidateState::Unknown);
         assert!(candidate.needs_probe());
         assert!(!candidate.is_usable());
         
-        // Mark probed
         candidate.mark_probed();
         assert_eq!(candidate.state, PathCandidateState::Probing);
         
-        // Record success
         candidate.record_success(Duration::from_millis(50));
         assert_eq!(candidate.state, PathCandidateState::Active);
         assert!(candidate.is_usable());
         assert!(candidate.rtt_ms.is_some());
         
-        // RTT should be around 50ms
         let rtt = candidate.rtt_ms.unwrap();
         assert!(rtt > 40.0 && rtt < 60.0);
         
-        // EMA smoothing
         candidate.record_success(Duration::from_millis(100));
         let new_rtt = candidate.rtt_ms.unwrap();
-        // Should be 0.8 * 50 + 0.2 * 100 = 60
         assert!(new_rtt > 55.0 && new_rtt < 65.0);
     }
     
@@ -1649,7 +1318,6 @@ mod tests {
         candidate.mark_probed();
         candidate.record_success(Duration::from_millis(50));
         
-        // Record failures
         for _ in 0..MAX_PROBE_FAILURES {
             assert_ne!(candidate.state, PathCandidateState::Failed);
             candidate.record_failure();
@@ -1664,7 +1332,6 @@ mod tests {
         let identity = Identity::from([1u8; 32]);
         let mut state = PeerPathState::new(identity);
         
-        // Add candidates
         let direct1: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         let direct2: SocketAddr = "10.0.0.2:1234".parse().unwrap();
         let relay: SocketAddr = "192.168.1.100:4433".parse().unwrap();
@@ -1673,21 +1340,16 @@ mod tests {
         state.add_direct_candidate(direct2);
         state.add_relay_candidate(relay, [0xAB; 16]);
         
-        // Make direct1 active with 50ms RTT
         state.candidates.get_mut(&direct1).unwrap().record_success(Duration::from_millis(50));
         
-        // Make direct2 active with 30ms RTT (better)
         state.candidates.get_mut(&direct2).unwrap().record_success(Duration::from_millis(30));
         
-        // Make relay active with 20ms RTT (best)
         state.candidates.get_mut(&relay).unwrap().record_success(Duration::from_millis(20));
         
-        // Best path should be direct2 (30ms) since relay needs to be 50ms+ faster
         let best = state.select_best_path();
         assert!(best.is_some());
         let best = best.unwrap();
         
-        // Direct should win since relay (20ms) is not 50ms+ faster than direct2 (30ms)
         match best {
             PathChoice::Direct { addr, .. } => assert_eq!(addr, direct2),
             _ => panic!("Expected direct path"),
@@ -1705,16 +1367,13 @@ mod tests {
         state.add_direct_candidate(direct);
         state.add_relay_candidate(relay, [0xCD; 16]);
         
-        // Direct: 150ms RTT
         state.candidates.get_mut(&direct).unwrap().record_success(Duration::from_millis(150));
         
-        // Relay: 50ms RTT (100ms faster - more than 50ms threshold)
         state.candidates.get_mut(&relay).unwrap().record_success(Duration::from_millis(50));
         
         let best = state.select_best_path();
         assert!(best.is_some());
         
-        // Relay should win since it's 100ms faster (> 50ms threshold)
         match best.unwrap() {
             PathChoice::Relay { relay_addr, .. } => assert_eq!(relay_addr, relay),
             _ => panic!("Expected relay path"),

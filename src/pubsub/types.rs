@@ -1,33 +1,3 @@
-//! Internal types for GossipSub.
-//!
-//! This module contains the internal data structures used by GossipSub
-//! for message caching, topic state tracking, and rate limiting.
-//!
-//! # Security Model
-//!
-//! All collection types in this module implement bounded insertion to prevent
-//! memory exhaustion attacks.
-//!
-//! ## Bounded Collections
-//!
-//! | Type | Bound | Enforcement |
-//! |------|-------|-------------|
-//! | `TopicState.mesh + peers` | 1,000 | `try_insert_peer()` returns false at limit |
-//! | Rate limit timestamps | 1 second window | Old entries pruned on each check |
-//! | Rate limit entries | 10,000 | LRU eviction in gossipsub.rs |
-//!
-//! ## Rate Limiting Algorithm
-//!
-//! The `PeerRateLimit` struct uses a sliding window algorithm:
-//!
-//! 1. **Window**: 1 second (`RATE_LIMIT_WINDOW`)
-//! 2. **Cleanup**: Timestamps older than window are pruned
-//! 3. **Check**: If timestamps.len() >= limit, reject
-//! 4. **Record**: Add current timestamp to deque
-//! 5. **Staleness**: Entries unused for 5 minutes are eligible for cleanup
-//!
-//! Separate rate limits for publish vs IWant prevent amplification attacks.
-
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
@@ -35,72 +5,42 @@ use crate::identity::Identity;
 use super::config::{MAX_PEERS_PER_TOPIC, RATE_LIMIT_WINDOW, RATE_LIMIT_ENTRY_MAX_AGE};
 use super::message::MessageId;
 
-// ============================================================================
-// Message Types
-// ============================================================================
-
-/// A received pubsub message.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
-    /// The topic this message was published to.
     pub topic: String,
-    /// The original publisher's identity.
     pub source: Identity,
-    /// Sequence number from the source.
     pub seqno: u64,
-    /// The message payload.
     pub data: Vec<u8>,
-    /// Message ID (hash).
     pub msg_id: MessageId,
-    /// When this message was received.
     pub received_at: Instant,
 }
 
-/// Cached message for deduplication and IWant fulfillment.
 #[derive(Clone)]
 pub(crate) struct CachedMessage {
     pub topic: String,
     pub source: Identity,
     pub seqno: u64,
     pub data: Vec<u8>,
-    /// The signature from the original publisher.
     pub signature: Vec<u8>,
 }
 
-// ============================================================================
-// Topic State
-// ============================================================================
-
-/// State for a single topic.
 #[derive(Debug, Default)]
 pub(crate) struct TopicState {
-    /// Peers in our mesh for this topic (full message push).
     pub mesh: HashSet<Identity>,
-    /// Peers we know are subscribed but not in our mesh (for gossip).
     pub peers: HashSet<Identity>,
-    /// Recent message IDs for IHave gossip.
     pub recent_messages: VecDeque<MessageId>,
 }
 
 impl TopicState {
-    /// Total number of peers tracked for this topic.
     pub fn total_peers(&self) -> usize {
         self.mesh.len() + self.peers.len()
     }
 
-    /// Try to insert a peer into the peers set with bounds checking.
-    ///
-    /// # Security
-    ///
-    /// Returns false if the topic is at capacity, preventing Sybil attacks
-    /// where an attacker creates many fake identities to exhaust memory.
     pub fn try_insert_peer(&mut self, peer: Identity) -> bool {
-        // Already in mesh or peers - no capacity impact
         if self.mesh.contains(&peer) || self.peers.contains(&peer) {
             return true;
         }
 
-        // Check capacity before inserting
         if self.total_peers() >= MAX_PEERS_PER_TOPIC {
             return false;
         }
@@ -110,18 +50,10 @@ impl TopicState {
     }
 }
 
-// ============================================================================
-// Rate Limiting
-// ============================================================================
-
-/// Per-peer rate limiting state.
 #[derive(Debug)]
 pub(crate) struct PeerRateLimit {
-    /// Timestamps of recent publish requests.
     pub publish_times: VecDeque<Instant>,
-    /// Timestamps of recent IWant requests (separate limit for amplification protection).
     pub iwant_times: VecDeque<Instant>,
-    /// Last activity time for cleanup.
     pub last_active: Instant,
 }
 
@@ -136,20 +68,14 @@ impl Default for PeerRateLimit {
 }
 
 impl PeerRateLimit {
-    /// Check if a peer is rate limited for publish and record the request if not.
     pub fn check_and_record(&mut self, max_rate: usize) -> bool {
         self.check_and_record_generic(&mut self.publish_times.clone(), max_rate)
     }
     
-    /// Check if a peer is rate limited for IWant and record the request if not.
-    ///
-    /// IWant has a separate rate limit because it can trigger amplification:
-    /// a small IWant request can result in large Publish responses.
     pub fn check_and_record_iwant(&mut self, max_rate: usize) -> bool {
         let now = Instant::now();
         self.last_active = now;
         
-        // Remove timestamps older than 1 second
         while let Some(front) = self.iwant_times.front() {
             if now.duration_since(*front) > RATE_LIMIT_WINDOW {
                 self.iwant_times.pop_front();
@@ -158,22 +84,18 @@ impl PeerRateLimit {
             }
         }
         
-        // Check if over limit
         if self.iwant_times.len() >= max_rate {
             return true; // Rate limited
         }
         
-        // Record this request
         self.iwant_times.push_back(now);
         false
     }
     
-    /// Generic rate limit check helper.
     fn check_and_record_generic(&mut self, _times: &mut VecDeque<Instant>, max_rate: usize) -> bool {
         let now = Instant::now();
         self.last_active = now;
         
-        // Remove timestamps older than 1 second
         while let Some(front) = self.publish_times.front() {
             if now.duration_since(*front) > RATE_LIMIT_WINDOW {
                 self.publish_times.pop_front();
@@ -182,35 +104,26 @@ impl PeerRateLimit {
             }
         }
         
-        // Check if over limit
         if self.publish_times.len() >= max_rate {
             return true; // Rate limited
         }
         
-        // Record this request
         self.publish_times.push_back(now);
         false
     }
     
-    /// Check if this entry is stale and can be cleaned up.
     pub fn is_stale(&self, now: Instant) -> bool {
         now.duration_since(self.last_active) > RATE_LIMIT_ENTRY_MAX_AGE
     }
 }
 
-/// Reason why a message was rejected.
 #[allow(dead_code)]  // Ready for future rejection handling
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRejection {
-    /// Message payload is too large.
     MessageTooLarge,
-    /// Topic name is too long.
     TopicTooLong,
-    /// Peer is sending too many messages.
     RateLimited,
-    /// Message is a duplicate.
     Duplicate,
-    /// Invalid message ID.
     InvalidMessageId,
 }
 
@@ -263,7 +176,6 @@ mod tests {
     fn rate_limiter_allows_within_limit() {
         let mut limiter = PeerRateLimit::default();
         
-        // Should allow first 5 requests
         for _ in 0..5 {
             assert!(!limiter.check_and_record(10));
         }
@@ -273,12 +185,10 @@ mod tests {
     fn rate_limiter_blocks_over_limit() {
         let mut limiter = PeerRateLimit::default();
         
-        // Fill up the limit
         for _ in 0..10 {
             let _ = limiter.check_and_record(10);
         }
         
-        // Next request should be blocked
         assert!(limiter.check_and_record(10));
     }
 
@@ -286,29 +196,21 @@ mod tests {
     fn rate_limiter_window_expiration() {
         let mut limiter = PeerRateLimit::default();
         
-        // Add an old timestamp manually
         limiter.publish_times.push_back(Instant::now() - Duration::from_secs(2));
         
-        // Old entries should be cleaned up when checking
         assert!(!limiter.check_and_record(10));
         
-        // Should only have the new timestamp now (old one cleaned up)
         assert_eq!(limiter.publish_times.len(), 1);
     }
 
     #[test]
     fn message_rejection_types_exist() {
-        // Ensure all rejection types are usable
         let _ = MessageRejection::MessageTooLarge;
         let _ = MessageRejection::TopicTooLong;
         let _ = MessageRejection::RateLimited;
         let _ = MessageRejection::Duplicate;
         let _ = MessageRejection::InvalidMessageId;
     }
-
-    // ========================================================================
-    // PubSubMessage Security Tests (from tests/security_pubsub.rs)
-    // ========================================================================
 
     #[test]
     fn subscribe_message_structure() {

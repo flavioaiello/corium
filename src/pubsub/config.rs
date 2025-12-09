@@ -1,119 +1,37 @@
-//! GossipSub configuration parameters and constants.
-//!
-//! This module contains all the tunable parameters for GossipSub behavior,
-//! including mesh sizes, rate limits, and flood protection constants.
-//!
-//! # Security Model
-//!
-//! All constants in this module are security-critical bounds that prevent
-//! resource exhaustion attacks. Modifying these values can affect security.
-//!
-//! ## Rate Limiting Constants
-//!
-//! | Constant | Value | Purpose |
-//! |----------|-------|----------|
-//! | `DEFAULT_PUBLISH_RATE_LIMIT` | 100/s | Local publish flood prevention |
-//! | `DEFAULT_FORWARD_RATE_LIMIT` | 1000/s | Forward flood prevention |
-//! | `DEFAULT_PER_PEER_RATE_LIMIT` | 50/s | Per-peer flood prevention |
-//! | `DEFAULT_IWANT_RATE_LIMIT` | 5/s | Amplification attack prevention |
-//!
-//! ## Amplification Attack Prevention
-//!
-//! | Constant | Value | Purpose |
-//! |----------|-------|----------|
-//! | `DEFAULT_MAX_IWANT_MESSAGES` | 10 | Limits message IDs per IWant request |
-//! | `MAX_IWANT_RESPONSE_BYTES` | 256 KB | Caps total response regardless of count |
-//!
-//! ## Memory Exhaustion Prevention
-//!
-//! | Constant | Value | Purpose |
-//! |----------|-------|----------|
-//! | `MAX_TOPICS` | 10,000 | Prevents topic explosion attacks |
-//! | `MAX_PEERS_PER_TOPIC` | 1,000 | Bounds per-topic memory |
-//! | `MAX_SUBSCRIPTIONS_PER_PEER` | 100 | Limits peer subscription count |
-//! | `MAX_OUTBOUND_PER_PEER` | 100 | Bounds queued messages per peer |
-//! | `MAX_TOTAL_OUTBOUND_MESSAGES` | 50,000 | Global outbound queue limit |
-//! | `MAX_RATE_LIMIT_ENTRIES` | 10,000 | Bounds rate limiter state |
-//! | `DEFAULT_MESSAGE_CACHE_SIZE` | 10,000 | LRU dedup cache limit |
-//!
-//! ## Input Validation
-//!
-//! | Constant | Value | Purpose |
-//! |----------|-------|----------|
-//! | `MAX_MESSAGE_SIZE` | 64 KB | Prevents oversized message DoS |
-//! | `MAX_TOPIC_LENGTH` | 256 | Prevents oversized topic names |
-
 use std::time::Duration;
 
-// ============================================================================
-// Mesh Configuration
-// ============================================================================
-
-/// Default mesh degree (number of peers per topic).
 pub const DEFAULT_MESH_DEGREE: usize = 6;
 
-/// Minimum mesh degree before seeking more peers.
 pub const DEFAULT_MESH_DEGREE_LOW: usize = 4;
 
-/// Maximum mesh degree before pruning excess peers.
 pub const DEFAULT_MESH_DEGREE_HIGH: usize = 12;
 
-// ============================================================================
-// Cache Configuration
-// ============================================================================
-
-/// How long to cache messages for deduplication.
 pub const DEFAULT_MESSAGE_CACHE_TTL: Duration = Duration::from_secs(120);
 
-/// Maximum messages to cache for deduplication.
 pub const DEFAULT_MESSAGE_CACHE_SIZE: usize = 10_000;
 
-// ============================================================================
-// Timing Configuration
-// ============================================================================
-
-/// Gossip interval for IHave messages.
 pub const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Heartbeat interval for mesh maintenance.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long to keep fanout peers cached.
 pub const DEFAULT_FANOUT_TTL: Duration = Duration::from_secs(60);
 
-/// Maximum number of IHave messages to include in gossip.
 pub const DEFAULT_MAX_IHAVE_LENGTH: usize = 100;
 
-// ============================================================================
-// Flood Protection Constants
-// ============================================================================
-
-/// Maximum size of a single pubsub message payload (64 KB).
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Default publish rate limit (messages per second for local publishes).
 pub const DEFAULT_PUBLISH_RATE_LIMIT: usize = 100;
 
-/// Default forward rate limit (messages per second for relayed messages).
 pub const DEFAULT_FORWARD_RATE_LIMIT: usize = 1000;
 
-/// Default per-peer rate limit (messages per second from any single peer).
 pub const DEFAULT_PER_PEER_RATE_LIMIT: usize = 50;
 
-/// Time window for rate limiting.
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 
-/// Maximum topic name length.
 pub const MAX_TOPIC_LENGTH: usize = 256;
 
-/// Maximum number of topics to track state for.
-/// Prevents memory exhaustion from topic count explosion.
 pub const MAX_TOPICS: usize = 10_000;
 
-/// Validate a topic name.
-/// 
-/// Returns true if the topic is valid (non-empty, within length limit, printable ASCII).
-/// This is used for incoming message validation.
 #[inline]
 pub fn is_valid_topic(topic: &str) -> bool {
     !topic.is_empty() 
@@ -121,88 +39,42 @@ pub fn is_valid_topic(topic: &str) -> bool {
         && topic.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
-/// Maximum topics a peer can subscribe to.
 pub const MAX_SUBSCRIPTIONS_PER_PEER: usize = 100;
 
-/// Maximum number of peers tracked per topic (mesh + peers combined).
-///
-/// # Security
-///
-/// Limits the total number of peers tracked for any single topic.
-/// This prevents Sybil attacks where an attacker creates many fake
-/// identities to exhaust memory via topic peer tracking.
-///
-/// Set to 1000 which is far more than needed for efficient gossip
-/// (mesh typically has 6-12 peers, gossip needs ~50-100 more).
 pub const MAX_PEERS_PER_TOPIC: usize = 1000;
 
-/// Maximum number of message IDs in a single IHave.
 pub const DEFAULT_MAX_IHAVE_MESSAGES: usize = 10;
 
-/// Maximum number of message IDs in a single IWant request.
-/// Limits amplification attacks where small IWant triggers large data responses.
 pub const DEFAULT_MAX_IWANT_MESSAGES: usize = 10;
 
-/// Default IWant rate limit (requests per second per peer).
-/// Prevents amplification attacks via rapid IWant requests.
 pub const DEFAULT_IWANT_RATE_LIMIT: usize = 5;
 
-/// Maximum total bytes sent in response to a single IWant request.
-/// Even with MAX_IWANT_MESSAGES messages, we won't exceed this byte budget.
-/// Limits amplification to ~256KB per request regardless of message count.
 pub const MAX_IWANT_RESPONSE_BYTES: usize = 256 * 1024;
 
-/// Maximum pending outbound messages per peer before dropping.
-/// Prevents memory exhaustion from disconnected peers.
 pub const MAX_OUTBOUND_PER_PEER: usize = 100;
 
-/// Maximum total outbound messages across all peers.
-/// Prevents memory exhaustion from many peers with queued messages.
 pub const MAX_TOTAL_OUTBOUND_MESSAGES: usize = 50_000;
 
-/// Maximum number of peers with outbound queues.
-/// Prevents memory exhaustion from peer count multiplication.
 pub const MAX_OUTBOUND_PEERS: usize = 1000;
 
-/// Maximum number of peers tracked in rate limiting state.
-/// Oldest entries are evicted when limit is reached.
 pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 
-/// Maximum age of rate limit entries before cleanup (5 minutes).
 pub const RATE_LIMIT_ENTRY_MAX_AGE: Duration = Duration::from_secs(300);
 
-// ============================================================================
-// GossipConfig
-// ============================================================================
-
-/// GossipSub configuration parameters.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
-    /// Target number of peers per topic mesh.
     pub mesh_degree: usize,
-    /// Minimum peers before seeking more.
     pub mesh_degree_low: usize,
-    /// Maximum peers before pruning.
     pub mesh_degree_high: usize,
-    /// Message cache size for deduplication.
     pub message_cache_size: usize,
-    /// Message cache TTL.
     pub message_cache_ttl: Duration,
-    /// Gossip interval.
     pub gossip_interval: Duration,
-    /// Heartbeat interval.
     pub heartbeat_interval: Duration,
-    /// Fanout cache TTL.
     pub fanout_ttl: Duration,
-    /// Maximum IHave messages per gossip round.
     pub max_ihave_length: usize,
-    /// Maximum message payload size in bytes.
     pub max_message_size: usize,
-    /// Maximum publish rate (messages per second) for local publishes.
     pub publish_rate_limit: usize,
-    /// Maximum forward rate (messages per second) for relayed messages.
     pub forward_rate_limit: usize,
-    /// Maximum rate per peer (messages per second).
     pub per_peer_rate_limit: usize,
 }
 
@@ -243,7 +115,6 @@ mod tests {
 
     #[test]
     fn flood_protection_constants() {
-        // Verify constants are reasonable
         assert!(MAX_MESSAGE_SIZE >= 1024, "max message size too small");
         assert!(MAX_MESSAGE_SIZE <= 1024 * 1024, "max message size too large");
         assert!(MAX_TOPIC_LENGTH >= 32, "max topic length too small");
@@ -271,10 +142,6 @@ mod tests {
         assert_eq!(config.publish_rate_limit, 50);
         assert_eq!(config.per_peer_rate_limit, 25);
     }
-
-    // ========================================================================
-    // Config Security Tests (from tests/security_pubsub.rs)
-    // ========================================================================
 
     #[test]
     fn default_config_has_security_limits() {

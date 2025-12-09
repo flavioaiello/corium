@@ -1,21 +1,10 @@
-//! Hashing and distance functions for content-addressed storage.
-//!
-//! Provides BLAKE3-based hashing for content addressing and XOR distance
-//! metrics for Kademlia-style routing.
-
 use blake3::Hasher;
 use crate::identity::{Identity, EndpointRecord};
 
-/// A 256-bit content-addressed key for stored values.
-///
-/// Keys are computed as the BLAKE3 hash of the content, providing
-/// content-addressable storage with built-in integrity verification.
 pub type Key = [u8; 32];
 
-/// Maximum age for EndpointRecords to prevent replay attacks (24 hours).
 const ENDPOINT_RECORD_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// Compute a 32-byte BLAKE3 digest of the input data.
 pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(data);
@@ -26,89 +15,22 @@ pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Compute a content-addressed key as the BLAKE3 hash of content bytes.
-///
-/// This is the standard way to derive a DHT key for storing content:
-///
-/// ```ignore
-/// use corium::internals::hash_content;
-///
-/// let content = b"hello world";
-/// let key = hash_content(content);
-/// // The same content always produces the same key
-/// assert_eq!(key, hash_content(content));
-/// ```
 pub fn hash_content(data: &[u8]) -> Key {
     blake3_digest(data)
 }
 
-/// Compute XOR distance between two Identities for DHT routing.
-///
-/// # Zero-Hash Property
-/// In the zero-hash architecture, XOR distance is computed directly
-/// on Identity bytes (which ARE the public key bytes).
 #[inline]
 pub fn xor_distance(a: &Identity, b: &Identity) -> [u8; 32] {
     a.xor_distance(b)
 }
 
-/// Verify that a key matches the hash of a value, or is a valid signed EndpointRecord.
-///
-/// This function supports two verification modes:
-///
-/// 1. **Content-addressed data**: `key == BLAKE3(value)` for immutable storage
-/// 2. **Signed EndpointRecord**: `key == identity && record.verify_fresh()` for mutable peer addresses
-///
-/// # Security Model
-///
-/// The DHT stores two types of data with different security requirements:
-///
-/// ## Immutable Content (Mode 1)
-/// - Key = BLAKE3(value), providing content-addressing
-/// - Any peer can store any content (key derived from content)
-/// - Data integrity guaranteed by hash verification
-/// - Used for: files, messages, arbitrary data
-///
-/// ## Mutable EndpointRecords (Mode 2)
-/// - Key = Identity (Ed25519 public key bytes)
-/// - Only the identity owner can store at their key (signature required)
-/// - **Replay Attack Prevention**: Records older than 24 hours are rejected
-///   even if the signature is valid, preventing attackers from re-publishing
-///   old records to redirect traffic to stale/compromised addresses
-/// - Used for: peer address resolution, NAT traversal coordination
-///
-/// # Threat Model
-///
-/// Without timestamp freshness checking, an attacker who observes a valid
-/// EndpointRecord could replay it indefinitely, potentially:
-/// - Redirecting traffic to addresses the peer no longer controls
-/// - Forcing connections through attacker-controlled relays
-/// - Preventing peers from updating their addresses after IP changes
-///
-/// # Example
-///
-/// ```ignore
-/// use corium::internals::{hash_content, verify_key_value_pair};
-///
-/// let content = b"my data";
-/// let key = hash_content(content);
-/// assert!(verify_key_value_pair(&key, content));
-/// assert!(!verify_key_value_pair(&key, b"wrong data"));
-/// ```
 pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
-    // 1. Check strict content addressing (immutable data)
     if hash_content(value) == *key {
         return true;
     }
 
-    // 2. Check for signed EndpointRecord (mutable identity data)
-    // Try to deserialize as EndpointRecord
-    if let Ok(record) = crate::messages::deserialize_bounded::<EndpointRecord>(value) {
-        // Check if the record belongs to the key (key == Identity bytes in zero-hash)
+    if let Ok(record) = crate::dht::messages::deserialize_bounded::<EndpointRecord>(value) {
         if record.identity.as_bytes() == key {
-            // Verify the signature AND timestamp freshness to prevent replay attacks
-            // Old records with valid signatures should be rejected to prevent
-            // attackers from redirecting traffic to stale/controlled addresses
             if record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS) {
                 return true;
             }
@@ -118,10 +40,6 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
     false
 }
 
-/// Compare two XOR distances lexicographically.
-///
-/// Returns `Ordering::Less` if `a` represents a smaller distance,
-/// `Ordering::Greater` if larger, or `Ordering::Equal` if identical.
 pub(crate) fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
     for i in 0..32 {
         if a[i] < b[i] {

@@ -1,33 +1,3 @@
-//! TLS configuration and Ed25519 certificate handling for QUIC connections.
-//!
-//! This module provides:
-//! - Self-signed Ed25519 certificate generation
-//! - Server and client TLS configuration for QUIC
-//! - SNI-based identity pinning for peer verification
-//! - Certificate verifiers for mutual TLS
-//!
-//! # Security Model
-//!
-//! This module implements the **Zero-Hash Identity Model** where Identity = Ed25519 public key.
-//!
-//! ## Formal Security Properties
-//!
-//! | Property | Description |
-//! |----------|-------------|
-//! | **P1: Identity Binding** | Certificate SPKI contains exactly the Identity's Ed25519 public key |
-//! | **P2: TLS Signature** | Handshake proves possession of private key matching certificate |
-//! | **P3: SNI Pinning** | Client encodes expected Identity in SNI; verifier rejects mismatch |
-//! | **P4: Mutual Auth** | Both parties present certificates; bidirectional identity verification |
-//!
-//! ## Attack Prevention
-//!
-//! | Attack | Protection |
-//! |--------|------------|
-//! | Identity spoofing | P3: Certificate public key must match SNI-encoded identity |
-//! | MITM | P2: Attacker cannot produce valid TLS signature without private key |
-//! | Certificate substitution | P1+P3: SPKI extraction, not CN parsing |
-//! | Impersonation | P4: Server also verifies client certificate |
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -36,33 +6,21 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::identity::{Identity, Keypair};
 
-/// Default crypto provider for TLS signature verification.
 static CRYPTO_PROVIDER: std::sync::LazyLock<Arc<rustls::crypto::CryptoProvider>> =
     std::sync::LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
 
-/// ALPN protocol identifier for Corium connections.
 pub const ALPN: &[u8] = b"corium";
 
-/// Generate a self-signed Ed25519 certificate for QUIC connections.
-///
-/// This creates a certificate using the provided Ed25519 keypair, allowing
-/// the node's cryptographic identity to be tied to its TLS certificate.
-/// The Identity is the same as the keypair's public key.
 pub fn generate_ed25519_cert(
     keypair: &Keypair,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    // Build the Ed25519 key pair in PKCS8 format for rcgen
     let secret_key = keypair.secret_key_bytes();
     let public_key = keypair.public_key_bytes();
     
-    // Ed25519 PKCS8 format (RFC 8410)
-    // This is a minimal PKCS#8 structure for Ed25519 private keys
-    // OID 1.3.101.112 (Ed25519)
     const ED25519_OID: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
     const PKCS8_VERSION: [u8; 3] = [0x02, 0x01, 0x00];
     
     let mut pkcs8 = Vec::with_capacity(48);
-    // PKCS#8 header for Ed25519
     pkcs8.extend_from_slice(&[
         0x30, 0x2e, // SEQUENCE, 46 bytes
     ]);
@@ -77,17 +35,13 @@ pub fn generate_ed25519_cert(
     ]);
     pkcs8.extend_from_slice(&secret_key);
     
-    // Create KeyPair from PKCS8 DER - rcgen will auto-detect Ed25519
     let pkcs8_der = PrivatePkcs8KeyDer::from(pkcs8.clone());
     let key_pair = rcgen::KeyPair::try_from(&pkcs8_der)
         .context("failed to create Ed25519 key pair for certificate")?;
     
-    // Create certificate with the node's public key encoded in the subject
     let mut params = rcgen::CertificateParams::new(vec!["corium".to_string()])
         .context("failed to create certificate params")?;
     
-    // Encode the public key in the common name for peer verification
-    // Use Utf8String instead of PrintableString for hex-encoded data
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(hex::encode(public_key)),
@@ -103,27 +57,10 @@ pub fn generate_ed25519_cert(
     Ok((vec![cert_der], key))
 }
 
-/// Create a server configuration for accepting QUIC connections.
-///
-/// # TLS Configuration
-///
-/// - **Client auth**: Required (mutual TLS for peer identity)
-/// - **ALPN**: `corium`
-/// - **Verifier**: [`Ed25519ClientCertVerifier`] (accepts any cert, app-layer verification)
-///
-/// # Transport Configuration
-///
-/// - **Migration**: Enabled (clients can change source IP/port mid-connection,
-///   e.g., WiFi→cellular handoff, NAT rebinding). Note: this does NOT enable
-///   relay→direct upgrades, which require establishing a new connection.
-/// - **Idle timeout**: 60 seconds
-/// - **Max bidi streams**: 64 concurrent bidirectional streams
-/// - **Max uni streams**: 64 concurrent unidirectional streams
 pub fn create_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig> {
-    // Require client certificates for mutual TLS - enables peer identity verification
     let client_cert_verifier = Arc::new(Ed25519ClientCertVerifier);
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_cert_verifier)
@@ -136,13 +73,8 @@ pub fn create_server_config(
             .context("failed to create QUIC server config")?,
     ));
     
-    // Enable connection migration - allows clients to change source addresses
-    // (e.g., WiFi→cellular handoff, NAT rebinding). This does NOT enable
-    // relay→direct upgrades, which require a new connection to a different endpoint.
     server_config.migration(true);
     
-    // Configure transport parameters for security and resource management
-    // Arc::get_mut is safe here because we just created server_config and hold the only reference
     let transport_config = Arc::get_mut(&mut server_config.transport)
         .expect("transport config should be exclusively owned immediately after creation");
     transport_config.max_idle_timeout(Some(
@@ -150,28 +82,18 @@ pub fn create_server_config(
             .try_into()
             .expect("60 seconds is a valid VarInt duration"),
     ));
-    // Bound concurrent inbound streams to mitigate resource exhaustion.
     transport_config.max_concurrent_bidi_streams(64u32.into());
     transport_config.max_concurrent_uni_streams(64u32.into());
 
     Ok(server_config)
 }
 
-/// Create a client config that enforces peer identity via SNI.
-///
-/// The verifier extracts the expected peer Identity from the SNI (Server Name Indication)
-/// field during the handshake and verifies that the peer's certificate matches it.
-///
-/// This allows a single `ClientConfig` to be used for connecting to any peer,
-/// provided the connection is initiated with the correct SNI (the peer's Identity hex string).
 pub fn create_client_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<ClientConfig> {
     let verifier = Ed25519CertVerifier::new();
 
-    // For self-signed certs, accept valid Ed25519 certificates and enforce
-    // the identity pinned in the SNI.
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
@@ -189,23 +111,14 @@ pub fn create_client_config(
     Ok(client_config)
 }
 
-/// Extract the Ed25519 public key from a peer's certificate.
-///
-/// The public key is extracted from the Subject Public Key Info (SPKI) field.
-/// Returns `None` if the certificate doesn't contain a valid Ed25519 public key.
 pub fn extract_public_key_from_cert(cert_der: &[u8]) -> Option<[u8; 32]> {
-    // Parse the certificate to extract the public key from the Subject Public Key Info (SPKI)
-    // This ensures the identity is derived from the key used for the TLS handshake,
-    // preventing identity spoofing via the Common Name.
     use x509_parser::prelude::*;
     
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
     
-    // Extract the public key bytes from the SPKI
     let spki = cert.public_key();
     let key_bytes = &spki.subject_public_key.data;
     
-    // Ed25519 public keys are exactly 32 bytes
     if key_bytes.len() == 32 {
         let mut key = [0u8; 32];
         key.copy_from_slice(key_bytes);
@@ -215,16 +128,6 @@ pub fn extract_public_key_from_cert(cert_der: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
-/// Verify that a peer's certificate matches their claimed identity.
-///
-/// This extracts the Ed25519 public key from the certificate and verifies
-/// that it matches the expected identity (public key bytes).
-///
-/// # Use Cases
-///
-/// - **Post-handshake verification**: After QUIC handshake completes, verify
-///   that the peer's certificate identity matches what we expected
-/// - **Sybil protection**: Ensure peers can't claim to be a different identity
 pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bool {
     if let Some(public_key) = extract_public_key_from_cert(cert_der) {
         crate::identity::verify_identity(expected_identity, &public_key)
@@ -233,28 +136,6 @@ pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bo
     }
 }
 
-// ============================================================================
-// Certificate Verifiers
-// ============================================================================
-
-/// Server-side client certificate verifier for mutual TLS.
-///
-/// # Verification Strategy
-///
-/// This verifier accepts any syntactically valid certificate during the TLS handshake.
-/// Actual identity verification is deferred to the application layer, where the
-/// server extracts the public key from the certificate and matches it against
-/// the expected peer identity.
-///
-/// # Why Accept All Certificates?
-///
-/// In a decentralized mesh network:
-/// - There is no central CA to trust
-/// - Peer identity = Ed25519 public key (self-certifying)
-/// - The server may not know the client's identity until after connection
-///
-/// The TLS signature verification (`verify_tls1[23]_signature`) still ensures
-/// the client possesses the private key corresponding to their certificate.
 #[derive(Debug)]
 struct Ed25519ClientCertVerifier;
 
@@ -269,7 +150,6 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        // Accept any certificate - identity verification is done at app layer
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -279,7 +159,6 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // Actually verify the cryptographic signature using the certificate's public key
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -294,7 +173,6 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // Actually verify the cryptographic signature using the certificate's public key
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -312,24 +190,12 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
     }
 }
 
-/// Encode an Identity as a valid DNS-style SNI hostname for TLS identity pinning.
-///
-/// The hex-encoded Identity (64 chars) exceeds the DNS label limit (63 chars),
-/// so we split it into two labels: `<first32>.<last32>`
-///
-/// # Formal Invariant
-/// `∀ id. parse_identity_from_sni(&identity_to_sni(id)) == Some(id)`
 pub(crate) fn identity_to_sni(identity: &Identity) -> String {
     let hex = hex::encode(identity);
     format!("{}.{}", &hex[..32], &hex[32..])
 }
 
-/// Parse an Identity from a DNS-style SNI hostname.
-///
-/// # Formal Invariant
-/// Roundtrip: `parse_identity_from_sni(&identity_to_sni(id))` recovers the original.
 fn parse_identity_from_sni(sni: &str) -> Option<Identity> {
-    // Split by '.' and concatenate the hex parts
     let hex_str: String = sni.split('.').collect();
     let bytes = hex::decode(&hex_str).ok()?;
     if bytes.len() != 32 {
@@ -340,28 +206,6 @@ fn parse_identity_from_sni(sni: &str) -> Option<Identity> {
     Some(Identity::from_bytes(arr))
 }
 
-/// Client-side server certificate verifier with SNI-based identity pinning.
-///
-/// # Formal Property (P3 - SNI Identity Pinning)
-///
-/// This verifier enforces the invariant:
-/// ```text
-/// verify_server_cert(cert, sni) succeeds ⟺
-///     ∃ pk ∈ cert.SPKI : pk == parse_identity_from_sni(sni)
-/// ```
-///
-/// # Verification Chain
-///
-/// 1. **SNI → Expected Identity**: Parse DNS-encoded identity from SNI hostname
-///    (format: `<first32hex>.<last32hex>` to fit DNS label limits)
-/// 2. **Certificate → Actual Public Key**: Extract Ed25519 public key from SPKI
-/// 3. **Compare**: Public key must equal expected identity (zero-hash model)
-///
-/// # Security Properties
-///
-/// - Prevents MITM: Attacker cannot present a certificate for a different identity
-/// - Prevents spoofing: Certificate's key must match the claimed identity
-/// - No CA required: Self-certifying identities in decentralized network
 #[derive(Debug)]
 struct Ed25519CertVerifier;
 
@@ -372,19 +216,6 @@ impl Ed25519CertVerifier {
 }
 
 impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
-    /// Verify server certificate matches the expected identity encoded in SNI.
-    ///
-    /// # Formal Verification Steps
-    ///
-    /// 1. **SNI → Expected Identity**: Parse DNS-encoded identity from SNI hostname
-    /// 2. **Certificate → Actual Public Key**: Extract Ed25519 public key from SPKI
-    /// 3. **Identity Comparison**: Verify public key == expected identity (constant-time)
-    ///
-    /// # Security Properties
-    ///
-    /// - **P3**: SNI Identity Pinning - certificate's public key must match expected identity
-    /// - TLS signature verification is handled by `verify_tls1[23]_signature`
-    /// - Prevents certificate substitution attacks
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -393,13 +224,9 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // FORMAL VERIFICATION STEP 1:
-        // Extract expected identity from SNI (DNS-style encoded)
         let expected_identity_sni = match server_name {
             rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
             rustls::pki_types::ServerName::IpAddress(_) => {
-                // P3 violation: Cannot verify identity without SNI
-                // Connecting by IP address bypasses identity pinning
                 return Err(rustls::Error::InvalidCertificate(
                     rustls::CertificateError::ApplicationVerificationFailure,
                 ));
@@ -411,21 +238,15 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
             }
         };
 
-        // Parse SNI as Identity (zero-hash model: identity = public key)
         let expected_identity = parse_identity_from_sni(expected_identity_sni).ok_or_else(|| {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         })?;
 
-        // FORMAL VERIFICATION STEP 2:
-        // Extract actual public key from certificate's SPKI
         let public_key = extract_public_key_from_cert(end_entity.as_ref())
             .ok_or(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::BadEncoding,
             ))?;
 
-        // FORMAL VERIFICATION STEP 3:
-        // Zero-hash model: Identity IS the public key, no hashing needed
-        // Compare expected identity vs actual public key
         let actual_identity = Identity::from_bytes(public_key);
         if actual_identity != expected_identity {
             return Err(rustls::Error::InvalidCertificate(
@@ -433,7 +254,6 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
             ));
         }
 
-        // Certificate is valid and its public key matches the pinned identity.
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -443,7 +263,6 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // Actually verify the cryptographic signature using the certificate's public key
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -458,7 +277,6 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // Actually verify the cryptographic signature using the certificate's public key
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -472,21 +290,12 @@ impl rustls::client::danger::ServerCertVerifier for Ed25519CertVerifier {
     }
 }
 
-// ============================================================================
-// TLS Certificate Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::Keypair;
     use std::collections::HashSet;
 
-    // ========================================================================
-    // P3: SNI Identity Pinning Tests
-    // ========================================================================
-
-    /// P3: Certificate contains the same public key as Identity.
     #[test]
     fn certificate_contains_identity_public_key() {
         for _ in 0..50 {
@@ -508,7 +317,6 @@ mod tests {
         }
     }
 
-    /// P3: verify_identity accepts matching certificate.
     #[test]
     fn verify_identity_accepts_matching_cert() {
         for _ in 0..50 {
@@ -523,7 +331,6 @@ mod tests {
         }
     }
 
-    /// P3: verify_identity rejects mismatched certificate.
     #[test]
     fn verify_identity_rejects_mismatched_cert() {
         for _ in 0..50 {
@@ -540,22 +347,18 @@ mod tests {
         }
     }
 
-    /// P4: Identity is cryptographically bound to the keypair via certificate.
     #[test]
     fn identity_bound_to_keypair_via_cert() {
         for _ in 0..50 {
             let keypair = Keypair::generate();
             let identity = keypair.identity();
             
-            // Generate certificate from keypair
             let (certs, _) = generate_ed25519_cert(&keypair)
                 .expect("cert generation must succeed");
             
-            // Extract public key from certificate
             let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
                 .expect("pk extraction must succeed");
             
-            // Verify identity matches certificate public key
             assert!(
                 crate::identity::verify_identity(&identity, &cert_pk),
                 "P4 violation: Identity not bound to keypair via certificate"
@@ -563,7 +366,6 @@ mod tests {
         }
     }
 
-    /// P4: Different keypairs produce certificates with different public keys.
     #[test]
     fn different_keypairs_different_cert_public_keys() {
         let mut public_keys = HashSet::new();
