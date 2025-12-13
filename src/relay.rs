@@ -95,6 +95,7 @@ pub fn detect_nat_type(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
 pub struct RelayInfo {
     pub relay_peer: Identity,
     pub relay_addrs: Vec<String>,
@@ -106,6 +107,7 @@ pub struct RelayInfo {
     pub tier: Option<u8>,
 }
 
+#[allow(dead_code)] // Relay infrastructure
 impl RelayInfo {
     pub fn selection_score(&self) -> f32 {
         let rtt_score = self.rtt_ms.unwrap_or(200.0);
@@ -147,9 +149,8 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
     Ok(id)
 }
 
-/// Internal session state for the UDP relay forwarder.
-/// This tracks the peer addresses and forwarding statistics.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay infrastructure - session tracking
 pub struct ForwarderSession {
     pub session_id: [u8; 16],
     pub peer_a_addr: SocketAddr,
@@ -206,6 +207,7 @@ pub struct UdpRelayForwarder {
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
 }
 
+#[allow(dead_code)] // Relay infrastructure
 impl UdpRelayForwarder {
     pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
@@ -452,6 +454,112 @@ impl UdpRelayForwarder {
         tokio::spawn(async move {
             self.run().await;
         })
+    }
+}
+
+// ============================================================================
+// Relay Request Handler
+// ============================================================================
+
+use crate::messages::{RelayRequest, RelayResponse};
+
+/// Handle an incoming relay request.
+/// 
+/// This function processes `RelayRequest::Connect` messages, managing session
+/// registration and completion on the `UdpRelayForwarder`.
+pub async fn handle_relay_request(
+    request: RelayRequest,
+    remote_addr: SocketAddr,
+    forwarder: Option<&UdpRelayForwarder>,
+    forwarder_addr: Option<SocketAddr>,
+) -> RelayResponse {
+    match request {
+        RelayRequest::Connect {
+            from_peer,
+            target_peer,
+            session_id,
+        } => {
+            debug!(
+                from = ?from_peer,
+                target = ?target_peer,
+                session = hex::encode(session_id),
+                "handling RELAY_CONNECT request"
+            );
+
+            let forwarder = match forwarder {
+                Some(f) => f,
+                None => {
+                    return RelayResponse::Rejected {
+                        reason: "relay not available".to_string(),
+                    };
+                }
+            };
+
+            let relay_data_addr = match forwarder_addr {
+                Some(addr) => addr.to_string(),
+                None => {
+                    return RelayResponse::Rejected {
+                        reason: "relay address not configured".to_string(),
+                    };
+                }
+            };
+
+            let session_count = forwarder.session_count().await;
+            if session_count >= MAX_SESSIONS {
+                return RelayResponse::Rejected {
+                    reason: "relay server at capacity".to_string(),
+                };
+            }
+
+            match forwarder.register_session(session_id, remote_addr).await {
+                Ok(()) => {
+                    debug!(
+                        session = hex::encode(session_id),
+                        peer = %remote_addr,
+                        "relay session pending (waiting for peer B)"
+                    );
+                    RelayResponse::Accepted {
+                        session_id,
+                        relay_data_addr,
+                    }
+                }
+                Err("session already exists") => {
+                    match forwarder.complete_session(session_id, remote_addr).await {
+                        Ok(()) => {
+                            debug!(
+                                session = hex::encode(session_id),
+                                peer = %remote_addr,
+                                "relay session established"
+                            );
+                            RelayResponse::Connected {
+                                session_id,
+                                relay_data_addr,
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                session = hex::encode(session_id),
+                                error = e,
+                                "failed to complete relay session"
+                            );
+                            RelayResponse::Rejected {
+                                reason: e.to_string(),
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        session = hex::encode(session_id),
+                        error = e,
+                        "failed to register relay session"
+                    );
+                    RelayResponse::Rejected {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
     }
 }
 

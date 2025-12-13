@@ -40,6 +40,7 @@ const RTT_EMA_OLD: f32 = 0.8;
 const RTT_EMA_NEW: f32 = 0.2;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay infrastructure - tunnel tracking
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
@@ -364,6 +365,7 @@ pub enum PathChoice {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Path state tracking - used by probe loop
 pub struct PeerPathState {
     pub identity: Identity,
     pub direct_addrs: Vec<SocketAddr>,
@@ -376,6 +378,7 @@ pub struct PeerPathState {
     pub next_probe_id: u64,
 }
 
+#[allow(dead_code)] // Path state infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
         let mut id_bytes = [0u8; 8];
@@ -875,11 +878,13 @@ impl SmartSock {
         })
     }
 
+    #[allow(dead_code)] // Path resolution infrastructure
     async fn resolve_destination(&self, smart_addr: &SmartAddr) -> Option<SocketAddr> {
         let peers = self.peers.read().await;
         peers.get(smart_addr).and_then(|state| state.best_addr())
     }
     
+    #[allow(dead_code)] // Path resolution infrastructure
     async fn translate_source(&self, real_addr: SocketAddr) -> Option<SmartAddr> {
         let reverse = self.reverse_map.read().await;
         reverse.get(&real_addr).copied()

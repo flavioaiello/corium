@@ -1,132 +1,41 @@
-use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use lru::LruCache;
 use quinn::{Connection, Endpoint, Incoming};
 use tracing::{debug, info, trace, warn};
 
-use crate::dht::{Contact, Dht, DhtNetwork, Key, TelemetrySnapshot};
+use crate::crypto::{extract_verified_identity, generate_ed25519_cert, create_server_config, create_client_config};
+use crate::dht::{Dht, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
+use crate::hyparview::{HyParView, HyParViewConfig, HyParViewMessage};
 use crate::identity::{EndpointRecord, Identity, Keypair, RelayEndpoint};
-use crate::dht::messages::{DhtRequest, DhtResponse};
-use crate::net::{
-    extract_public_key_from_cert, RpcNode, RpcRequest, RpcResponse, SmartSock,
-    UdpRelayForwarder, MAX_SESSIONS,
-};
-use crate::pubsub::{GossipConfig, GossipSub, PubSubHandler, PubSubMessage, ReceivedMessage};
+use crate::messages::{DhtRequest, DhtResponse, Message, PlumTreeMessage, RpcRequest, RpcResponse};
+use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
+use crate::ratelimit::ConnectionRateLimiter;
+use crate::relay::{self, UdpRelayForwarder};
+use crate::routing::Contact;
+use crate::rpc::{DhtRpc, HyParViewRpc, PlumTreeRpc, RpcNode};
+use crate::smartsock::SmartSock;
 
-const DEFAULT_K: usize = 20;
-const DEFAULT_ALPHA: usize = 3;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
-
-// ============================================================================
-// ConnectionRateLimiter - Token bucket rate limiting for incoming connections
-// ============================================================================
-
-const MAX_GLOBAL_CONNECTIONS_PER_SECOND: usize = 100;
-const MAX_CONNECTIONS_PER_IP_PER_SECOND: usize = 20;
-const MAX_TRACKED_IPS: usize = 1000;
-
-#[derive(Debug, Clone, Copy)]
-struct TokenBucket {
-    tokens: f64,
-    last_update: Instant,
-}
-
-impl TokenBucket {
-    fn new(capacity: usize) -> Self {
-        Self {
-            tokens: capacity as f64,
-            last_update: Instant::now(),
-        }
-    }
-
-    fn try_consume(&mut self, rate: f64, capacity: f64) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-
-        self.tokens = (self.tokens + elapsed * rate).min(capacity);
-        self.last_update = now;
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RateLimitState {
-    global: TokenBucket,
-    per_ip: LruCache<IpAddr, TokenBucket>,
-}
-
-#[derive(Debug)]
-struct ConnectionRateLimiter {
-    state: tokio::sync::Mutex<RateLimitState>,
-}
-
-impl ConnectionRateLimiter {
-    fn new() -> Self {
-        Self {
-            state: tokio::sync::Mutex::new(RateLimitState {
-                global: TokenBucket::new(MAX_GLOBAL_CONNECTIONS_PER_SECOND),
-                per_ip: LruCache::new(NonZeroUsize::new(MAX_TRACKED_IPS).unwrap()),
-            }),
-        }
-    }
-
-    async fn allow(&self, ip: IpAddr) -> bool {
-        let mut state = self.state.lock().await;
-
-        if !state.global.try_consume(
-            MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
-            MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
-        ) {
-            return false;
-        }
-
-        let ip_bucket = state.per_ip.get_or_insert_mut(ip, || {
-            TokenBucket::new(MAX_CONNECTIONS_PER_IP_PER_SECOND)
-        });
-
-        if !ip_bucket.try_consume(
-            MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
-            MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
-        ) {
-            state.global.tokens = (state.global.tokens + 1.0)
-                .min(MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64);
-            return false;
-        }
-
-        true
-    }
-}
 
 // ============================================================================
 // Connection Handling
 // ============================================================================
 
-fn extract_verified_identity(connection: &quinn::Connection) -> Option<Identity> {
-    let peer_identity = connection.peer_identity()?;
-    let certs: &Vec<rustls::pki_types::CertificateDer> = peer_identity.downcast_ref()?;
-    let cert_der = certs.first()?.as_ref();
-    let public_key = extract_public_key_from_cert(cert_der)?;
-    Some(Identity::from_bytes(public_key))
-}
-
-async fn handle_connection<N: DhtNetwork>(
+async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
     node: Dht<N>,
-    pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
+    hyparview: Arc<HyParView<N>>,
+    plumtree: Option<Arc<PlumTree<N>>>,
+    _network: N,
+    _local_identity: Identity,
 ) -> Result<()> {
     debug!("handle_connection: accepting incoming connection");
     let connection = incoming.await.context("failed to accept connection")?;
@@ -170,14 +79,16 @@ async fn handle_connection<N: DhtNetwork>(
         };
 
         let node = node.clone();
-        let pubsub = pubsub_handler.clone();
+        let plumtree_h = plumtree_handler.clone();
         let forwarder = udp_forwarder.clone();
         let forwarder_addr = udp_forwarder_addr;
         let remote_addr = remote;
         let verified_id = verified_identity;
+        let hv = hyparview.clone();
+        let ps = plumtree.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(node, pubsub, forwarder, forwarder_addr, stream, remote_addr, verified_id).await
+                handle_stream(node, plumtree_h, forwarder, forwarder_addr, stream, remote_addr, verified_id, hv, ps).await
             {
                 debug!(error = ?e, "stream error");
             }
@@ -188,14 +99,16 @@ async fn handle_connection<N: DhtNetwork>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtNetwork>(
+async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
     node: Dht<N>,
-    pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
     verified_identity: Identity,
+    hyparview: Arc<HyParView<N>>,
+    plumtree: Option<Arc<PlumTree<N>>>,
 ) -> Result<()> {
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut len_buf))
@@ -227,7 +140,7 @@ async fn handle_stream<N: DhtNetwork>(
         .map_err(|_| anyhow::anyhow!("request body read timed out"))??;
 
     let request: RpcRequest =
-        crate::net::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
+        crate::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
 
     if let Some(claimed_id) = request.sender_identity() {
         if claimed_id != verified_identity {
@@ -254,9 +167,11 @@ async fn handle_stream<N: DhtNetwork>(
         request,
         remote_addr,
         verified_identity,
-        pubsub_handler,
+        plumtree_handler,
         udp_forwarder,
         udp_forwarder_addr,
+        hyparview,
+        plumtree,
     )
     .await;
 
@@ -269,42 +184,49 @@ async fn handle_stream<N: DhtNetwork>(
     Ok(())
 }
 
-/// Dispatch incoming RPC requests to DHT or PubSub handlers.
 #[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtNetwork>(
+async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
     node: Dht<N>,
     request: RpcRequest,
     remote_addr: SocketAddr,
     _verified_identity: Identity,
-    pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
+    hyparview: Arc<HyParView<N>>,
+    _plumtree: Option<Arc<PlumTree<N>>>,
 ) -> RpcResponse {
     match request {
         RpcRequest::Dht(dht_request) => {
-            let dht_response = handle_dht_request(
-                node,
-                dht_request,
-                remote_addr,
-                udp_forwarder,
-                udp_forwarder_addr,
-            ).await;
+            let dht_response = handle_dht_request(node, dht_request, remote_addr).await;
             RpcResponse::Dht(dht_response)
         }
-        RpcRequest::PubSub { from, message } => {
-            handle_pubsub_request(from, message, pubsub_handler).await
+        RpcRequest::Relay(relay_request) => {
+            let relay_response = relay::handle_relay_request(
+                relay_request,
+                remote_addr,
+                udp_forwarder.as_deref(),
+                udp_forwarder_addr,
+            ).await;
+            RpcResponse::Relay(relay_response)
+        }
+        RpcRequest::PlumTree(req) => {
+            handle_plumtree_request(req.from, req.message, plumtree_handler).await
+        }
+        RpcRequest::HyParView(req) => {
+            handle_hyparview_request(req.from, req.message, hyparview).await
         }
     }
 }
 
-/// Handle DHT protocol requests.
-#[allow(clippy::too_many_arguments)]
-async fn handle_dht_request<N: DhtNetwork>(
+// ============================================================================
+// DHT Request Handler
+// ============================================================================
+
+async fn handle_dht_request<N: DhtRpc>(
     node: Dht<N>,
     request: DhtRequest,
     remote_addr: SocketAddr,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
 ) -> DhtResponse {
     match request {
         DhtRequest::Ping { from } => {
@@ -354,95 +276,8 @@ async fn handle_dht_request<N: DhtNetwork>(
             node.handle_store_request(&from, key, value).await;
             DhtResponse::Ack
         }
-        DhtRequest::RelayConnect {
-            from_peer,
-            target_peer,
-            session_id,
-        } => {
-            debug!(
-                from = ?from_peer,
-                target = ?target_peer,
-                session = hex::encode(session_id),
-                "handling RELAY_CONNECT request"
-            );
-
-            let forwarder = match &udp_forwarder {
-                Some(f) => f,
-                None => {
-                    return DhtResponse::RelayRejected {
-                        reason: "relay not available".to_string(),
-                    };
-                }
-            };
-
-            let relay_data_addr = match udp_forwarder_addr {
-                Some(addr) => addr.to_string(),
-                None => {
-                    return DhtResponse::RelayRejected {
-                        reason: "relay address not configured".to_string(),
-                    };
-                }
-            };
-
-            let session_count = forwarder.session_count().await;
-            if session_count >= MAX_SESSIONS {
-                return DhtResponse::RelayRejected {
-                    reason: "relay server at capacity".to_string(),
-                };
-            }
-
-            match forwarder.register_session(session_id, remote_addr).await {
-                Ok(()) => {
-                    debug!(
-                        session = hex::encode(session_id),
-                        peer = %remote_addr,
-                        "relay session pending (waiting for peer B)"
-                    );
-                    DhtResponse::RelayAccepted {
-                        session_id,
-                        relay_data_addr,
-                    }
-                }
-                Err("session already exists") => match forwarder.complete_session(session_id, remote_addr).await {
-                    Ok(()) => {
-                        debug!(
-                            session = hex::encode(session_id),
-                            peer = %remote_addr,
-                            "relay session established"
-                        );
-                        DhtResponse::RelayConnected {
-                            session_id,
-                            relay_data_addr,
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            session = hex::encode(session_id),
-                            error = e,
-                            "failed to complete relay session"
-                        );
-                        DhtResponse::RelayRejected {
-                            reason: e.to_string(),
-                        }
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        session = hex::encode(session_id),
-                        error = e,
-                        "failed to register relay session"
-                    );
-                    DhtResponse::RelayRejected {
-                        reason: e.to_string(),
-                    }
-                }
-            }
-        }
         DhtRequest::WhatIsMyAddr => {
-            debug!(
-                remote = %remote_addr,
-                "handling WHAT_IS_MY_ADDR request (STUN-like)"
-            );
+            debug!("handling WHAT_IS_MY_ADDR request (STUN-like)");
             DhtResponse::YourAddr {
                 addr: remote_addr.to_string(),
             }
@@ -450,43 +285,56 @@ async fn handle_dht_request<N: DhtNetwork>(
     }
 }
 
-/// Handle PubSub protocol requests.
-async fn handle_pubsub_request(
+// ============================================================================
+// PlumTree Request Handler
+// ============================================================================
+
+async fn handle_plumtree_request(
     from: Identity,
-    message: PubSubMessage,
-    pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>>,
+    message: PlumTreeMessage,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
 ) -> RpcResponse {
-    if let Some(handler) = pubsub_handler {
+    if let Some(handler) = plumtree_handler {
         trace!(
             from = ?hex::encode(&from.as_bytes()[..8]),
             message = ?message,
-            "dispatching PUBSUB request to handler"
+            "dispatching PLUMTREE request to handler"
         );
         if let Err(e) = handler.handle_message(&from, message).await {
-            warn!(from = ?hex::encode(&from.as_bytes()[..8]), error = %e, "PubSub handler returned error");
+            warn!(from = ?hex::encode(&from.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
             RpcResponse::Error {
-                message: format!("PubSub error: {}", e),
+                message: format!("PlumTree error: {}", e),
             }
         } else {
-            RpcResponse::PubSubAck
+            RpcResponse::PlumTreeAck
         }
     } else {
         warn!(
             from = ?hex::encode(&from.as_bytes()[..8]),
             message = ?message,
-            "received PUBSUB request but no handler registered"
+            "received PLUMTREE request but no handler registered"
         );
         RpcResponse::Error {
-            message: "PubSub not enabled on this node".to_string(),
+            message: "PlumTree not enabled on this node".to_string(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Message {
-    pub topic: String,
-    pub from: String,
-    pub data: Vec<u8>,
+async fn handle_hyparview_request<N: HyParViewRpc + Send + Sync + 'static>(
+    from: Identity,
+    message: HyParViewMessage,
+    hyparview: Arc<HyParView<N>>,
+) -> RpcResponse {
+    trace!(
+        from = ?hex::encode(&from.as_bytes()[..8]),
+        message = ?message,
+        "handling HyParView request"
+    );
+    
+    // Process the message through HyParView - it handles events internally
+    hyparview.handle_message(from, message).await;
+    
+    RpcResponse::HyParViewAck
 }
 
 pub struct Node {
@@ -496,11 +344,14 @@ pub struct Node {
     contact: Contact,
     dht: Dht<RpcNode>,
     network: RpcNode,
+    #[allow(dead_code)] // Used for connection rate limiting in server loop
     rate_limiter: Arc<ConnectionRateLimiter>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
-    pubsub: Option<Arc<GossipSub<RpcNode>>>,
-    pubsub_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
+    #[allow(dead_code)] // HyParView state machine - used in RPC handlers
+    hyparview: Arc<HyParView<RpcNode>>,
+    plumtree: Option<Arc<PlumTree<RpcNode>>>,
+    plumtree_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
     _server_handle: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -514,17 +365,17 @@ impl Node {
         Self::create(addr, keypair, true).await
     }
 
-    async fn create(addr: &str, keypair: Keypair, enable_pubsub: bool) -> Result<Self> {
+    async fn create(addr: &str, keypair: Keypair, enable_plumtree: bool) -> Result<Self> {
         let addr: SocketAddr = addr.parse()
             .context("invalid socket address")?;
         
         let identity = keypair.identity();
         
-        let (server_certs, server_key) = crate::net::generate_ed25519_cert(&keypair)?;
-        let (client_certs, client_key) = crate::net::generate_ed25519_cert(&keypair)?;
+        let (server_certs, server_key) = generate_ed25519_cert(&keypair)?;
+        let (client_certs, client_key) = generate_ed25519_cert(&keypair)?;
         
-        let server_config = crate::net::create_server_config(server_certs, server_key)?;
-        let client_config = crate::net::create_client_config(client_certs, client_key)?;
+        let server_config = create_server_config(server_certs, server_key)?;
+        let client_config = create_client_config(client_certs, client_key)?;
         
         let (endpoint, smartsock) = SmartSock::bind_endpoint(addr, server_config)
             .await
@@ -571,17 +422,29 @@ impl Node {
             }
         };
         
-        let (pubsub, pubsub_receiver) = if enable_pubsub {
-            let mut gossip = GossipSub::new(dht.clone(), keypair.clone(), GossipConfig::default());
-            let receiver = gossip.take_message_receiver();
-            let gossip = Arc::new(gossip);
+        // Create HyParView membership manager
+        let hyparview = Arc::new(
+            HyParView::new(identity, HyParViewConfig::default(), Arc::new(network.clone()))
+        );
+        
+        let (plumtree, plumtree_receiver) = if enable_plumtree {
+            let mut plumtree = PlumTree::new(Arc::new(network.clone()), keypair.clone(), PlumTreeConfig::default());
+            let receiver = plumtree.take_message_receiver();
+            let plumtree = Arc::new(plumtree);
+            
+            // Connect HyParView neighbor events to PlumTree
+            hyparview.set_neighbor_callback(plumtree.clone()).await;
+            
             (
-                Some(gossip),
+                Some(plumtree),
                 Some(tokio::sync::Mutex::new(receiver)),
             )
         } else {
             (None, None)
         };
+        
+        // Start HyParView shuffle loop
+        hyparview.spawn_shuffle_loop();
         
         let server_handle = {
             let endpoint = endpoint.clone();
@@ -589,8 +452,12 @@ impl Node {
             let rate_limiter = rate_limiter.clone();
             let udp_forwarder = udp_forwarder.clone();
             let smartsock_for_server = Some(smartsock.clone());
-            let pubsub_handler: Option<Arc<dyn PubSubHandler + Send + Sync>> = 
-                pubsub.clone().map(|p| p as Arc<dyn PubSubHandler + Send + Sync>);
+            let plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>> = 
+                plumtree.clone().map(|p| p as Arc<dyn PlumTreeHandler + Send + Sync>);
+            let hyparview_for_server = hyparview.clone();
+            let plumtree_for_server = plumtree.clone();
+            let network_for_server = network.clone();
+            let identity_for_server = identity;
             
             tokio::spawn(async move {
                 if let Some(forwarder) = &udp_forwarder {
@@ -609,13 +476,17 @@ impl Node {
                     }
 
                     let node = dht.clone();
-                    let pubsub = pubsub_handler.clone();
+                    let plumtree = plumtree_handler.clone();
                     let forwarder = udp_forwarder.clone();
                     let forwarder_addr = udp_forwarder_addr;
                     let ss = smartsock_for_server.clone();
+                    let hv = hyparview_for_server.clone();
+                    let ps = plumtree_for_server.clone();
+                    let net = network_for_server.clone();
+                    let me = identity_for_server;
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_connection(node, pubsub, forwarder, forwarder_addr, ss, incoming).await
+                            handle_connection(node, plumtree, forwarder, forwarder_addr, ss, incoming, hv, ps, net, me).await
                         {
                             warn!("connection error: {:?}", e);
                         }
@@ -637,8 +508,9 @@ impl Node {
             rate_limiter,
             udp_forwarder,
             udp_forwarder_addr,
-            pubsub,
-            pubsub_receiver,
+            hyparview,
+            plumtree,
+            plumtree_receiver,
             _server_handle: server_handle,
         })
     }
@@ -687,8 +559,6 @@ impl Node {
         self.dht.publish_address(&self.keypair, addresses).await
     }
     
-    /// Publish address with relay endpoints for NAT traversal.
-    /// Use this when behind symmetric NAT or when you want to advertise relay fallbacks.
     pub async fn publish_address_with_relays(
         &self,
         addresses: Vec<String>,
@@ -697,14 +567,10 @@ impl Node {
         self.dht.republish_on_network_change(&self.keypair, addresses, relays).await
     }
     
-    /// Check if this node is capable of acting as a relay for other peers.
-    /// A node is relay-capable if it has a UDP forwarder bound.
     pub fn is_relay_capable(&self) -> bool {
         self.udp_forwarder.is_some()
     }
     
-    /// Get relay endpoint info for this node (for others to use in their records).
-    /// Returns None if this node is not relay-capable.
     pub async fn relay_endpoint(&self) -> Option<RelayEndpoint> {
         let forwarder_addr = self.udp_forwarder_addr?;
         let local_addr = self.endpoint.local_addr().ok()?;
@@ -776,9 +642,6 @@ impl Node {
         Ok(conn)
     }
     
-    /// Connect to a peer by identity only, resolving their address from the DHT.
-    /// This is the preferred method when the peer's address is not known.
-    /// It will try direct connection first, then fall back to relay if available.
     pub async fn connect_peer(&self, identity: &str) -> Result<Connection> {
         let identity_bytes = hex::decode(identity)
             .context("invalid identity: must be 64 hex characters")?;
@@ -809,28 +672,28 @@ impl Node {
     
     
     pub async fn subscribe(&self, topic: &str) -> Result<()> {
-        let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled")?;
-        pubsub.subscribe(topic).await
+        let plumtree = self.plumtree.as_ref()
+            .context("plumtree not enabled")?;
+        plumtree.subscribe(topic).await
     }
     
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
-        let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled")?;
-        pubsub.publish(topic, data).await?;
+        let plumtree = self.plumtree.as_ref()
+            .context("plumtree not enabled")?;
+        plumtree.publish(topic, data).await?;
         Ok(())
     }
     
     pub async fn unsubscribe(&self, topic: &str) -> Result<()> {
-        let pubsub = self.pubsub.as_ref()
-            .context("pubsub not enabled")?;
-        pubsub.unsubscribe(topic).await?;
+        let plumtree = self.plumtree.as_ref()
+            .context("plumtree not enabled")?;
+        plumtree.unsubscribe(topic).await?;
         Ok(())
     }
     
     pub async fn messages(&self) -> Result<tokio::sync::mpsc::Receiver<Message>> {
-        let receiver_mutex = self.pubsub_receiver.as_ref()
-            .context("pubsub not enabled")?;
+        let receiver_mutex = self.plumtree_receiver.as_ref()
+            .context("plumtree not enabled")?;
         let mut guard = receiver_mutex.lock().await;
         let internal_rx = guard.take().context("message receiver already taken")?;
         
@@ -852,149 +715,12 @@ impl Node {
         Ok(rx)
     }
     
-    pub fn has_pubsub(&self) -> bool {
-        self.pubsub.is_some()
+    pub fn has_plumtree(&self) -> bool {
+        self.plumtree.is_some()
     }
     
     
     pub async fn telemetry(&self) -> TelemetrySnapshot {
         self.dht.telemetry_snapshot().await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    #[tokio::test]
-    async fn test_rate_limiter_per_ip() {
-        let limiter = ConnectionRateLimiter::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-
-        for _ in 0..MAX_CONNECTIONS_PER_IP_PER_SECOND {
-            assert!(limiter.allow(ip).await);
-        }
-
-        assert!(!limiter.allow(ip).await);
-
-        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
-        assert!(limiter.allow(ip2).await);
-    }
-
-    const TEST_MAX_CONNECTIONS_PER_IP: usize = 10;
-
-    const TEST_MAX_GLOBAL_CONNECTIONS: usize = 100;
-
-    const TEST_MAX_TRACKED_IPS: usize = 1000;
-
-    #[test]
-    fn per_ip_limit_exact_boundary() {
-        let allowed_count = TEST_MAX_CONNECTIONS_PER_IP;
-        let rejected_count = 1;
-
-        assert_eq!(
-            allowed_count + rejected_count,
-            TEST_MAX_CONNECTIONS_PER_IP + 1,
-            "Test configuration error"
-        );
-    }
-
-    #[test]
-    fn global_limit_exact_boundary() {
-        let ips_needed = TEST_MAX_GLOBAL_CONNECTIONS / TEST_MAX_CONNECTIONS_PER_IP;
-
-        assert_eq!(ips_needed, 10, "Should need 10 IPs to hit global limit");
-
-        let total_allowed = TEST_MAX_GLOBAL_CONNECTIONS;
-        assert_eq!(total_allowed, 100);
-    }
-
-    #[test]
-    fn ip_tracking_lru_eviction() {
-        let ips_to_fill_cache = TEST_MAX_TRACKED_IPS;
-        let extra_ip = 1;
-
-        assert!(
-            ips_to_fill_cache + extra_ip > TEST_MAX_TRACKED_IPS,
-            "Need more IPs than cache size to trigger eviction"
-        );
-    }
-
-    #[test]
-    fn rate_limit_window_expiration() {
-        use std::time::Duration;
-
-        let window_duration = Duration::from_secs(1);
-        let time_after_window = Duration::from_millis(1001);
-
-        assert!(
-            time_after_window > window_duration,
-            "Time after window should exceed window duration"
-        );
-    }
-
-    #[test]
-    fn rapid_burst_handling() {
-        let burst_connections = TEST_MAX_CONNECTIONS_PER_IP + 5;
-        let expected_allowed = TEST_MAX_CONNECTIONS_PER_IP;
-        let expected_rejected = 5;
-
-        assert_eq!(
-            expected_allowed + expected_rejected,
-            burst_connections,
-            "Burst should be partially rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_rate_limit_checks() {
-        use std::sync::Arc;
-        use tokio::sync::Barrier;
-
-        let barrier = Arc::new(Barrier::new(20));
-        let mut handles = vec![];
-
-        for _ in 0..20 {
-            let barrier = barrier.clone();
-            let handle = tokio::spawn(async move {
-                barrier.wait().await;
-                true
-            });
-            handles.push(handle);
-        }
-
-        let results: Vec<_> = futures::future::join_all(handles).await;
-
-        assert_eq!(results.len(), 20);
-        for result in results {
-            assert!(result.is_ok());
-        }
-    }
-
-    #[test]
-    fn ipv4_vs_ipv6_separate_limits() {
-        let ipv4: IpAddr = "192.168.1.1".parse().unwrap();
-        let ipv6: IpAddr = "::1".parse().unwrap();
-
-        assert_ne!(ipv4, ipv6);
-
-        let ipv4_mapped_ipv6: IpAddr = "::ffff:192.168.1.1".parse().unwrap();
-
-        assert_ne!(ipv4, ipv4_mapped_ipv6);
-    }
-
-    #[test]
-    fn sustained_load_over_time() {
-        let seconds_of_load = 10;
-        let connections_per_second = TEST_MAX_CONNECTIONS_PER_IP;
-
-        let total_allowed = seconds_of_load * connections_per_second;
-
-        assert_eq!(
-            total_allowed, 100,
-            "Should allow {} connections over {} seconds",
-            total_allowed, seconds_of_load
-        );
     }
 }

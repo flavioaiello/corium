@@ -1,10 +1,15 @@
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
+
 use lru::LruCache;
 use tokio::time::{Duration, Instant};
 
+use crate::dht::{distance_cmp, xor_distance};
 use crate::identity::Identity;
-use super::hash::{xor_distance, distance_cmp};
+
+// ============================================================================
+// ROUTING CONSTANTS
+// ============================================================================
 
 pub(crate) const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -16,11 +21,19 @@ const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
 
+// ============================================================================
+// CONTACT
+// ============================================================================
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Contact {
     pub identity: Identity,
     pub addr: String,
 }
+
+// ============================================================================
+// ROUTING INSERTION LIMITER
+// ============================================================================
 
 #[derive(Debug, Clone, Copy)]
 struct RoutingInsertionBucket {
@@ -81,6 +94,10 @@ impl RoutingInsertionLimiter {
         }
     }
 }
+
+// ============================================================================
+// BUCKET
+// ============================================================================
 
 #[derive(Debug, Clone)]
 struct Bucket {
@@ -173,6 +190,10 @@ impl Bucket {
     }
 }
 
+// ============================================================================
+// BUCKET INDEX FUNCTIONS
+// ============================================================================
+
 pub(crate) fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
     let dist = xor_distance(self_id, other);
     for (byte_idx, byte) in dist.iter().enumerate() {
@@ -214,6 +235,10 @@ pub(crate) fn random_id_for_bucket(self_id: &Identity, bucket_idx: usize) -> Ide
     Identity::from_bytes(target)
 }
 
+// ============================================================================
+// ROUTING TABLE
+// ============================================================================
+
 #[derive(Debug)]
 pub struct RoutingTable {
     self_id: Identity,
@@ -245,6 +270,7 @@ impl RoutingTable {
         }
     }
 
+    #[allow(dead_code)] // Public API for direct routing updates
     pub fn update(&mut self, contact: Contact) {
         let _ = self.update_with_pending(contact);
     }
@@ -356,6 +382,10 @@ impl RoutingTable {
     }
 }
 
+// ============================================================================
+// TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,19 +482,6 @@ mod tests {
         );
     }
 
-    fn make_test_identity(byte: u8) -> Identity {
-        let mut id = [0u8; 32];
-        id[0] = byte;
-        Identity::from_bytes(id)
-    }
-
-    fn make_test_contact(byte: u8) -> Contact {
-        Contact {
-            identity: make_test_identity(byte),
-            addr: format!("node-{byte}"),
-        }
-    }
-
     #[test]
     fn routing_table_orders_contacts_by_distance() {
         let self_id = make_test_identity(0x00);
@@ -516,7 +533,6 @@ mod tests {
     }
 
     const MAX_K: usize = 30;
-
     const NUM_BUCKETS: usize = 256;
 
     #[test]
@@ -594,5 +610,18 @@ mod tests {
         }
 
         255
+    }
+
+    fn make_test_identity(byte: u8) -> Identity {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        Identity::from_bytes(id)
+    }
+
+    fn make_test_contact(byte: u8) -> Contact {
+        Contact {
+            identity: make_test_identity(byte),
+            addr: format!("node-{byte}"),
+        }
     }
 }

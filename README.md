@@ -170,12 +170,12 @@ You don't need to understand this—`node.connect()` handles it. But if you're c
 - **Smart connections** that seamlessly switch between direct and relayed paths
 - **QUIC connection migration** for seamless path switching without reconnection (saves 1-2 RTTs)
 
-### Publish/Subscribe (GossipSub)
-- **Topic-based messaging** with mesh-structured networks
-- **Epidemic broadcast** achieving O(log n) hop delivery
+### Publish/Subscribe (PlumTree)
+- **Topic-based messaging** with broadcast tree networks
+- **Epidemic broadcast** achieving O(N) message complexity
+- **Eager/lazy peers** for optimal tree construction with repair links
 - **Deduplication** via LRU message cache with configurable TTL
-- **Mesh maintenance** with automatic graft/prune for optimal connectivity
-- **Lazy push gossip** via IHave/IWant for reliable delivery
+- **IHave/IWant protocol** for reliable message recovery
 
 ### NAT Traversal
 - **Path probing** with candidate gathering and connectivity checks
@@ -272,13 +272,13 @@ use corium::tests::{
     Keypair, Identity, EndpointRecord, verify_identity,
     
     // DHT
-    DhtNode, DhtNetwork, Contact, Key, hash_content,
+    DhtNode, DhtRpc, Contact, Key, hash_content,
     
     // Network
     PeerNetwork, SmartConnection, UdpRelayForwarder,
     
     // PubSub
-    GossipSub, GossipConfig, PubSubMessage,
+    PlumTree, PlumTreeConfig, PlumTreeMessage,
     
     // TLS utilities
     generate_ed25519_cert, create_client_config, create_server_config,
@@ -462,16 +462,16 @@ pub const ALPN: &[u8] = b"corium";
 | `HolePunchRegister` | `HolePunchWaiting/Ready` | Coordinate hole punch |
 | `HolePunchStart` | `HolePunchReady/Failed` | Trigger hole punch |
 
-**Publish/Subscribe (GossipSub):**
+**Publish/Subscribe (PlumTree):**
 
 | Message Type | Description |
 |--------------|-------------|
-| `Subscribe` | Join a topic mesh |
-| `Unsubscribe` | Leave a topic mesh |
-| `Graft` | Request to join peer's mesh for a topic |
-| `Prune` | Leave peer's mesh, optionally suggest alternatives |
+| `Subscribe` | Join a topic |
+| `Unsubscribe` | Leave a topic |
+| `Graft` | Promote sender to eager peer |
+| `Prune` | Demote sender to lazy peer |
 | `Publish` | Broadcast message to topic |
-| `IHave` | Gossip: announce available messages |
+| `IHave` | Lazy push: announce available messages |
 | `IWant` | Request specific messages by ID |
 
 ---
@@ -619,9 +619,9 @@ let smartsock = node.smartsock();
 
 ---
 
-## Publish/Subscribe (GossipSub)
+## Publish/Subscribe (PlumTree)
 
-Corium includes a GossipSub-style publish/subscribe system for topic-based message distribution. Messages propagate through the network via epidemic broadcast, achieving O(log n) hop delivery with high reliability.
+Corium includes a PlumTree-based publish/subscribe system for topic-based message distribution. Messages propagate through the network via epidemic broadcast trees, achieving O(N) message complexity with optimal tree construction.
 
 ### How It Works
 
@@ -630,8 +630,8 @@ Corium includes a GossipSub-style publish/subscribe system for topic-based messa
 │                     Application                             │
 │              subscribe(), publish(), messages()             │
 ├─────────────────────────────────────────────────────────────┤
-│                      GossipSub                              │
-│         Topic meshes, message routing, deduplication        │
+│                       PlumTree                              │
+│        Eager/lazy peers, message routing, deduplication     │
 ├─────────────────────────────────────────────────────────────┤
 │                        Node                                 │
 │              Peer discovery, DHT, connections               │
@@ -643,9 +643,9 @@ Corium includes a GossipSub-style publish/subscribe system for topic-based messa
 | Concept | Description |
 |---------|-------------|
 | **Topic** | A named channel for messages (e.g., `"chat/lobby"`, `"sensors/temp"`) |
-| **Mesh** | Per-topic connection to `mesh_degree` peers (default: 6) for full message push |
-| **Fanout** | Cached peers for topics we publish to but aren't subscribed to |
-| **Gossip** | Periodic IHave/IWant exchanges to repair mesh gaps |
+| **Eager Peers** | Peers that receive full messages immediately (broadcast tree edges) |
+| **Lazy Peers** | Peers that receive IHave announcements only (repair links) |
+| **Graft/Prune** | Promotion/demotion between eager and lazy based on duplicates |
 
 ### Usage
 
@@ -670,45 +670,35 @@ while let Some(msg) = rx.recv().await {
 }
 ```
 
-### Advanced Usage (Tests Feature)
-
-For low-level access to GossipSub internals, use the `tests` feature:
-
-```rust
-// Requires `tests` feature
-use corium::tests::{GossipSub, GossipConfig};
-```
-
 ### Configuration
 
 Configuration is handled internally with sensible defaults:
 
 ```rust
-// Internal configuration (not directly accessible without `tests` feature)
-pub struct GossipConfig {
-    pub mesh_degree: usize,         // Target peers per topic (default: 6)
-    pub mesh_degree_low: usize,     // Min before seeking more (default: 4)
-    pub mesh_degree_high: usize,    // Max before pruning (default: 12)
+// PlumTree configuration
+pub struct PlumTreeConfig {
+    pub eager_peers: usize,         // Eager peers per topic (default: 4)
+    pub lazy_peers: usize,          // Lazy peers per topic (default: 6)
     pub message_cache_size: usize,  // Dedup cache size (default: 10,000)
     pub message_cache_ttl: Duration, // Cache TTL (default: 2 min)
-    pub gossip_interval: Duration,  // IHave interval (default: 1s)
-    pub heartbeat_interval: Duration, // Mesh maintenance (default: 1s)
-    pub fanout_ttl: Duration,       // Fanout cache TTL (default: 60s)
-    pub max_ihave_length: usize,    // Max IHave messages per gossip (default: 100)
+    pub heartbeat_interval: Duration, // Maintenance (default: 1s)
+    pub ihave_timeout: Duration,    // IWant timeout (default: 3s)
+    pub lazy_push_interval: Duration, // IHave interval (default: 1s)
+    pub max_ihave_length: usize,    // Max IHave IDs per push (default: 100)
     pub max_message_size: usize,    // Max message payload (default: 64KB)
     pub publish_rate_limit: usize,  // Local publish rate limit (msg/s)
-    pub forward_rate_limit: usize,  // Forward rate limit (msg/s)
     pub per_peer_rate_limit: usize, // Per-peer rate limit (msg/s)
 }
 ```
 
 ### Message Flow
 
-1. **Publish**: Message sent to all mesh peers (full push)
-2. **Forward**: Each peer forwards to their mesh peers (except sender)
+1. **Publish**: Message sent to all eager peers (tree edges)
+2. **Forward**: Each peer forwards to their eager peers (except sender)
 3. **Deduplicate**: Message ID cache prevents redundant delivery
-4. **Gossip**: Periodically exchange IHave to discover missed messages
-5. **Repair**: IWant requests fill gaps in message delivery
+4. **Lazy Push**: Periodically send IHave to lazy peers
+5. **Repair**: IWant requests promote lazy peers to eager on message miss
+6. **Optimize**: Duplicates trigger demotion from eager to lazy
 
 ---
 
@@ -801,7 +791,7 @@ Example output:
 
 ### Chatroom Example
 
-A chatroom demonstrating both **room broadcast** (GossipSub pubsub) and **direct messaging** (QUIC connections):
+A chatroom demonstrating both **room broadcast** (PlumTree pubsub) and **direct messaging** (QUIC connections):
 
 ```bash
 # Terminal 1: Start first node (Alice)
@@ -835,7 +825,7 @@ alice@5821a288: Hello everyone!
 ```
 
 The chatroom example demonstrates:
-- **Room chat**: GossipSub pubsub with `node.subscribe()` / `node.publish()`
+- **Room chat**: PlumTree pubsub with `node.subscribe()` / `node.publish()`
 - **Direct messages**: QUIC streams via `node.connect()` / `conn.open_bi()`
 - **Peer discovery**: Automatic via DHT bootstrap
 - **Identity verification**: TLS-pinned connections
@@ -953,7 +943,7 @@ Clock skew tolerance and bounded registrations:
 
 ### PubSub Message Authentication
 
-All GossipSub messages are cryptographically signed to prevent spoofing and forgery:
+All PubSub messages are cryptographically signed to prevent spoofing and forgery:
 
 1. **Signature creation**: Publishers sign `topic || seqno || data` with their Ed25519 private key
 2. **Signature verification**: Every node verifies the signature before accepting or forwarding messages

@@ -1,8 +1,15 @@
+mod crypto;
 mod dht;
+mod hyparview;
 mod identity;
-mod net;
-mod pubsub;
+mod messages;
 mod node;
+mod plumtree;
+mod ratelimit;
+mod relay;
+mod routing;
+mod rpc;
+mod smartsock;
 
 #[inline]
 pub(crate) fn now_ms() -> u64 {
@@ -12,8 +19,8 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub use messages::Message;
 pub use node::Node;
-pub use node::Message;
 pub use quinn::Connection;
 
 // Re-export types needed for relay integration

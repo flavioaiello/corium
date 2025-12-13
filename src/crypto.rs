@@ -128,6 +128,18 @@ pub fn extract_public_key_from_cert(cert_der: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
+/// Extract the verified peer identity from a QUIC connection's TLS certificate.
+///
+/// Returns `None` if the peer identity cannot be verified (no cert, invalid format, etc.).
+pub fn extract_verified_identity(connection: &quinn::Connection) -> Option<Identity> {
+    let peer_identity = connection.peer_identity()?;
+    let certs: &Vec<rustls::pki_types::CertificateDer> = peer_identity.downcast_ref()?;
+    let cert_der = certs.first()?.as_ref();
+    let public_key = extract_public_key_from_cert(cert_der)?;
+    Some(Identity::from_bytes(public_key))
+}
+
+#[allow(dead_code)] // Used by test infrastructure
 pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bool {
     if let Some(public_key) = extract_public_key_from_cert(cert_der) {
         crate::identity::verify_identity(expected_identity, &public_key)

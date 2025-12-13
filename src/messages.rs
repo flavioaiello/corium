@@ -1,0 +1,638 @@
+
+use bincode::Options;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+use crate::dht::Key;
+use crate::identity::Identity;
+use crate::routing::Contact;
+use crate::hyparview::HyParViewMessage;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const MAX_VALUE_SIZE: usize = 1024 * 1024;
+
+pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
+
+pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
+pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+// ============================================================================
+// Serialization Helpers
+// ============================================================================
+
+fn bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_DESERIALIZE_SIZE)
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+}
+
+pub fn deserialize_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
+    bincode_options().deserialize(bytes)
+}
+
+pub fn serialize_request(request: &RpcRequest) -> Result<Vec<u8>, bincode::Error> {
+    bincode::serialize(request)
+}
+
+pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
+    bincode::deserialize(data)
+}
+
+pub fn serialize_response(response: &RpcResponse) -> Result<Vec<u8>, bincode::Error> {
+    bincode::serialize(response)
+}
+
+pub fn deserialize_response(data: &[u8]) -> Result<RpcResponse, bincode::Error> {
+    bincode::deserialize(data)
+}
+
+// ============================================================================
+// DHT Messages
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DhtRequest {
+    Ping {
+        from: Contact,
+    },
+    FindNode {
+        from: Contact,
+        target: Identity,
+    },
+    FindValue {
+        from: Contact,
+        key: Key,
+    },
+    Store {
+        from: Contact,
+        key: Key,
+        value: Vec<u8>,
+    },
+    WhatIsMyAddr,
+}
+
+impl DhtRequest {
+    pub fn sender_identity(&self) -> Option<Identity> {
+        match self {
+            DhtRequest::Ping { from } => Some(from.identity),
+            DhtRequest::FindNode { from, .. } => Some(from.identity),
+            DhtRequest::FindValue { from, .. } => Some(from.identity),
+            DhtRequest::Store { from, .. } => Some(from.identity),
+            DhtRequest::WhatIsMyAddr => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DhtResponse {
+    Ack,
+    Nodes(Vec<Contact>),
+    Value {
+        value: Option<Vec<u8>>,
+        closer: Vec<Contact>,
+    },
+    YourAddr {
+        addr: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+// ============================================================================
+// Relay Messages
+// ============================================================================
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RelayRequest {
+    /// Request to establish a relay session
+    Connect {
+        from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
+    },
+}
+
+impl RelayRequest {
+    pub fn sender_identity(&self) -> Identity {
+        match self {
+            RelayRequest::Connect { from_peer, .. } => *from_peer,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RelayResponse {
+    /// Session registered, waiting for peer B
+    Accepted {
+        session_id: [u8; 16],
+        relay_data_addr: String,
+    },
+    /// Session established, both peers connected
+    Connected {
+        session_id: [u8; 16],
+        relay_data_addr: String,
+    },
+    /// Session rejected
+    Rejected {
+        reason: String,
+    },
+}
+
+// ============================================================================
+// PlumTree Messages
+// ============================================================================
+
+pub type MessageId = [u8; 32];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PlumTreeMessage {
+    Subscribe {
+        topic: String,
+    },
+    Unsubscribe {
+        topic: String,
+    },
+    Graft {
+        topic: String,
+    },
+    Prune {
+        topic: String,
+        peers: Vec<Identity>,
+    },
+    Publish {
+        topic: String,
+        msg_id: MessageId,
+        source: Identity,
+        seqno: u64,
+        data: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    IHave {
+        topic: String,
+        msg_ids: Vec<MessageId>,
+    },
+    IWant {
+        msg_ids: Vec<MessageId>,
+    },
+}
+
+impl PlumTreeMessage {
+    #[allow(dead_code)] // Used for message routing
+    pub fn topic(&self) -> Option<&str> {
+        match self {
+            PlumTreeMessage::Subscribe { topic } => Some(topic),
+            PlumTreeMessage::Unsubscribe { topic } => Some(topic),
+            PlumTreeMessage::Graft { topic } => Some(topic),
+            PlumTreeMessage::Prune { topic, .. } => Some(topic),
+            PlumTreeMessage::Publish { topic, .. } => Some(topic),
+            PlumTreeMessage::IHave { topic, .. } => Some(topic),
+            PlumTreeMessage::IWant { .. } => None,
+        }
+    }
+}
+
+// ============================================================================
+// Public Message Type
+// ============================================================================
+
+/// A message received from the PlumTree network.
+///
+/// This is the user-facing message type with hex-encoded identity.
+#[derive(Clone, Debug)]
+pub struct Message {
+    /// The topic the message was published to
+    pub topic: String,
+    /// Hex-encoded identity of the sender
+    pub from: String,
+    /// The message payload
+    pub data: Vec<u8>,
+}
+
+// ============================================================================
+// RPC Envelope
+// ============================================================================
+
+/// PlumTree protocol request (gossip-style, fire-and-forget)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlumTreeRequest {
+    pub from: Identity,
+    pub message: PlumTreeMessage,
+}
+
+/// HyParView protocol request (gossip-style, fire-and-forget)  
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyParViewRequest {
+    pub from: Identity,
+    pub message: HyParViewMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcRequest {
+    /// DHT operations (request/response pattern)
+    Dht(DhtRequest),
+    /// Relay session management (request/response pattern)
+    Relay(RelayRequest),
+    /// PlumTree gossip messages (fire-and-forget)
+    PlumTree(PlumTreeRequest),
+    /// HyParView membership messages (fire-and-forget)
+    HyParView(HyParViewRequest),
+}
+
+impl RpcRequest {
+    pub fn sender_identity(&self) -> Option<Identity> {
+        match self {
+            RpcRequest::Dht(dht_req) => dht_req.sender_identity(),
+            RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
+            RpcRequest::PlumTree(req) => Some(req.from),
+            RpcRequest::HyParView(req) => Some(req.from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcResponse {
+    Dht(DhtResponse),
+
+    Relay(RelayResponse),
+
+    PlumTreeAck,
+
+    HyParViewAck,
+
+    Error { message: String },
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::Contact;
+    use crate::identity::{Identity, Keypair};
+    use bincode::Options;
+
+    const MAX_MESSAGE_SIZE: u64 = 64 * 1024;
+
+    fn test_bincode_options() -> impl Options {
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_MESSAGE_SIZE)
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+    }
+
+    fn serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, bincode::Error> {
+        test_bincode_options().serialize(value)
+    }
+
+    fn test_deserialize_request(bytes: &[u8]) -> Result<DhtRequest, bincode::Error> {
+        test_bincode_options().deserialize(bytes)
+    }
+
+    fn test_deserialize_response(bytes: &[u8]) -> Result<DhtResponse, bincode::Error> {
+        test_bincode_options().deserialize(bytes)
+    }
+
+    fn make_identity(seed: u32) -> Identity {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&seed.to_be_bytes());
+        Identity::from_bytes(bytes)
+    }
+
+    fn test_identity() -> Identity {
+        Identity::from([1u8; 32])
+    }
+
+    fn test_contact() -> Contact {
+        Contact {
+            identity: test_identity(),
+            addr: "127.0.0.1:4433".to_string(),
+        }
+    }
+
+    // ========================================================================
+    // DHT Message Tests
+    // ========================================================================
+
+    #[test]
+    fn bounded_deserialization_normal_payloads() {
+        let request = DhtRequest::Store {
+            from: Contact {
+                identity: make_identity(1),
+                addr: "127.0.0.1:8080".to_string(),
+            },
+            key: [0u8; 32],
+            value: vec![0u8; 100],
+        };
+
+        let bytes = serialize(&request).unwrap();
+        assert!(test_deserialize_request(&bytes).is_ok());
+    }
+
+    #[test]
+    fn malformed_data_rejected() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
+        assert!(test_deserialize_request(&garbage).is_err());
+
+        let request = DhtRequest::Ping {
+            from: Contact {
+                identity: make_identity(1),
+                addr: "127.0.0.1:8080".to_string(),
+            },
+        };
+        let bytes = serialize(&request).unwrap();
+        let truncated = &bytes[..bytes.len() / 2];
+        assert!(test_deserialize_request(truncated).is_err());
+    }
+
+    #[test]
+    fn response_deserialization() {
+        let response = DhtResponse::Nodes(vec![Contact {
+            identity: make_identity(1),
+            addr: "127.0.0.1:8080".to_string(),
+        }]);
+        let bytes = bincode::serialize(&response).unwrap();
+        assert!(test_deserialize_response(&bytes).is_ok());
+    }
+
+    #[test]
+    fn request_types_roundtrip() {
+        let contact = Contact {
+            identity: make_identity(1),
+            addr: "127.0.0.1:8080".to_string(),
+        };
+        let keypair = Keypair::generate();
+        let identity = keypair.identity();
+
+        let requests = vec![
+            DhtRequest::Ping { from: contact.clone() },
+            DhtRequest::FindNode {
+                from: contact.clone(),
+                target: make_identity(2),
+            },
+            DhtRequest::FindValue {
+                from: contact.clone(),
+                key: [0u8; 32],
+            },
+            DhtRequest::Store {
+                from: contact.clone(),
+                key: [0u8; 32],
+                value: b"test".to_vec(),
+            },
+            DhtRequest::WhatIsMyAddr,
+        ];
+
+        for req in requests {
+            let bytes = serialize(&req).unwrap();
+            let decoded = test_deserialize_request(&bytes).unwrap();
+            let _ = format!("{:?}", decoded);
+        }
+        
+        // Test RelayRequest serialization separately
+        let relay_request = RelayRequest::Connect {
+            from_peer: identity,
+            target_peer: identity,
+            session_id: [0u8; 16],
+        };
+        let bytes = serialize(&relay_request).unwrap();
+        let decoded: RelayRequest = test_bincode_options().deserialize(&bytes).unwrap();
+        let _ = format!("{:?}", decoded);
+    }
+
+    #[test]
+    fn sender_identity_extraction() {
+        let contact = Contact {
+            identity: make_identity(42),
+            addr: "127.0.0.1:8080".to_string(),
+        };
+
+        let ping = DhtRequest::Ping { from: contact.clone() };
+        assert_eq!(ping.sender_identity(), Some(make_identity(42)));
+
+        let find_node = DhtRequest::FindNode {
+            from: contact.clone(),
+            target: make_identity(1),
+        };
+        assert_eq!(find_node.sender_identity(), Some(make_identity(42)));
+
+        let what_is_my_addr = DhtRequest::WhatIsMyAddr;
+        assert_eq!(what_is_my_addr.sender_identity(), None);
+    }
+
+    #[test]
+    fn content_addressing_integrity() {
+        use crate::dht::{hash_content, verify_key_value_pair};
+
+        let data = b"original content";
+        let key = hash_content(data);
+
+        assert!(verify_key_value_pair(&key, data));
+
+        let corrupted = b"corrupted content";
+        assert!(!verify_key_value_pair(&key, corrupted));
+    }
+
+    #[test]
+    fn empty_data_hashing() {
+        use crate::dht::{hash_content, verify_key_value_pair};
+
+        let empty = b"";
+        let key = hash_content(empty);
+
+        assert!(verify_key_value_pair(&key, empty));
+        assert!(!verify_key_value_pair(&key, b"not empty"));
+    }
+
+    #[test]
+    fn hash_collision_resistance() {
+        use crate::dht::hash_content;
+
+        let data1 = b"data one";
+        let data2 = b"data two";
+
+        let hash1 = hash_content(data1);
+        let hash2 = hash_content(data2);
+
+        assert_ne!(hash1, hash2);
+
+        let data3 = b"data onf"; // One bit different
+        let hash3 = hash_content(data3);
+        assert_ne!(hash1, hash3);
+    }
+
+    // ========================================================================
+    // PlumTree Message Tests
+    // ========================================================================
+
+    #[test]
+    fn plumtree_message_variants() {
+        let sub = PlumTreeMessage::Subscribe {
+            topic: "test".to_string(),
+        };
+        assert_eq!(sub.topic(), Some("test"));
+
+        let unsub = PlumTreeMessage::Unsubscribe {
+            topic: "test".to_string(),
+        };
+        assert_eq!(unsub.topic(), Some("test"));
+
+        let graft = PlumTreeMessage::Graft {
+            topic: "test".to_string(),
+        };
+        assert_eq!(graft.topic(), Some("test"));
+
+        let prune = PlumTreeMessage::Prune {
+            topic: "test".to_string(),
+            peers: vec![],
+        };
+        assert_eq!(prune.topic(), Some("test"));
+
+        let ihave = PlumTreeMessage::IHave {
+            topic: "test".to_string(),
+            msg_ids: vec![],
+        };
+        assert_eq!(ihave.topic(), Some("test"));
+
+        let iwant = PlumTreeMessage::IWant { msg_ids: vec![] };
+        assert_eq!(iwant.topic(), None);
+    }
+
+    #[test]
+    fn plumtree_message_serialization() {
+        let identity = Identity::from_bytes([1u8; 32]);
+        let msg = PlumTreeMessage::Publish {
+            topic: "test".to_string(),
+            msg_id: [0u8; 32],
+            source: identity,
+            seqno: 1,
+            data: b"hello".to_vec(),
+            signature: vec![0u8; 64],
+        };
+
+        let encoded = bincode::serialize(&msg).expect("serialize failed");
+        let decoded: PlumTreeMessage = bincode::deserialize(&encoded).expect("deserialize failed");
+
+        match decoded {
+            PlumTreeMessage::Publish {
+                topic, seqno, data, ..
+            } => {
+                assert_eq!(topic, "test");
+                assert_eq!(seqno, 1);
+                assert_eq!(data, b"hello");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ========================================================================
+    // RPC Envelope Tests
+    // ========================================================================
+
+    #[test]
+    fn round_trip_dht_ping() {
+        let request = RpcRequest::Dht(DhtRequest::Ping {
+            from: test_contact(),
+        });
+
+        let bytes = serialize_request(&request).expect("serialize should succeed");
+        let decoded = deserialize_request(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcRequest::Dht(DhtRequest::Ping { from }) => {
+                assert_eq!(from.identity, test_identity());
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_dht_response() {
+        let response = RpcResponse::Dht(DhtResponse::Ack);
+        let bytes = bincode::serialize(&response).expect("serialize should succeed");
+        let decoded: RpcResponse =
+            deserialize_response(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcResponse::Dht(DhtResponse::Ack) => {}
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_plumtree_request() {
+        let request = RpcRequest::PlumTree(PlumTreeRequest {
+            from: test_identity(),
+            message: PlumTreeMessage::Publish {
+                topic: "test".to_string(),
+                msg_id: [0u8; 32],
+                source: test_identity(),
+                seqno: 1,
+                data: b"hello".to_vec(),
+                signature: vec![],
+            },
+        });
+
+        let bytes = serialize_request(&request).expect("serialize should succeed");
+        let decoded = deserialize_request(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcRequest::PlumTree(req) => {
+                assert_eq!(req.from, test_identity());
+                match req.message {
+                    PlumTreeMessage::Publish { topic, .. } => assert_eq!(topic, "test"),
+                    _ => panic!("unexpected message type"),
+                }
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_plumtree_ack() {
+        let response = RpcResponse::PlumTreeAck;
+        let bytes = bincode::serialize(&response).expect("serialize should succeed");
+        let decoded: RpcResponse =
+            deserialize_response(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcResponse::PlumTreeAck => {}
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_hyparview_ack() {
+        let response = RpcResponse::HyParViewAck;
+        let bytes = bincode::serialize(&response).expect("serialize should succeed");
+        let decoded: RpcResponse =
+            deserialize_response(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcResponse::HyParViewAck => {}
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_error_response() {
+        let response = RpcResponse::Error {
+            message: "test error".to_string(),
+        };
+        let bytes = bincode::serialize(&response).expect("serialize should succeed");
+        let decoded: RpcResponse =
+            deserialize_response(&bytes).expect("deserialize should succeed");
+
+        match decoded {
+            RpcResponse::Error { message } => {
+                assert_eq!(message, "test error");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+}

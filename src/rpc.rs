@@ -11,26 +11,100 @@ use quinn::{ClientConfig, Connection, Endpoint};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
-use super::messages::{self, RpcRequest, RpcResponse};
-use super::smartsock::SmartSock;
-use super::tls::identity_to_sni;
-use super::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
-use super::network::{RelayNetwork, RelaySession};
-
-use crate::dht::{Contact, DhtNetwork, Key};
-use crate::dht::messages::{DhtRequest, DhtResponse};
+use crate::messages::{self as messages, DhtRequest, DhtResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
+use crate::smartsock::SmartSock;
+use crate::crypto::identity_to_sni;
+use crate::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
+use crate::routing::Contact;
+use crate::dht::Key;
 use crate::identity::{EndpointRecord, Identity};
-use crate::pubsub::{GossipSubNetwork, PubSubMessage};
+use crate::hyparview::HyParViewMessage;
+
+// ============================================================================
+// DHT RPC Trait
+// ============================================================================
+
+#[async_trait]
+pub trait DhtRpc: Send + Sync + 'static {
+    async fn find_node(&self, to: &Contact, target: Identity) -> Result<Vec<Contact>>;
+
+    async fn find_value(&self, to: &Contact, key: Key) -> Result<(Option<Vec<u8>>, Vec<Contact>)>;
+
+    async fn store(&self, to: &Contact, key: Key, value: Vec<u8>) -> Result<()>;
+
+    async fn ping(&self, to: &Contact) -> Result<()>;
+}
+
+// ============================================================================
+// PlumTree RPC Trait
+// ============================================================================
+
+#[async_trait]
+#[allow(dead_code)]
+pub trait PlumTreeRpc: Send + Sync {
+    async fn send_plumtree(&self, to: &Contact, from: Identity, message: PlumTreeMessage)
+        -> Result<()>;
+
+    async fn send_plumtree_batch(
+        &self,
+        to: &Contact,
+        from: Identity,
+        messages: Vec<PlumTreeMessage>,
+    ) -> Result<()> {
+        for msg in messages {
+            self.send_plumtree(to, from, msg).await?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// HyParView RPC Trait
+// ============================================================================
+
+#[async_trait]
+#[allow(dead_code)]
+pub trait HyParViewRpc: Send + Sync {
+    async fn send_hyparview(
+        &self,
+        to: &Identity,
+        from: Identity,
+        message: HyParViewMessage,
+    ) -> Result<()>;
+}
+
+// ============================================================================
+// Relay RPC Trait
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct RelaySession {
+    pub session_id: [u8; 16],
+    pub relay_data_addr: String,
+    pub relay_identity: Identity,
+}
+
+#[async_trait]
+pub trait RelayRpc: Send + Sync {
+    async fn request_relay(&self, relay: &Contact, target: Identity) -> Result<RelaySession>;
+
+    async fn join_relay(&self, relay: &Contact, session_id: [u8; 16]) -> Result<RelaySession>;
+}
+
+// ============================================================================
+// RPC Constants
+// ============================================================================
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 const MAX_CONTACTS_PER_RESPONSE: usize = 100;
 
-const MAX_VALUE_SIZE: usize = crate::dht::messages::MAX_VALUE_SIZE;
+const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 
 const MAX_CACHED_CONNECTIONS: usize = 1000;
 
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
+
 
 // ============================================================================
 // CachedConnection - Minimal connection wrapper with staleness tracking
@@ -75,14 +149,6 @@ impl CachedConnection {
 // RpcNode - RPC layer for DHT peer communication
 // ============================================================================
 
-/// RpcNode handles RPC communication with DHT peers.
-/// 
-/// Responsibilities:
-/// - Connection caching and health tracking
-/// - RPC request/response framing (length-prefixed serialization)
-/// - DhtNetwork trait implementation (find_node, find_value, store, ping)
-/// - NAT detection via STUN-like queries
-/// - Smart connection with relay fallback
 #[derive(Clone)]
 pub struct RpcNode {
     pub endpoint: Endpoint,
@@ -92,6 +158,7 @@ pub struct RpcNode {
     nat_type: Arc<RwLock<NatType>>,
     public_addr: Arc<RwLock<Option<SocketAddr>>>,
     connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
+    contact_cache: Arc<RwLock<LruCache<Identity, Contact>>>,
     smartsock: Option<Arc<SmartSock>>,
 }
 
@@ -112,6 +179,9 @@ impl RpcNode {
             connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
             ))),
+            contact_cache: Arc::new(RwLock::new(LruCache::<Identity, Contact>::new(
+                NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
+            ))),
             smartsock: None,
         }
     }
@@ -119,6 +189,11 @@ impl RpcNode {
     pub fn with_smartsock(mut self, smartsock: Arc<SmartSock>) -> Self {
         self.smartsock = Some(smartsock);
         self
+    }
+    
+    pub async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
+        let mut cache = self.contact_cache.write().await;
+        cache.get(identity).cloned()
     }
 
     pub async fn public_addr(&self) -> Option<SocketAddr> {
@@ -252,7 +327,6 @@ impl RpcNode {
         }
     }
 
-    /// Send a DHT RPC request and return the DHT response.
     pub(crate) async fn rpc(&self, contact: &Contact, request: DhtRequest) -> Result<DhtResponse> {
         let rpc_request = RpcRequest::Dht(request);
         let rpc_response = self.rpc_raw(contact, rpc_request).await?;
@@ -264,7 +338,17 @@ impl RpcNode {
         }
     }
 
-    /// Send a raw RPC request and return the raw response.
+    pub(crate) async fn relay_rpc(&self, contact: &Contact, request: RelayRequest) -> Result<RelayResponse> {
+        let rpc_request = RpcRequest::Relay(request);
+        let rpc_response = self.rpc_raw(contact, rpc_request).await?;
+        
+        match rpc_response {
+            RpcResponse::Relay(relay_response) => Ok(relay_response),
+            RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
+            other => anyhow::bail!("unexpected response type for Relay request: {:?}", other),
+        }
+    }
+
     async fn rpc_raw(&self, contact: &Contact, request: RpcRequest) -> Result<RpcResponse> {
         let peer_id = contact.identity;
         let conn = self.get_or_connect(contact).await?;
@@ -297,7 +381,7 @@ impl RpcNode {
             .await
             .context("failed to open bidirectional stream")?;
 
-        let request_bytes = messages::serialize(&request).context("failed to serialize request")?;
+        let request_bytes = messages::serialize_request(&request).context("failed to serialize request")?;
         let len = request_bytes.len() as u32;
         send.write_all(&len.to_be_bytes()).await?;
         send.write_all(&request_bytes).await?;
@@ -443,18 +527,18 @@ impl RpcNode {
             let relay_conn = self.connect_to_peer(&relay_peer_id, &relay.relay_addrs).await
                 .context("failed to connect to relay")?;
             
-            let request = DhtRequest::RelayConnect {
+            let request = RelayRequest::Connect {
                 from_peer: *our_peer_id,
                 target_peer: *peer_id,
                 session_id,
             };
             
-            let response = self.send_rpc(&relay_conn, request).await?;
+            let response = self.send_relay_rpc(&relay_conn, request).await?;
             
             let direct_addrs = record.addrs.clone();
             
             match response {
-                DhtResponse::RelayAccepted { session_id, relay_data_addr } => {
+                RelayResponse::Accepted { session_id, relay_data_addr } => {
                     debug!(
                         peer = ?peer_id,
                         relay = ?relay_peer_id,
@@ -477,7 +561,7 @@ impl RpcNode {
                     
                     Ok(relay_conn)
                 }
-                DhtResponse::RelayConnected { session_id, relay_data_addr } => {
+                RelayResponse::Connected { session_id, relay_data_addr } => {
                     debug!(
                         peer = ?peer_id,
                         relay = ?relay_peer_id,
@@ -500,17 +584,15 @@ impl RpcNode {
                     
                     Ok(relay_conn)
                 }
-                DhtResponse::RelayRejected { reason } => {
+                RelayResponse::Rejected { reason } => {
                     anyhow::bail!("relay rejected: {}", reason);
                 }
-                _ => anyhow::bail!("unexpected relay response"),
             }
         } else {
             anyhow::bail!("direct connection failed and no relays available");
         }
     }
 
-    /// Send a DHT RPC on an existing connection (used for relay handshake).
     async fn send_rpc(&self, conn: &Connection, request: DhtRequest) -> Result<DhtResponse> {
         let (mut send, mut recv) = conn
             .open_bi()
@@ -518,7 +600,7 @@ impl RpcNode {
             .context("failed to open bidirectional stream")?;
 
         let rpc_request = RpcRequest::Dht(request);
-        let request_bytes = messages::serialize(&rpc_request).context("failed to serialize request")?;
+        let request_bytes = messages::serialize_request(&rpc_request).context("failed to serialize request")?;
         let len = request_bytes.len() as u32;
         send.write_all(&len.to_be_bytes()).await?;
         send.write_all(&request_bytes).await?;
@@ -549,10 +631,49 @@ impl RpcNode {
             other => anyhow::bail!("unexpected response type: {:?}", other),
         }
     }
+
+    async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .context("failed to open bidirectional stream")?;
+
+        let rpc_request = RpcRequest::Relay(request);
+        let request_bytes = messages::serialize_request(&rpc_request).context("failed to serialize request")?;
+        let len = request_bytes.len() as u32;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&request_bytes).await?;
+        send.finish()?;
+
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        if len > MAX_RESPONSE_SIZE {
+            warn!(
+                size = len,
+                max = MAX_RESPONSE_SIZE,
+                "peer sent oversized response on existing connection"
+            );
+            anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+        }
+
+        let mut response_bytes = vec![0u8; len];
+        recv.read_exact(&mut response_bytes).await?;
+
+        let rpc_response: RpcResponse =
+            messages::deserialize_response(&response_bytes).context("failed to deserialize response")?;
+        
+        match rpc_response {
+            RpcResponse::Relay(relay_response) => Ok(relay_response),
+            RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
+            other => anyhow::bail!("unexpected response type for Relay: {:?}", other),
+        }
+    }
 }
 
 #[async_trait]
-impl DhtNetwork for RpcNode {
+impl DhtRpc for RpcNode {
     async fn find_node(&self, to: &Contact, target: Identity) -> Result<Vec<Contact>> {
         let request = DhtRequest::FindNode {
             from: self.self_contact.clone(),
@@ -637,35 +758,55 @@ impl DhtNetwork for RpcNode {
 }
 
 // ============================================================================
-// GossipSubNetwork - PubSub message delivery for GossipSub
+// PlumTreeRpc - PlumTree message delivery
 // ============================================================================
 
 #[async_trait]
-impl GossipSubNetwork for RpcNode {
-    async fn send_pubsub(&self, to: &Contact, from: Identity, message: PubSubMessage) -> Result<()> {
-        let request = RpcRequest::PubSub { from, message };
+impl PlumTreeRpc for RpcNode {
+    async fn send_plumtree(&self, to: &Contact, from: Identity, message: PlumTreeMessage) -> Result<()> {
+        let request = RpcRequest::PlumTree(PlumTreeRequest { from, message });
         match self.rpc_raw(to, request).await? {
-            RpcResponse::PubSubAck => Ok(()),
-            RpcResponse::Error { message } => anyhow::bail!("PubSub rejected: {}", message),
-            other => anyhow::bail!("unexpected response to PubSub: {:?}", other),
+            RpcResponse::PlumTreeAck => Ok(()),
+            RpcResponse::Error { message } => anyhow::bail!("PlumTree rejected: {}", message),
+            other => anyhow::bail!("unexpected response to PlumTree: {:?}", other),
         }
     }
 
-    async fn send_pubsub_batch(&self, to: &Contact, from: Identity, messages: Vec<PubSubMessage>) -> Result<()> {
+    async fn send_plumtree_batch(&self, to: &Contact, from: Identity, messages: Vec<PlumTreeMessage>) -> Result<()> {
         // For now, send sequentially. Could be optimized with a batch RPC later.
         for msg in messages {
-            self.send_pubsub(to, from, msg).await?;
+            self.send_plumtree(to, from, msg).await?;
         }
         Ok(())
     }
 }
 
 // ============================================================================
-// RelayNetwork - Relay connection establishment
+// HyParViewRpc - HyParView message delivery
 // ============================================================================
 
 #[async_trait]
-impl RelayNetwork for RpcNode {
+impl HyParViewRpc for RpcNode {
+    async fn send_hyparview(&self, to: &Identity, from: Identity, message: HyParViewMessage) -> Result<()> {
+        // Look up the contact for this identity
+        let contact = self.resolve_identity_to_contact(to).await
+            .context("could not resolve identity to contact for HyParView message")?;
+        
+        let request = RpcRequest::HyParView(HyParViewRequest { from, message });
+        match self.rpc_raw(&contact, request).await? {
+            RpcResponse::HyParViewAck => Ok(()),
+            RpcResponse::Error { message } => anyhow::bail!("HyParView rejected: {}", message),
+            other => anyhow::bail!("unexpected response to HyParView: {:?}", other),
+        }
+    }
+}
+
+// ============================================================================
+// RelayRpc - Relay connection establishment
+// ============================================================================
+
+#[async_trait]
+impl RelayRpc for RpcNode {
     async fn request_relay(
         &self,
         relay: &Contact,
@@ -677,14 +818,14 @@ impl RelayNetwork for RpcNode {
         let session_id = generate_session_id()
             .context("failed to generate session ID")?;
         
-        let request = DhtRequest::RelayConnect {
+        let request = RelayRequest::Connect {
             from_peer: *our_peer_id,
             target_peer: target,
             session_id,
         };
         
-        match self.rpc(relay, request).await? {
-            DhtResponse::RelayAccepted { session_id, relay_data_addr } => {
+        match self.relay_rpc(relay, request).await? {
+            RelayResponse::Accepted { session_id, relay_data_addr } => {
                 debug!(
                     target = ?target,
                     relay = ?relay.identity,
@@ -698,7 +839,7 @@ impl RelayNetwork for RpcNode {
                     relay_identity: relay.identity,
                 })
             }
-            DhtResponse::RelayConnected { session_id, relay_data_addr } => {
+            RelayResponse::Connected { session_id, relay_data_addr } => {
                 debug!(
                     target = ?target,
                     relay = ?relay.identity,
@@ -712,10 +853,9 @@ impl RelayNetwork for RpcNode {
                     relay_identity: relay.identity,
                 })
             }
-            DhtResponse::RelayRejected { reason } => {
+            RelayResponse::Rejected { reason } => {
                 anyhow::bail!("relay rejected: {}", reason);
             }
-            other => anyhow::bail!("unexpected relay response: {:?}", other),
         }
     }
 
@@ -728,14 +868,14 @@ impl RelayNetwork for RpcNode {
             .context("cannot use relay without our_peer_id set")?;
         
         // When joining, we use a placeholder target - the relay will match by session_id
-        let request = DhtRequest::RelayConnect {
+        let request = RelayRequest::Connect {
             from_peer: *our_peer_id,
             target_peer: *our_peer_id, // Placeholder, relay matches by session_id
             session_id,
         };
         
-        match self.rpc(relay, request).await? {
-            DhtResponse::RelayConnected { session_id, relay_data_addr } => {
+        match self.relay_rpc(relay, request).await? {
+            RelayResponse::Connected { session_id, relay_data_addr } => {
                 debug!(
                     relay = ?relay.identity,
                     session = hex::encode(session_id),
@@ -748,10 +888,10 @@ impl RelayNetwork for RpcNode {
                     relay_identity: relay.identity,
                 })
             }
-            DhtResponse::RelayRejected { reason } => {
+            RelayResponse::Rejected { reason } => {
                 anyhow::bail!("relay rejected join: {}", reason);
             }
-            other => anyhow::bail!("unexpected relay response: {:?}", other),
+            other => anyhow::bail!("unexpected relay response for join: {:?}", other),
         }
     }
 }
