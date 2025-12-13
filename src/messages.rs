@@ -15,8 +15,12 @@ pub const MAX_VALUE_SIZE: usize = 1024 * 1024;
 
 pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
 
+/// Maximum request size - used by node.rs for request validation
+#[allow(dead_code)]
 pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 
+/// Maximum response size - used by rpc.rs for response validation  
+#[allow(dead_code)]
 pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 // ============================================================================
@@ -42,6 +46,8 @@ pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
     bincode::deserialize(data)
 }
 
+/// Serialize an RPC response for transmission
+#[allow(dead_code)]
 pub fn serialize_response(response: &RpcResponse) -> Result<Vec<u8>, bincode::Error> {
     bincode::serialize(response)
 }

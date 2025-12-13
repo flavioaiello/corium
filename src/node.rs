@@ -17,6 +17,7 @@ use crate::transport::{self, Contact, SmartSock, UdpRelayForwarder};
 use crate::rpc::{DhtRpc, HyParViewRpc, PlumTreeRpc, RpcNode};
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 // ============================================================================
@@ -160,18 +161,28 @@ async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 's
         }
     }
 
-    let response = handle_rpc_request(
-        node,
-        request,
-        remote_addr,
-        verified_identity,
-        plumtree_handler,
-        udp_forwarder,
-        udp_forwarder_addr,
-        hyparview,
-        plumtree,
-    )
-    .await;
+    let response = match tokio::time::timeout(
+        REQUEST_PROCESS_TIMEOUT,
+        handle_rpc_request(
+            node,
+            request,
+            remote_addr,
+            verified_identity,
+            plumtree_handler,
+            udp_forwarder,
+            udp_forwarder_addr,
+            hyparview,
+            plumtree,
+        )
+    ).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            warn!(remote = %remote_addr, "request processing timed out");
+            RpcResponse::Error {
+                message: "request processing timeout".to_string(),
+            }
+        }
+    };
 
     let response_bytes = bincode::serialize(&response).context("failed to serialize response")?;
     let len = response_bytes.len() as u32;
@@ -598,6 +609,8 @@ impl Node {
     
     /// Add a peer to this node's routing table.
     pub async fn add_peer(&self, endpoint: Contact) {
+        // Cache contact for HyParView resolution
+        self.network.cache_contact(&endpoint).await;
         self.dht.observe_contact(endpoint).await
     }
     
@@ -615,6 +628,8 @@ impl Node {
             addrs: vec![],
         };
         
+        // Cache contact for HyParView resolution
+        self.network.cache_contact(&contact).await;
         self.dht.observe_contact(contact.clone()).await;
         
         self.network.detect_nat(&[contact]).await;

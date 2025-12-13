@@ -1244,10 +1244,13 @@ impl<N: DhtRpc> Dht<N> {
         target: Identity,
         level_filter: Option<TieringLevel>,
     ) -> Result<Vec<Contact>> {
+        const MAX_LOOKUP_ITERATIONS: usize = 20;
+        
         let mut seen: HashSet<Identity> = HashSet::new();
         let mut queried: HashSet<Identity> = HashSet::new();
         let mut rpc_success = false;
         let mut rpc_failure = false;
+        let mut iteration = 0;
         let k_initial = self.current_k().await;
         let mut shortlist = {
             let rt = self.routing.lock().await;
@@ -1270,6 +1273,16 @@ impl<N: DhtRpc> Dht<N> {
             .unwrap_or([0xff; 32]);
 
         loop {
+            iteration += 1;
+            if iteration > MAX_LOOKUP_ITERATIONS {
+                warn!(
+                    target = ?hex::encode(&target.as_bytes()[..8]),
+                    iterations = iteration,
+                    "iterative lookup exceeded max iterations"
+                );
+                break;
+            }
+            
             let alpha = self.current_alpha().await;
             let candidates: Vec<Contact> = shortlist
                 .iter()

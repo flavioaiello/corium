@@ -76,8 +76,10 @@ pub const RELAY_HEADER_SIZE: usize = 20;
 pub const MAX_FRAME_SIZE: usize = 1500;
 pub const MAX_SESSIONS: usize = 10_000;
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+pub const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_SMARTSOCK_PEERS: usize = 10_000;
 
 pub const MAX_RELAY_FRAME_SIZE: usize = 1400;
 pub const PROBE_MAGIC: [u8; 4] = *b"SMPR";
@@ -230,6 +232,9 @@ pub struct ForwarderSession {
     pub last_activity: Instant,
     pub bytes_forwarded: u64,
     pub packets_forwarded: u64,
+    /// Flag to prevent race condition in session completion.
+    /// Once set to true via complete_session(), process_packet cannot auto-complete.
+    pub completion_locked: bool,
 }
 
 impl ForwarderSession {
@@ -243,6 +248,7 @@ impl ForwarderSession {
             last_activity: now,
             bytes_forwarded: 0,
             packets_forwarded: 0,
+            completion_locked: false,
         }
     }
 
@@ -251,7 +257,12 @@ impl ForwarderSession {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.last_activity.elapsed() > SESSION_TIMEOUT
+        if self.is_complete() {
+            self.last_activity.elapsed() > SESSION_TIMEOUT
+        } else {
+            // Pending sessions expire faster to prevent exhaustion attacks
+            self.last_activity.elapsed() > PENDING_SESSION_TIMEOUT
+        }
     }
 
     pub fn get_destination(&self, from: SocketAddr) -> Option<SocketAddr> {
@@ -347,6 +358,8 @@ impl UdpRelayForwarder {
             return Err("session already complete");
         }
         
+        // Lock completion to prevent race with process_packet auto-completion
+        session.completion_locked = true;
         session.peer_b_addr = Some(peer_b_addr);
         session.last_activity = Instant::now();
         
@@ -444,8 +457,10 @@ impl UdpRelayForwarder {
                 }
             };
             
-            if !session.is_complete() && from != session.peer_a_addr {
+            // Only auto-complete if not already locked by complete_session RPC
+            if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
                 session.peer_b_addr = Some(from);
+                session.completion_locked = true;
                 
                 drop(sessions);
                 let mut addr_map = self.addr_to_session.write().await;
@@ -967,16 +982,25 @@ pub struct PeerPathState {
     pub last_send: Option<Instant>,
     pub last_recv: Option<Instant>,
     pub candidates: HashMap<SocketAddr, PathCandidateInfo>,
+    /// Maps (tx_id) -> (addr, sent_time). TX IDs are unique per-peer via identity prefix.
     pub pending_probes: HashMap<u64, (SocketAddr, Instant)>,
-    pub next_probe_id: u64,
+    /// Counter portion of probe ID; combined with identity hash for uniqueness.
+    next_probe_counter: u64,
+    /// Cached identity hash prefix for probe ID generation.
+    identity_probe_prefix: u64,
 }
 
 #[allow(dead_code)] // Path state infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
-        let mut id_bytes = [0u8; 8];
-        let _ = getrandom::getrandom(&mut id_bytes);
-        let next_probe_id = u64::from_le_bytes(id_bytes);
+        // Use identity hash as prefix to ensure TX IDs are unique across peers
+        let identity_hash = blake3::hash(identity.as_bytes());
+        let identity_probe_prefix = u64::from_le_bytes(identity_hash.as_bytes()[0..8].try_into().unwrap());
+        
+        // Random starting counter for additional entropy
+        let mut counter_bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut counter_bytes);
+        let next_probe_counter = u64::from_le_bytes(counter_bytes);
         
         Self {
             identity,
@@ -987,8 +1011,17 @@ impl PeerPathState {
             last_recv: None,
             candidates: HashMap::new(),
             pending_probes: HashMap::new(),
-            next_probe_id,
+            next_probe_counter,
+            identity_probe_prefix,
         }
+    }
+    
+    /// Generate a unique probe TX ID by combining identity prefix with counter.
+    fn next_probe_id(&mut self) -> u64 {
+        let counter = self.next_probe_counter;
+        self.next_probe_counter = self.next_probe_counter.wrapping_add(1);
+        // XOR prefix with counter to create unique ID that includes peer identity
+        self.identity_probe_prefix ^ counter
     }
     
     pub fn best_addr(&self) -> Option<SocketAddr> {
@@ -1039,11 +1072,16 @@ impl PeerPathState {
     }
     
     pub fn generate_probe(&mut self, addr: SocketAddr) -> Option<(u64, PathProbeRequest)> {
+        // Check candidate exists first
+        if !self.candidates.contains_key(&addr) {
+            return None;
+        }
+        
+        // Generate TX ID before borrowing candidates mutably
+        let tx_id = self.next_probe_id();
+        
+        // Now get mutable reference and update
         let candidate = self.candidates.get_mut(&addr)?;
-        
-        let tx_id = self.next_probe_id;
-        self.next_probe_id = self.next_probe_id.wrapping_add(1);
-        
         candidate.mark_probed();
         self.pending_probes.insert(tx_id, (addr, Instant::now()));
         
@@ -1224,6 +1262,30 @@ impl SmartSock {
         
         {
             let mut peers = self.peers.write().await;
+            
+            // Evict oldest peer if at capacity to prevent unbounded growth
+            if peers.len() >= MAX_SMARTSOCK_PEERS && !peers.contains_key(&smart_addr) {
+                if let Some(oldest_addr) = peers.iter()
+                    .min_by_key(|(_, s)| s.last_recv)
+                    .map(|(k, _)| *k)
+                {
+                    if let Some(evicted) = peers.remove(&oldest_addr) {
+                        // Also clean up reverse map entries for evicted peer
+                        let mut reverse = self.reverse_map.write().await;
+                        for addr in &evicted.direct_addrs {
+                            reverse.remove(addr);
+                        }
+                        for tunnel in evicted.relay_tunnels.values() {
+                            reverse.remove(&tunnel.relay_addr);
+                        }
+                        debug!(
+                            evicted = ?evicted.identity,
+                            "evicted oldest peer from SmartSock to make room"
+                        );
+                    }
+                }
+            }
+            
             peers.insert(smart_addr, state);
         }
         

@@ -471,6 +471,12 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             known.remove(peer);
         }
         
+        // Clean up any pending outbound messages for this peer
+        {
+            let mut outbound = self.outbound.write().await;
+            outbound.remove(peer);
+        }
+        
         // Remove from all topics
         let mut topics = self.topics.write().await;
         for (topic, state) in topics.iter_mut() {
@@ -503,6 +509,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
     }
 }
 
+#[allow(dead_code)] // Public API - methods are exposed for library consumers and heartbeat loop
 impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
     // ========================================================================
     // SUBSCRIPTION MANAGEMENT (No DHT involvement)
@@ -1098,6 +1105,33 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
         self.cleanup_stale_state().await;
+        self.flush_pending_queues().await;
+    }
+
+    /// Attempt to flush pending message queues to peers that are now resolvable
+    async fn flush_pending_queues(&self) {
+        let peers_with_pending: Vec<Identity> = {
+            let outbound = self.outbound.read().await;
+            outbound.keys().copied().collect()
+        };
+
+        for peer in peers_with_pending {
+            // Try to resolve and send
+            if let Some(contact) = self.network.resolve_identity_to_contact(&peer).await {
+                let messages = self.take_pending_messages(&peer).await;
+                for msg in messages {
+                    if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg).await {
+                        trace!(
+                            peer = %hex::encode(&peer.as_bytes()[..8]),
+                            error = %e,
+                            "failed to flush pending PlumTree message"
+                        );
+                        // Message is lost if send fails during flush - this is acceptable
+                        // as the peer is likely unreachable
+                    }
+                }
+            }
+        }
     }
 
     async fn lazy_push(&self, topic: &str) {
@@ -1166,6 +1200,21 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
     // ========================================================================
 
     async fn queue_message(&self, peer: &Identity, msg: PlumTreeMessage) {
+        // Try to resolve identity to contact and send immediately
+        if let Some(contact) = self.network.resolve_identity_to_contact(peer).await {
+            if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg.clone()).await {
+                trace!(
+                    peer = %hex::encode(&peer.as_bytes()[..8]),
+                    error = %e,
+                    "failed to send PlumTree message, queueing for later"
+                );
+                // Fall through to queue as fallback
+            } else {
+                return; // Successfully sent
+            }
+        }
+        
+        // Fallback: queue for later delivery (maintains bounded queue semantics)
         let mut outbound = self.outbound.write().await;
         
         // Limit total peers

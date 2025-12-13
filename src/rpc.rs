@@ -55,6 +55,10 @@ pub trait PlumTreeRpc: Send + Sync {
         }
         Ok(())
     }
+    
+    /// Resolve an identity to a contact for message delivery.
+    /// Returns None if the identity is not in the contact cache.
+    async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact>;
 }
 
 // ============================================================================
@@ -77,6 +81,7 @@ pub trait HyParViewRpc: Send + Sync {
 // ============================================================================
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
 pub struct RelaySession {
     pub session_id: [u8; 16],
     pub relay_data_addr: String,
@@ -84,6 +89,7 @@ pub struct RelaySession {
 }
 
 #[async_trait]
+#[allow(dead_code)] // Relay infrastructure - trait for relay operations
 pub trait RelayRpc: Send + Sync {
     async fn request_relay(&self, relay: &Contact, target: Identity) -> Result<RelaySession>;
 
@@ -158,6 +164,7 @@ pub struct RpcNode {
     public_addr: Arc<RwLock<Option<SocketAddr>>>,
     connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
     contact_cache: Arc<RwLock<LruCache<Identity, Contact>>>,
+    in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Identity>>>,
     smartsock: Option<Arc<SmartSock>>,
 }
 
@@ -181,6 +188,7 @@ impl RpcNode {
             contact_cache: Arc::new(RwLock::new(LruCache::<Identity, Contact>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
             ))),
+            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             smartsock: None,
         }
     }
@@ -193,6 +201,12 @@ impl RpcNode {
     pub async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
         let mut cache = self.contact_cache.write().await;
         cache.get(identity).cloned()
+    }
+
+    /// Cache a contact for later resolution (e.g., for HyParView).
+    pub async fn cache_contact(&self, contact: &Contact) {
+        let mut cache = self.contact_cache.write().await;
+        cache.put(contact.identity, contact.clone());
     }
 
     pub async fn public_addr(&self) -> Option<SocketAddr> {
@@ -271,6 +285,7 @@ impl RpcNode {
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
         let peer_id = contact.identity;
         
+        // First check if we have a usable cached connection
         {
             let mut cache = self.connections.write().await;
             if let Some(cached) = cache.get_mut(&peer_id) {
@@ -299,8 +314,51 @@ impl RpcNode {
             }
         }
         
-        let conn = self.connect(contact).await?;
+        // Check if another task is already connecting to this peer
+        // This prevents duplicate connection attempts under concurrency
+        // Use a retry loop to wait for the other task to complete
+        const MAX_WAIT_RETRIES: usize = 10;
+        const WAIT_INTERVAL_MS: u64 = 50;
         
+        for retry in 0..=MAX_WAIT_RETRIES {
+            {
+                let mut in_flight = self.in_flight.lock().await;
+                if !in_flight.contains(&peer_id) {
+                    // No other task is connecting, we'll do it
+                    in_flight.insert(peer_id);
+                    break;
+                }
+                // Another task is connecting, drop lock and wait
+            }
+            
+            if retry == MAX_WAIT_RETRIES {
+                // Timed out waiting for other task, give up and return error
+                anyhow::bail!("timed out waiting for concurrent connection to peer");
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(WAIT_INTERVAL_MS)).await;
+            
+            // Check if connection appeared in cache while we waited
+            let cache = self.connections.read().await;
+            if let Some(cached) = cache.peek(&peer_id) {
+                if !cached.is_closed() {
+                    return Ok(cached.connection.clone());
+                }
+            }
+        }
+        
+        // We hold the in_flight marker, connect outside of any locks
+        let result = self.connect(contact).await;
+        
+        // Always remove from in_flight, even on error
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.remove(&peer_id);
+        }
+        
+        let conn = result?;
+        
+        // Cache the new connection
         {
             let mut cache = self.connections.write().await;
             cache.put(peer_id, CachedConnection::new(conn.clone()));
@@ -337,6 +395,7 @@ impl RpcNode {
         }
     }
 
+    #[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
     pub(crate) async fn relay_rpc(&self, contact: &Contact, request: RelayRequest) -> Result<RelayResponse> {
         let rpc_request = RpcRequest::Relay(request);
         let rpc_response = self.rpc_raw(contact, rpc_request).await?;
@@ -595,6 +654,7 @@ impl RpcNode {
         }
     }
 
+    #[allow(dead_code)] // Used by smart_connect relay path
     async fn send_rpc(&self, conn: &Connection, request: DhtRequest) -> Result<DhtResponse> {
         let (mut send, mut recv) = conn
             .open_bi()
@@ -780,6 +840,11 @@ impl PlumTreeRpc for RpcNode {
             self.send_plumtree(to, from, msg).await?;
         }
         Ok(())
+    }
+    
+    async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
+        let mut cache = self.contact_cache.write().await;
+        cache.get(identity).cloned()
     }
 }
 

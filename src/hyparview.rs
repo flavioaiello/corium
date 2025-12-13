@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,7 +6,7 @@ use rand::seq::IteratorRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::identity::Identity;
 use crate::rpc::HyParViewRpc;
@@ -101,12 +101,13 @@ pub struct HyParView<N: HyParViewRpc> {
     // Protocol state
     active_view: RwLock<HashSet<Identity>>,
     passive_view: RwLock<HashSet<Identity>>,
-    pending_neighbors: RwLock<HashSet<Identity>>,
+    pending_neighbors: RwLock<HashMap<Identity, Instant>>,
     alive_disconnecting: RwLock<HashSet<Identity>>,
     last_shuffle: RwLock<Instant>,
     rng: RwLock<rand::rngs::StdRng>,
 }
 
+#[allow(dead_code)] // Public API - methods are exposed for library consumers
 impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     pub fn new(me: Identity, config: HyParViewConfig, network: Arc<N>) -> Self {
         Self {
@@ -116,7 +117,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             neighbor_callback: RwLock::new(None),
             active_view: RwLock::new(HashSet::new()),
             passive_view: RwLock::new(HashSet::new()),
-            pending_neighbors: RwLock::new(HashSet::new()),
+            pending_neighbors: RwLock::new(HashMap::new()),
             alive_disconnecting: RwLock::new(HashSet::new()),
             last_shuffle: RwLock::new(Instant::now()),
             rng: RwLock::new(rand::rngs::StdRng::from_entropy()),
@@ -215,7 +216,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             self.try_promote_passive().await;
         }
 
-        self.pending_neighbors.write().await.remove(&peer);
+        self.pending_neighbors.write().await.remove(&peer);  // Returns Option, discard result
     }
 
     pub async fn do_shuffle(&self) {
@@ -245,11 +246,39 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     pub async fn handle_neighbor_timeout(&self, peer: Identity) {
         let was_pending = {
             let mut pending = self.pending_neighbors.write().await;
-            pending.remove(&peer)
+            pending.remove(&peer).is_some()
         };
 
         if was_pending {
             debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "neighbor request timed out");
+            self.try_promote_passive().await;
+        }
+    }
+
+    /// Clean up stale pending neighbor requests that have timed out
+    async fn cleanup_stale_pending_neighbors(&self) {
+        let timeout = self.config.neighbor_timeout;
+        let now = Instant::now();
+        
+        let stale_peers: Vec<Identity> = {
+            let pending = self.pending_neighbors.read().await;
+            pending
+                .iter()
+                .filter(|(_, inserted_at)| now.duration_since(**inserted_at) > timeout)
+                .map(|(peer, _)| *peer)
+                .collect()
+        };
+
+        if !stale_peers.is_empty() {
+            let mut pending = self.pending_neighbors.write().await;
+            for peer in &stale_peers {
+                pending.remove(peer);
+                debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "cleaned up stale pending neighbor");
+            }
+        }
+
+        // Try to promote passive peers if we cleaned up any
+        if !stale_peers.is_empty() {
             self.try_promote_passive().await;
         }
     }
@@ -282,6 +311,8 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             loop {
                 interval.tick().await;
                 this.do_shuffle().await;
+                // Clean up stale pending neighbor requests on each shuffle tick
+                this.cleanup_stale_pending_neighbors().await;
             }
         })
     }
@@ -398,11 +429,23 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     }
 
     async fn on_shuffle(&self, from: Identity, origin: Identity, peers: Vec<Identity>, ttl: u8) {
+        // Validate shuffle peer list size to prevent amplification attacks
+        let max_shuffle_size = self.config.shuffle_active_count + self.config.shuffle_passive_count + 1;
+        if peers.len() > max_shuffle_size * 2 {
+            warn!(
+                from = %hex::encode(&from.as_bytes()[..8]),
+                peer_count = peers.len(),
+                max = max_shuffle_size * 2,
+                "rejecting oversized shuffle message"
+            );
+            return;
+        }
+        
         let active_len = self.active_view.read().await.len();
 
         if ttl == 0 || active_len <= 1 {
-            // Accept shuffle and reply
-            for peer in peers.iter() {
+            // Accept shuffle and reply (limited to max_shuffle_size peers)
+            for peer in peers.iter().take(max_shuffle_size) {
                 if *peer != self.me {
                     self.add_to_passive(*peer).await;
                 }
@@ -548,17 +591,12 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         self.emit_neighbor_up(peer).await;
 
         if send_neighbor {
-            self.pending_neighbors.write().await.insert(peer);
+            self.pending_neighbors.write().await.insert(peer, Instant::now());
 
             let msg = HyParViewMessage::Neighbor { priority };
             if let Err(e) = self.network.send_hyparview(&peer, self.me, msg).await {
                 warn!(peer = %hex::encode(&peer.as_bytes()[..8]), error = %e, "failed to send Neighbor");
             }
-
-            // Schedule timeout
-            let timeout = self.config.neighbor_timeout;
-            // Note: Timer scheduling would require Arc<Self> - handled by caller
-            trace!(peer = %hex::encode(&peer.as_bytes()[..8]), timeout = ?timeout, "neighbor timeout should be scheduled");
         }
     }
 

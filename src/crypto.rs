@@ -158,10 +158,25 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
 
     fn verify_client_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Validate that the certificate contains a valid Ed25519 public key
+        // The actual identity verification happens after connection via extract_verified_identity
+        let public_key = extract_public_key_from_cert(end_entity.as_ref())
+            .ok_or(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ))?;
+        
+        // Verify the public key is a valid Ed25519 key (32 bytes, not all zeros/ones)
+        let identity = Identity::from_bytes(public_key);
+        if !identity.is_valid() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 

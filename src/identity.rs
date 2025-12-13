@@ -255,7 +255,9 @@ impl EndpointRecord {
         
         let max_age_ms = max_age_secs * 1000;
         
-        if self.timestamp > now_ms + 60_000 {
+        // Allow 10 second future tolerance for clock skew (reduced from 60s for security)
+        const FUTURE_TOLERANCE_MS: u64 = 10_000;
+        if self.timestamp > now_ms + FUTURE_TOLERANCE_MS {
             return false;
         }
         
