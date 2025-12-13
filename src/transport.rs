@@ -149,31 +149,6 @@ pub fn detect_nat_type(
     report
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayInfo {
-    pub relay_peer: Identity,
-    pub relay_addrs: Vec<String>,
-    pub load: f32,
-    pub accepting: bool,
-    #[serde(default)]
-    pub rtt_ms: Option<f32>,
-    #[serde(default)]
-    pub tier: Option<u8>,
-}
-
-impl RelayInfo {
-    pub fn selection_score(&self) -> f32 {
-        let rtt_score = self.rtt_ms.unwrap_or(200.0);
-        let load_penalty = self.load * 100.0;
-        let tier_penalty = self.tier.map(|t| t as f32 * 20.0).unwrap_or(40.0);
-        rtt_score + load_penalty + tier_penalty
-    }
-
-    pub fn has_latency_info(&self) -> bool {
-        self.rtt_ms.is_some() || self.tier.is_some()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CryptoError {
     pub code: Option<u32>,
@@ -274,6 +249,7 @@ pub struct UdpRelayForwarder {
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
 }
 
+#[allow(dead_code)] // Relay infrastructure
 impl UdpRelayForwarder {
     pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
@@ -645,6 +621,7 @@ pub async fn handle_relay_request(
 
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay infrastructure
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
@@ -969,6 +946,7 @@ pub enum PathChoice {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Path probing infrastructure
 pub struct PeerPathState {
     pub identity: Identity,
     pub direct_addrs: Vec<SocketAddr>,
@@ -982,6 +960,7 @@ pub struct PeerPathState {
     identity_probe_prefix: u64,
 }
 
+#[allow(dead_code)] // Path probing infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
         let identity_hash = blake3::hash(identity.as_bytes());
@@ -2109,35 +2088,6 @@ mod tests {
             PathChoice::Relay { relay_addr, .. } => assert_eq!(relay_addr, relay),
             _ => panic!("Expected relay path"),
         }
-    }
-
-    #[test]
-    fn relay_info_selection_score() {
-        let info = RelayInfo {
-            relay_peer: Identity::from_bytes([1u8; 32]),
-            relay_addrs: vec!["127.0.0.1:5000".into()],
-            load: 0.5,
-            accepting: true,
-            rtt_ms: Some(50.0),
-            tier: Some(1),
-        };
-        
-        let score = info.selection_score();
-        assert!(score > 0.0);
-        assert!(info.has_latency_info());
-        
-        let no_latency = RelayInfo {
-            relay_peer: Identity::from_bytes([2u8; 32]),
-            relay_addrs: vec![],
-            load: 0.0,
-            accepting: false,
-            rtt_ms: None,
-            tier: None,
-        };
-        assert!(!no_latency.has_latency_info());
-        
-        let cloned = info.clone();
-        let _debug = format!("{:?}", cloned);
     }
 
     #[test]

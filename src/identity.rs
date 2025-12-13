@@ -334,20 +334,6 @@ impl EndpointRecord {
     }
 }
 
-#[inline]
-pub fn verify_identity(identity: &Identity, public_key: &[u8; 32]) -> bool {
-    constant_time_eq(identity.as_bytes(), public_key)
-}
-
-#[inline]
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,10 +364,10 @@ mod tests {
         let identity = kp.identity();
         let public_key = kp.public_key_bytes();
         
-        assert!(verify_identity(&identity, &public_key));
+        assert_eq!(*identity.as_bytes(), public_key);
         
         let other_kp = Keypair::generate();
-        assert!(!verify_identity(&identity, &other_kp.public_key_bytes()));
+        assert_ne!(*identity.as_bytes(), other_kp.public_key_bytes());
     }
 
     #[test]
@@ -586,29 +572,16 @@ mod tests {
             let public_key_1 = kp1.public_key_bytes();
             let public_key_2 = kp2.public_key_bytes();
             
-            assert!(
-                verify_identity(&identity_1, &public_key_1),
+            assert_eq!(
+                *identity_1.as_bytes(), public_key_1,
                 "P4 violation: valid Identity-PublicKey binding rejected"
             );
             
-            assert!(
-                !verify_identity(&identity_1, &public_key_2),
+            assert_ne!(
+                *identity_1.as_bytes(), public_key_2,
                 "P4 violation: Sybil attack - wrong public key accepted for Identity"
             );
         }
-    }
-    
-    #[test]
-    fn test_constant_time_eq() {
-        let a = [0u8; 32];
-        let b = [0u8; 32];
-        let c = [1u8; 32];
-        let mut d = [0u8; 32];
-        d[31] = 1; // Differ only in last byte
-        
-        assert!(constant_time_eq(&a, &b), "Equal arrays should compare equal");
-        assert!(!constant_time_eq(&a, &c), "Different arrays should not compare equal");
-        assert!(!constant_time_eq(&a, &d), "Arrays differing in last byte should not compare equal");
     }
     
     #[test]
@@ -706,15 +679,15 @@ mod tests {
         let identity = keypair.identity();
         let public_key = keypair.public_key_bytes();
 
-        assert!(verify_identity(&identity, &public_key));
+        assert_eq!(*identity.as_bytes(), public_key);
 
         let other_keypair = Keypair::generate();
-        assert!(!verify_identity(&identity, &other_keypair.public_key_bytes()));
+        assert_ne!(*identity.as_bytes(), other_keypair.public_key_bytes());
 
         let mut bad_bytes = *identity.as_bytes();
         bad_bytes[0] ^= 0xFF;
         let bad_identity = Identity::from_bytes(bad_bytes);
-        assert!(!verify_identity(&bad_identity, &public_key));
+        assert_ne!(*bad_identity.as_bytes(), public_key);
     }
 
     #[test]
@@ -923,8 +896,8 @@ mod tests {
 
         let attacker_claimed_id = Identity::from_bytes([0xFF; 32]);
 
-        assert!(!verify_identity(&attacker_claimed_id, &public_key));
-        assert!(verify_identity(&correct_identity, &public_key));
+        assert_ne!(*attacker_claimed_id.as_bytes(), public_key);
+        assert_eq!(*correct_identity.as_bytes(), public_key);
     }
 
     #[test]
@@ -963,13 +936,13 @@ mod tests {
 
         let keypair = Keypair::generate();
 
-        assert!(
-            !verify_identity(&all_zeros, &keypair.public_key_bytes()),
-            "All-zeros Identity should not verify against any real keypair"
+        assert_ne!(
+            *all_zeros.as_bytes(), keypair.public_key_bytes(),
+            "All-zeros Identity should not match any real keypair"
         );
-        assert!(
-            !verify_identity(&all_ones, &keypair.public_key_bytes()),
-            "All-ones Identity should not verify against any real keypair"
+        assert_ne!(
+            *all_ones.as_bytes(), keypair.public_key_bytes(),
+            "All-ones Identity should not match any real keypair"
         );
     }
 }

@@ -55,17 +55,29 @@ pub const RATE_LIMIT_ENTRY_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// Configuration for the PlumTree gossip protocol.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // eager_peers, lazy_peers, message_cache_ttl reserved for protocol tuning
 pub struct PlumTreeConfig {
+    /// Target number of eager peers per topic (reserved for protocol optimization)
     pub eager_peers: usize,
+    /// Target number of lazy peers per topic (reserved for protocol optimization)
     pub lazy_peers: usize,
+    /// Timeout before retrying IWant requests
     pub ihave_timeout: Duration,
+    /// Interval between lazy push (IHave) rounds
     pub lazy_push_interval: Duration,
+    /// Maximum number of messages to cache
     pub message_cache_size: usize,
+    /// TTL for cached messages (reserved for TTL-based eviction)
     pub message_cache_ttl: Duration,
+    /// Interval between heartbeat ticks
     pub heartbeat_interval: Duration,
+    /// Maximum size of a single message in bytes
     pub max_message_size: usize,
+    /// Maximum number of message IDs in an IHave announcement
     pub max_ihave_length: usize,
+    /// Maximum publish rate (messages per second) for local node
     pub publish_rate_limit: usize,
+    /// Maximum message rate per remote peer
     pub per_peer_rate_limit: usize,
 }
 
@@ -145,6 +157,7 @@ const MAX_PENDING_IWANTS: usize = 100;
 
 /// A message received from the gossip network.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Library API - fields returned to consumers
 pub struct ReceivedMessage {
     pub topic: String,
     pub source: Identity,
@@ -164,6 +177,7 @@ pub(crate) struct CachedMessage {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Heartbeat infrastructure - last_lazy_push tracked for timing
 pub(crate) struct TopicState {
     pub eager_peers: HashSet<Identity>,
     pub lazy_peers: HashSet<Identity>,
@@ -184,6 +198,7 @@ impl Default for TopicState {
     }
 }
 
+#[allow(dead_code)] // Heartbeat infrastructure
 impl TopicState {
     pub fn total_peers(&self) -> usize {
         self.eager_peers.len() + self.lazy_peers.len()
@@ -222,8 +237,8 @@ impl TopicState {
         self.lazy_peers.remove(peer);
     }
 
-    pub fn should_lazy_push(&self) -> bool {
-        self.last_lazy_push.elapsed() >= DEFAULT_LAZY_PUSH_INTERVAL && !self.lazy_peers.is_empty()
+    pub fn should_lazy_push(&self, lazy_push_interval: Duration) -> bool {
+        self.last_lazy_push.elapsed() >= lazy_push_interval && !self.lazy_peers.is_empty()
     }
 
     pub fn record_iwant(&mut self, msg_id: MessageId, peer: Identity) {
@@ -239,13 +254,13 @@ impl TopicState {
         self.pending_iwants.insert(msg_id, (Instant::now(), vec![peer]));
     }
 
-    pub fn check_iwant_timeouts(&mut self) -> Vec<(MessageId, Identity)> {
+    pub fn check_iwant_timeouts(&mut self, ihave_timeout: Duration) -> Vec<(MessageId, Identity)> {
         let now = Instant::now();
         let mut retries = Vec::new();
         let mut completed = Vec::new();
 
         for (msg_id, (requested_at, tried_peers)) in self.pending_iwants.iter_mut() {
-            if now.duration_since(*requested_at) > DEFAULT_IHAVE_TIMEOUT {
+            if now.duration_since(*requested_at) > ihave_timeout {
                 if let Some(next_peer) = self.lazy_peers.iter()
                     .find(|p| !tried_peers.contains(p))
                     .copied()
@@ -339,6 +354,7 @@ impl PeerRateLimit {
 }
 
 /// Reasons why a message might be rejected.
+#[allow(dead_code)] // Library API - error type for consumers
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRejection {
     MessageTooLarge,
@@ -990,7 +1006,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-
+    #[allow(dead_code)] // Heartbeat infrastructure - to be wired
     pub async fn run_heartbeat(&self) {
         let mut interval = tokio::time::interval(self.config.heartbeat_interval);
         
@@ -1000,6 +1016,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
+    #[allow(dead_code)] // Heartbeat infrastructure - called by run_heartbeat
     async fn heartbeat(&self) {
         let subscribed_topics: Vec<String> = {
             self.subscriptions.read().await.iter().cloned().collect()
@@ -1040,7 +1057,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         let (should_push, msg_ids, lazy_peers) = {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.get_mut(topic) {
-                if state.should_lazy_push() {
+                if state.should_lazy_push(self.config.lazy_push_interval) {
                     state.last_lazy_push = Instant::now();
                     let ids: Vec<MessageId> = state.recent_messages.iter().copied().collect();
                     let peers: Vec<Identity> = state.lazy_peers.iter().copied().collect();
@@ -1069,7 +1086,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         let retries: Vec<(MessageId, Identity)> = {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.get_mut(topic) {
-                state.check_iwant_timeouts()
+                state.check_iwant_timeouts(self.config.ihave_timeout)
             } else {
                 Vec::new()
             }
@@ -1150,16 +1167,18 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         outbound.remove(peer).unwrap_or_default()
     }
 
+    #[allow(dead_code)] // Library API - accessor
     pub async fn peers_with_pending(&self) -> Vec<Identity> {
         let outbound = self.outbound.read().await;
         outbound.keys().copied().collect()
     }
 
-
+    #[allow(dead_code)] // Library API - accessor
     pub async fn subscriptions(&self) -> Vec<String> {
         self.subscriptions.read().await.iter().cloned().collect()
     }
 
+    #[allow(dead_code)] // Library API - accessor
     pub async fn eager_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1167,6 +1186,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)] // Library API - accessor
     pub async fn lazy_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1174,6 +1194,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)] // Library API - accessor
     pub async fn topic_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1181,6 +1202,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)] // Library API - accessor
     pub fn local_identity(&self) -> Identity {
         self.local_identity
     }
@@ -1458,10 +1480,10 @@ mod tests {
         
         // Initially no push needed (just created)
         // After waiting, should_lazy_push would return true
-        let _ = state.should_lazy_push();
+        let _ = state.should_lazy_push(DEFAULT_LAZY_PUSH_INTERVAL);
         
         // Check timeout tracking
-        let retries = state.check_iwant_timeouts();
+        let retries = state.check_iwant_timeouts(DEFAULT_IHAVE_TIMEOUT);
         assert!(retries.is_empty());
     }
 

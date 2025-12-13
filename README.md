@@ -255,35 +255,7 @@ pub use node::{Node, Message};  // The mesh node and pubsub messages
 pub use quinn::Connection;      // QUIC connection to a peer
 ```
 
-### Internal Access (Tests Feature)
 
-For testing or advanced use cases, enable the `tests` feature:
-
-```toml
-[dependencies]
-corium = { version = "0.2", features = ["tests"] }
-```
-
-Then access internal types:
-
-```rust
-use corium::tests::{
-    // Identity
-    Keypair, Identity, EndpointRecord, verify_identity,
-    
-    // DHT
-    DhtNode, DhtRpc, Contact, Key, hash_content,
-    
-    // Network
-    PeerNetwork, SmartConnection, UdpRelayForwarder,
-    
-    // PubSub
-    PlumTree, PlumTreeConfig, PlumTreeMessage,
-    
-    // TLS utilities
-    generate_ed25519_cert, create_client_config, create_server_config,
-};
-```
 
 ---
 
@@ -309,23 +281,6 @@ assert_eq!(identity.as_bytes(), &public_key);
 let secret = keypair.secret_key_bytes();
 let restored = Keypair::from_secret_key_bytes(&secret);
 assert_eq!(keypair.identity(), restored.identity());
-```
-
-### Peer Verification
-
-Peer identity is verified automatically during TLS handshake:
-
-```rust
-use corium::tests::{verify_peer_identity, extract_public_key_from_cert, Identity};
-
-// After receiving a peer's certificate
-let cert_der: &[u8] = /* from TLS handshake */;
-let claimed_identity: Identity = /* from Contact */;
-
-// Verify the peer owns their claimed Identity
-if verify_peer_identity(cert_der, &claimed_identity) {
-    // Peer verified - their certificate's public key matches claimed Identity
-}
 ```
 
 ---
@@ -534,27 +489,6 @@ When relay is needed, Corium dynamically selects the best relay node using a sco
 | Tier level | Low | DHT tiering level (20ms penalty per tier) |
 
 Relay selection uses the formula: `score = rtt_ms + (load * 100) + (tier * 20)` (lower is better).
-
-Relay nodes publish their capabilities to the DHT:
-
-```rust
-// Available via `tests` feature
-use corium::tests::RelayInfo;
-
-pub struct RelayInfo {
-    pub relay_peer: Identity,      // Relay's peer ID
-    pub relay_addrs: Vec<String>,  // Relay addresses
-    pub load: f32,                 // Current load (0.0-1.0)
-    pub accepting: bool,           // Accepting new sessions?
-    pub rtt_ms: Option<f32>,       // Observed RTT (from tiering)
-    pub tier: Option<u8>,          // Tiering level (0 = fastest)
-}
-
-impl RelayInfo {
-    /// Calculate relay selection score (lower is better)
-    pub fn selection_score(&self) -> f32;
-}
-```
 
 ### NAT Types
 
@@ -876,7 +810,7 @@ This prevents attackers from claiming arbitrary Identities—they can only use I
 | **P1: Identity Binding** | `Identity = PublicKey` (exact 32-byte equality, no transformation) |
 | **P2: Zero-Hash** | XOR distance computed directly on raw public key bytes |
 | **P3: SNI Pinning** | TLS SNI = hex(Identity) binds connection to claimed identity |
-| **P4: Sybil Protection** | `verify_identity(id, pk)` uses constant-time comparison |
+| **P4: Sybil Protection** | Mutual TLS authentication cryptographically binds identity to keypair |
 | **P5: EndpointRecord Auth** | Length-prefixed signatures prevent malleability attacks |
 
 ### Protocol Security

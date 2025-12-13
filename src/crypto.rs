@@ -136,17 +136,6 @@ pub fn extract_verified_identity(connection: &quinn::Connection) -> Option<Ident
     Some(Identity::from_bytes(public_key))
 }
 
-/// Verifies that a certificate's public key matches the expected identity.
-/// Used for peer certificate validation.
-#[allow(dead_code)] // Library public API
-pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bool {
-    if let Some(public_key) = extract_public_key_from_cert(cert_der) {
-        crate::identity::verify_identity(expected_identity, &public_key)
-    } else {
-        false
-    }
-}
-
 #[derive(Debug)]
 struct Ed25519ClientCertVerifier;
 
@@ -341,21 +330,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_identity_accepts_matching_cert() {
+    fn identity_matches_public_key() {
         for _ in 0..50 {
             let keypair = Keypair::generate();
             let identity = keypair.identity();
             let public_key = keypair.public_key_bytes();
             
-            assert!(
-                crate::identity::verify_identity(&identity, &public_key),
-                "P3 violation: verify_identity rejected matching public key"
+            assert_eq!(
+                *identity.as_bytes(), public_key,
+                "P3 violation: Identity does not match public key"
             );
         }
     }
 
     #[test]
-    fn verify_identity_rejects_mismatched_cert() {
+    fn identity_rejects_mismatched_public_key() {
         for _ in 0..50 {
             let keypair1 = Keypair::generate();
             let keypair2 = Keypair::generate();
@@ -363,9 +352,9 @@ mod tests {
             let identity1 = keypair1.identity();
             let public_key2 = keypair2.public_key_bytes();
             
-            assert!(
-                !crate::identity::verify_identity(&identity1, &public_key2),
-                "P3 violation: verify_identity accepted mismatched public key"
+            assert_ne!(
+                *identity1.as_bytes(), public_key2,
+                "P3 violation: Identity incorrectly matched wrong public key"
             );
         }
     }
@@ -382,8 +371,8 @@ mod tests {
             let cert_pk = extract_public_key_from_cert(certs[0].as_ref())
                 .expect("pk extraction must succeed");
             
-            assert!(
-                crate::identity::verify_identity(&identity, &cert_pk),
+            assert_eq!(
+                *identity.as_bytes(), cert_pk,
                 "P4 violation: Identity not bound to keypair via certificate"
             );
         }
@@ -408,19 +397,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_peer_identity_function() {
-        let keypair = Keypair::generate();
-        let (certs, _) = generate_ed25519_cert(&keypair)
-            .expect("cert generation must succeed");
-        
-        let identity = keypair.identity();
-        
-        // Test the verify_peer_identity function
-        assert!(verify_peer_identity(certs[0].as_ref(), &identity));
-        
-        // Test with wrong identity
-        let wrong_id = Identity::from_bytes([0xFFu8; 32]);
-        assert!(!verify_peer_identity(certs[0].as_ref(), &wrong_id));
-    }
 }
