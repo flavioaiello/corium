@@ -20,10 +20,8 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
-// ============================================================================
-// Connection Handling
-// ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
     node: Dht<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
@@ -47,7 +45,6 @@ async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send
     }
     let verified_identity = verified_identity.unwrap();
 
-    // Register inbound peer with SmartSock for path multiplexing
     if let Some(ss) = &smartsock {
         ss.register_peer(verified_identity, vec![remote]).await;
         debug!(
@@ -228,9 +225,6 @@ async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync
     }
 }
 
-// ============================================================================
-// DHT Request Handler
-// ============================================================================
 
 async fn handle_dht_request<N: DhtRpc>(
     node: Dht<N>,
@@ -294,9 +288,6 @@ async fn handle_dht_request<N: DhtRpc>(
     }
 }
 
-// ============================================================================
-// PlumTree Request Handler
-// ============================================================================
 
 async fn handle_plumtree_request(
     from: Identity,
@@ -340,7 +331,6 @@ async fn handle_hyparview_request<N: HyParViewRpc + Send + Sync + 'static>(
         "handling HyParView request"
     );
     
-    // Process the message through HyParView - it handles events internally
     hyparview.handle_message(from, message).await;
     
     RpcResponse::HyParViewAck
@@ -391,7 +381,6 @@ impl Node {
             .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
-        // Start the path probing loop for automatic path switching
         let _probe_handle = smartsock.spawn_probe_loop();
         debug!("SmartSock probe loop started");
         
@@ -432,7 +421,6 @@ impl Node {
             }
         };
         
-        // Create HyParView membership manager
         let hyparview = Arc::new(
             HyParView::new(identity, HyParViewConfig::default(), Arc::new(network.clone()))
         );
@@ -442,7 +430,6 @@ impl Node {
             let receiver = plumtree.take_message_receiver();
             let plumtree = Arc::new(plumtree);
             
-            // Connect HyParView neighbor events to PlumTree
             hyparview.set_neighbor_callback(plumtree.clone()).await;
             
             (
@@ -453,7 +440,6 @@ impl Node {
             (None, None)
         };
         
-        // Start HyParView shuffle loop
         hyparview.spawn_shuffle_loop();
         
         let server_handle = {
@@ -540,12 +526,10 @@ impl Node {
         &self.keypair
     }
     
-    /// Returns this node's endpoint information (identity + addresses).
     pub fn peer_endpoint(&self) -> &Contact {
         &self.contact
     }
     
-    /// Returns the underlying QUIC endpoint.
     pub fn quic_endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -587,7 +571,6 @@ impl Node {
         let forwarder_addr = self.udp_forwarder_addr?;
         let local_addr = self.endpoint.local_addr().ok()?;
         
-        // Prefer public address if detected, otherwise use local
         let relay_addr = self.network.public_addr().await
             .map(|public| SocketAddr::new(public.ip(), forwarder_addr.port()))
             .unwrap_or(forwarder_addr);
@@ -607,9 +590,7 @@ impl Node {
         self.dht.iterative_find_node(target).await
     }
     
-    /// Add a peer to this node's routing table.
     pub async fn add_peer(&self, endpoint: Contact) {
-        // Cache contact for HyParView resolution
         self.network.cache_contact(&endpoint).await;
         self.dht.observe_contact(endpoint).await
     }
@@ -628,7 +609,6 @@ impl Node {
             addrs: vec![],
         };
         
-        // Cache contact for HyParView resolution
         self.network.cache_contact(&contact).await;
         self.dht.observe_contact(contact.clone()).await;
         
@@ -669,7 +649,6 @@ impl Node {
         }
         let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        // Resolve the peer's endpoint record from DHT
         let record = self.dht.resolve_peer(&peer_identity).await?
             .context("peer not found in DHT")?;
         
@@ -680,7 +659,6 @@ impl Node {
             "resolved peer endpoint, attempting smart_connect"
         );
         
-        // Use smart_connect which handles direct + relay fallback
         let conn = self.network.smart_connect(&record).await?;
         Ok(conn)
     }

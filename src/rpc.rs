@@ -19,9 +19,6 @@ use crate::dht::Key;
 use crate::identity::{EndpointRecord, Identity};
 use crate::hyparview::HyParViewMessage;
 
-// ============================================================================
-// DHT RPC Trait
-// ============================================================================
 
 #[async_trait]
 pub trait DhtRpc: Send + Sync + 'static {
@@ -34,9 +31,6 @@ pub trait DhtRpc: Send + Sync + 'static {
     async fn ping(&self, to: &Contact) -> Result<()>;
 }
 
-// ============================================================================
-// PlumTree RPC Trait
-// ============================================================================
 
 #[async_trait]
 #[allow(dead_code)]
@@ -56,14 +50,9 @@ pub trait PlumTreeRpc: Send + Sync {
         Ok(())
     }
     
-    /// Resolve an identity to a contact for message delivery.
-    /// Returns None if the identity is not in the contact cache.
     async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact>;
 }
 
-// ============================================================================
-// HyParView RPC Trait
-// ============================================================================
 
 #[async_trait]
 #[allow(dead_code)]
@@ -76,9 +65,6 @@ pub trait HyParViewRpc: Send + Sync {
     ) -> Result<()>;
 }
 
-// ============================================================================
-// Relay RPC Trait
-// ============================================================================
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
@@ -96,9 +82,6 @@ pub trait RelayRpc: Send + Sync {
     async fn join_relay(&self, relay: &Contact, session_id: [u8; 16]) -> Result<RelaySession>;
 }
 
-// ============================================================================
-// RPC Constants
-// ============================================================================
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
@@ -110,10 +93,9 @@ const MAX_CACHED_CONNECTIONS: usize = 1000;
 
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 
+const RPC_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
-// ============================================================================
-// CachedConnection - Minimal connection wrapper with staleness tracking
-// ============================================================================
+
 
 #[derive(Clone)]
 struct CachedConnection {
@@ -150,9 +132,6 @@ impl CachedConnection {
     }
 }
 
-// ============================================================================
-// RpcNode - RPC layer for DHT peer communication
-// ============================================================================
 
 #[derive(Clone)]
 pub struct RpcNode {
@@ -203,7 +182,6 @@ impl RpcNode {
         cache.get(identity).cloned()
     }
 
-    /// Cache a contact for later resolution (e.g., for HyParView).
     pub async fn cache_contact(&self, contact: &Contact) {
         let mut cache = self.contact_cache.write().await;
         cache.put(contact.identity, contact.clone());
@@ -285,7 +263,6 @@ impl RpcNode {
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
         let peer_id = contact.identity;
         
-        // First check if we have a usable cached connection
         {
             let mut cache = self.connections.write().await;
             if let Some(cached) = cache.get_mut(&peer_id) {
@@ -295,28 +272,21 @@ impl RpcNode {
                         "cached connection is closed, removing"
                     );
                     cache.pop(&peer_id);
-                }
-                else if !cached.is_stale() {
+                } else if !cached.is_stale() {
                     return Ok(cached.connection.clone());
-                }
-                else {
-                    if cached.check_health_passive() {
-                        cached.mark_success();
-                        return Ok(cached.connection.clone());
-                    } else {
-                        debug!(
-                            peer = hex::encode(&peer_id.as_bytes()[..8]),
-                            "stale connection failed passive health check, removing"
-                        );
-                        cache.pop(&peer_id);
-                    }
+                } else if cached.check_health_passive() {
+                    cached.mark_success();
+                    return Ok(cached.connection.clone());
+                } else {
+                    debug!(
+                        peer = hex::encode(&peer_id.as_bytes()[..8]),
+                        "stale connection failed passive health check, removing"
+                    );
+                    cache.pop(&peer_id);
                 }
             }
         }
         
-        // Check if another task is already connecting to this peer
-        // This prevents duplicate connection attempts under concurrency
-        // Use a retry loop to wait for the other task to complete
         const MAX_WAIT_RETRIES: usize = 10;
         const WAIT_INTERVAL_MS: u64 = 50;
         
@@ -324,21 +294,17 @@ impl RpcNode {
             {
                 let mut in_flight = self.in_flight.lock().await;
                 if !in_flight.contains(&peer_id) {
-                    // No other task is connecting, we'll do it
                     in_flight.insert(peer_id);
                     break;
                 }
-                // Another task is connecting, drop lock and wait
             }
             
             if retry == MAX_WAIT_RETRIES {
-                // Timed out waiting for other task, give up and return error
                 anyhow::bail!("timed out waiting for concurrent connection to peer");
             }
             
             tokio::time::sleep(std::time::Duration::from_millis(WAIT_INTERVAL_MS)).await;
             
-            // Check if connection appeared in cache while we waited
             let cache = self.connections.read().await;
             if let Some(cached) = cache.peek(&peer_id) {
                 if !cached.is_closed() {
@@ -347,10 +313,8 @@ impl RpcNode {
             }
         }
         
-        // We hold the in_flight marker, connect outside of any locks
         let result = self.connect(contact).await;
         
-        // Always remove from in_flight, even on error
         {
             let mut in_flight = self.in_flight.lock().await;
             in_flight.remove(&peer_id);
@@ -358,7 +322,6 @@ impl RpcNode {
         
         let conn = result?;
         
-        // Cache the new connection
         {
             let mut cache = self.connections.write().await;
             cache.put(peer_id, CachedConnection::new(conn.clone()));
@@ -434,37 +397,42 @@ impl RpcNode {
     }
 
     async fn rpc_inner(&self, conn: &Connection, contact: &Contact, request: RpcRequest) -> Result<RpcResponse> {
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .context("failed to open bidirectional stream")?;
+        tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .context("failed to open bidirectional stream")?;
 
-        let request_bytes = messages::serialize_request(&request).context("failed to serialize request")?;
-        let len = request_bytes.len() as u32;
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&request_bytes).await?;
-        send.finish()?;
+            let request_bytes = messages::serialize_request(&request)
+                .context("failed to serialize request")?;
+            let len = request_bytes.len() as u32;
+            send.write_all(&len.to_be_bytes()).await?;
+            send.write_all(&request_bytes).await?;
+            send.finish()?;
 
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
 
-        if len > MAX_RESPONSE_SIZE {
-            warn!(
-                peer = %contact.addr,
-                size = len,
-                max = MAX_RESPONSE_SIZE,
-                "peer sent oversized response"
-            );
-            anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
-        }
+            if len > MAX_RESPONSE_SIZE {
+                warn!(
+                    peer = %contact.addr,
+                    size = len,
+                    max = MAX_RESPONSE_SIZE,
+                    "peer sent oversized response"
+                );
+                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+            }
 
-        let mut response_bytes = vec![0u8; len];
-        recv.read_exact(&mut response_bytes).await?;
+            let mut response_bytes = vec![0u8; len];
+            recv.read_exact(&mut response_bytes).await?;
 
-        let response: RpcResponse =
-            messages::deserialize_response(&response_bytes).context("failed to deserialize response")?;
-        Ok(response)
+            let response: RpcResponse = messages::deserialize_response(&response_bytes)
+                .context("failed to deserialize response")?;
+            Ok(response)
+        })
+        .await
+        .context("RPC timed out")?
     }
 
     pub async fn what_is_my_addr(&self, contact: &Contact) -> Result<SocketAddr> {
@@ -656,81 +624,91 @@ impl RpcNode {
 
     #[allow(dead_code)] // Used by smart_connect relay path
     async fn send_rpc(&self, conn: &Connection, request: DhtRequest) -> Result<DhtResponse> {
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .context("failed to open bidirectional stream")?;
+        tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .context("failed to open bidirectional stream")?;
 
-        let rpc_request = RpcRequest::Dht(request);
-        let request_bytes = messages::serialize_request(&rpc_request).context("failed to serialize request")?;
-        let len = request_bytes.len() as u32;
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&request_bytes).await?;
-        send.finish()?;
+            let rpc_request = RpcRequest::Dht(request);
+            let request_bytes = messages::serialize_request(&rpc_request)
+                .context("failed to serialize request")?;
+            let len = request_bytes.len() as u32;
+            send.write_all(&len.to_be_bytes()).await?;
+            send.write_all(&request_bytes).await?;
+            send.finish()?;
 
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
 
-        if len > MAX_RESPONSE_SIZE {
-            warn!(
-                size = len,
-                max = MAX_RESPONSE_SIZE,
-                "peer sent oversized response on existing connection"
-            );
-            anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
-        }
+            if len > MAX_RESPONSE_SIZE {
+                warn!(
+                    size = len,
+                    max = MAX_RESPONSE_SIZE,
+                    "peer sent oversized response on existing connection"
+                );
+                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+            }
 
-        let mut response_bytes = vec![0u8; len];
-        recv.read_exact(&mut response_bytes).await?;
+            let mut response_bytes = vec![0u8; len];
+            recv.read_exact(&mut response_bytes).await?;
 
-        let rpc_response: RpcResponse =
-            messages::deserialize_response(&response_bytes).context("failed to deserialize response")?;
-        
-        match rpc_response {
-            RpcResponse::Dht(dht_response) => Ok(dht_response),
-            RpcResponse::Error { message } => anyhow::bail!("RPC error: {}", message),
-            other => anyhow::bail!("unexpected response type: {:?}", other),
-        }
+            let rpc_response: RpcResponse = messages::deserialize_response(&response_bytes)
+                .context("failed to deserialize response")?;
+            
+            match rpc_response {
+                RpcResponse::Dht(dht_response) => Ok(dht_response),
+                RpcResponse::Error { message } => anyhow::bail!("RPC error: {}", message),
+                other => anyhow::bail!("unexpected response type: {:?}", other),
+            }
+        })
+        .await
+        .context("RPC timed out")?
     }
 
     async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .context("failed to open bidirectional stream")?;
+        tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .context("failed to open bidirectional stream")?;
 
-        let rpc_request = RpcRequest::Relay(request);
-        let request_bytes = messages::serialize_request(&rpc_request).context("failed to serialize request")?;
-        let len = request_bytes.len() as u32;
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&request_bytes).await?;
-        send.finish()?;
+            let rpc_request = RpcRequest::Relay(request);
+            let request_bytes = messages::serialize_request(&rpc_request)
+                .context("failed to serialize request")?;
+            let len = request_bytes.len() as u32;
+            send.write_all(&len.to_be_bytes()).await?;
+            send.write_all(&request_bytes).await?;
+            send.finish()?;
 
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
 
-        if len > MAX_RESPONSE_SIZE {
-            warn!(
-                size = len,
-                max = MAX_RESPONSE_SIZE,
-                "peer sent oversized response on existing connection"
-            );
-            anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
-        }
+            if len > MAX_RESPONSE_SIZE {
+                warn!(
+                    size = len,
+                    max = MAX_RESPONSE_SIZE,
+                    "peer sent oversized response on existing connection"
+                );
+                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
+            }
 
-        let mut response_bytes = vec![0u8; len];
-        recv.read_exact(&mut response_bytes).await?;
+            let mut response_bytes = vec![0u8; len];
+            recv.read_exact(&mut response_bytes).await?;
 
-        let rpc_response: RpcResponse =
-            messages::deserialize_response(&response_bytes).context("failed to deserialize response")?;
-        
-        match rpc_response {
-            RpcResponse::Relay(relay_response) => Ok(relay_response),
-            RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
-            other => anyhow::bail!("unexpected response type for Relay: {:?}", other),
-        }
+            let rpc_response: RpcResponse = messages::deserialize_response(&response_bytes)
+                .context("failed to deserialize response")?;
+            
+            match rpc_response {
+                RpcResponse::Relay(relay_response) => Ok(relay_response),
+                RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
+                other => anyhow::bail!("unexpected response type for Relay: {:?}", other),
+            }
+        })
+        .await
+        .context("RPC timed out")?
     }
 }
 
@@ -819,9 +797,6 @@ impl DhtRpc for RpcNode {
     }
 }
 
-// ============================================================================
-// PlumTreeRpc - PlumTree message delivery
-// ============================================================================
 
 #[async_trait]
 impl PlumTreeRpc for RpcNode {
@@ -835,7 +810,6 @@ impl PlumTreeRpc for RpcNode {
     }
 
     async fn send_plumtree_batch(&self, to: &Contact, from: Identity, messages: Vec<PlumTreeMessage>) -> Result<()> {
-        // For now, send sequentially. Could be optimized with a batch RPC later.
         for msg in messages {
             self.send_plumtree(to, from, msg).await?;
         }
@@ -848,14 +822,10 @@ impl PlumTreeRpc for RpcNode {
     }
 }
 
-// ============================================================================
-// HyParViewRpc - HyParView message delivery
-// ============================================================================
 
 #[async_trait]
 impl HyParViewRpc for RpcNode {
     async fn send_hyparview(&self, to: &Identity, from: Identity, message: HyParViewMessage) -> Result<()> {
-        // Look up the contact for this identity
         let contact = self.resolve_identity_to_contact(to).await
             .context("could not resolve identity to contact for HyParView message")?;
         
@@ -868,9 +838,6 @@ impl HyParViewRpc for RpcNode {
     }
 }
 
-// ============================================================================
-// RelayRpc - Relay connection establishment
-// ============================================================================
 
 #[async_trait]
 impl RelayRpc for RpcNode {
@@ -934,7 +901,6 @@ impl RelayRpc for RpcNode {
         let our_peer_id = self.our_peer_id.as_ref()
             .context("cannot use relay without our_peer_id set")?;
         
-        // When joining, we use a placeholder target - the relay will match by session_id
         let request = RelayRequest::Connect {
             from_peer: *our_peer_id,
             target_peer: *our_peer_id, // Placeholder, relay matches by session_id

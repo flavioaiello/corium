@@ -7,9 +7,6 @@ use tokio::time::{Duration, Instant};
 use crate::dht::{distance_cmp, xor_distance};
 use crate::identity::Identity;
 
-// ============================================================================
-// ROUTING CONSTANTS
-// ============================================================================
 
 pub(crate) const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -23,9 +20,6 @@ const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
 
 use crate::transport::Contact;
 
-// ============================================================================
-// ROUTING INSERTION LIMITER
-// ============================================================================
 
 #[derive(Debug, Clone, Copy)]
 struct RoutingInsertionBucket {
@@ -87,9 +81,6 @@ impl RoutingInsertionLimiter {
     }
 }
 
-// ============================================================================
-// BUCKET
-// ============================================================================
 
 #[derive(Debug, Clone)]
 struct Bucket {
@@ -182,9 +173,6 @@ impl Bucket {
     }
 }
 
-// ============================================================================
-// BUCKET INDEX FUNCTIONS
-// ============================================================================
 
 pub(crate) fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
     let dist = xor_distance(self_id, other);
@@ -227,9 +215,6 @@ pub(crate) fn random_id_for_bucket(self_id: &Identity, bucket_idx: usize) -> Ide
     Identity::from_bytes(target)
 }
 
-// ============================================================================
-// ROUTING TABLE
-// ============================================================================
 
 #[derive(Debug)]
 pub struct RoutingTable {
@@ -374,9 +359,6 @@ impl RoutingTable {
     }
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

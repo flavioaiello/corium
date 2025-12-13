@@ -128,9 +128,6 @@ pub fn extract_public_key_from_cert(cert_der: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
-/// Extract the verified peer identity from a QUIC connection's TLS certificate.
-///
-/// Returns `None` if the peer identity cannot be verified (no cert, invalid format, etc.).
 pub fn extract_verified_identity(connection: &quinn::Connection) -> Option<Identity> {
     let peer_identity = connection.peer_identity()?;
     let certs: &Vec<rustls::pki_types::CertificateDer> = peer_identity.downcast_ref()?;
@@ -162,14 +159,11 @@ impl rustls::server::danger::ClientCertVerifier for Ed25519ClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        // Validate that the certificate contains a valid Ed25519 public key
-        // The actual identity verification happens after connection via extract_verified_identity
         let public_key = extract_public_key_from_cert(end_entity.as_ref())
             .ok_or(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::BadEncoding,
             ))?;
         
-        // Verify the public key is a valid Ed25519 key (32 bytes, not all zeros/ones)
         let identity = Identity::from_bytes(public_key);
         if !identity.is_valid() {
             return Err(rustls::Error::InvalidCertificate(

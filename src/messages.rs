@@ -7,31 +7,22 @@ use crate::identity::Identity;
 use crate::transport::Contact;
 use crate::hyparview::HyParViewMessage;
 
-// ============================================================================
-// Constants
-// ============================================================================
 
 pub const MAX_VALUE_SIZE: usize = 1024 * 1024;
 
 pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
 
-/// Maximum request size - used by node.rs for request validation
 #[allow(dead_code)]
 pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 
-/// Maximum response size - used by rpc.rs for response validation  
 #[allow(dead_code)]
 pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
-// ============================================================================
-// Serialization Helpers
-// ============================================================================
 
 fn bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(MAX_DESERIALIZE_SIZE)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
+    .with_fixint_encoding()
 }
 
 pub fn deserialize_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
@@ -43,22 +34,18 @@ pub fn serialize_request(request: &RpcRequest) -> Result<Vec<u8>, bincode::Error
 }
 
 pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
-    bincode::deserialize(data)
+    bincode_options().deserialize(data)
 }
 
-/// Serialize an RPC response for transmission
 #[allow(dead_code)]
 pub fn serialize_response(response: &RpcResponse) -> Result<Vec<u8>, bincode::Error> {
     bincode::serialize(response)
 }
 
 pub fn deserialize_response(data: &[u8]) -> Result<RpcResponse, bincode::Error> {
-    bincode::deserialize(data)
+    bincode_options().deserialize(data)
 }
 
-// ============================================================================
-// DHT Messages
-// ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DhtRequest {
@@ -109,13 +96,9 @@ pub enum DhtResponse {
     },
 }
 
-// ============================================================================
-// Relay Messages
-// ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RelayRequest {
-    /// Request to establish a relay session
     Connect {
         from_peer: Identity,
         target_peer: Identity,
@@ -133,25 +116,19 @@ impl RelayRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RelayResponse {
-    /// Session registered, waiting for peer B
     Accepted {
         session_id: [u8; 16],
         relay_data_addr: String,
     },
-    /// Session established, both peers connected
     Connected {
         session_id: [u8; 16],
         relay_data_addr: String,
     },
-    /// Session rejected
     Rejected {
         reason: String,
     },
 }
 
-// ============================================================================
-// PlumTree Messages
-// ============================================================================
 
 pub type MessageId = [u8; 32];
 
@@ -202,35 +179,21 @@ impl PlumTreeMessage {
     }
 }
 
-// ============================================================================
-// Public Message Type
-// ============================================================================
 
-/// A message received from the PlumTree network.
-///
-/// This is the user-facing message type with hex-encoded identity.
 #[derive(Clone, Debug)]
 pub struct Message {
-    /// The topic the message was published to
     pub topic: String,
-    /// Hex-encoded identity of the sender
     pub from: String,
-    /// The message payload
     pub data: Vec<u8>,
 }
 
-// ============================================================================
-// RPC Envelope
-// ============================================================================
 
-/// PlumTree protocol request (gossip-style, fire-and-forget)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlumTreeRequest {
     pub from: Identity,
     pub message: PlumTreeMessage,
 }
 
-/// HyParView protocol request (gossip-style, fire-and-forget)  
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyParViewRequest {
     pub from: Identity,
@@ -239,13 +202,9 @@ pub struct HyParViewRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {
-    /// DHT operations (request/response pattern)
     Dht(DhtRequest),
-    /// Relay session management (request/response pattern)
     Relay(RelayRequest),
-    /// PlumTree gossip messages (fire-and-forget)
     PlumTree(PlumTreeRequest),
-    /// HyParView membership messages (fire-and-forget)
     HyParView(HyParViewRequest),
 }
 
@@ -273,9 +232,6 @@ pub enum RpcResponse {
     Error { message: String },
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -319,9 +275,6 @@ mod tests {
         Contact { identity: test_identity(), addr: "127.0.0.1:4433".to_string(), addrs: vec![] }
     }
 
-    // ========================================================================
-    // DHT Message Tests
-    // ========================================================================
 
     #[test]
     fn bounded_deserialization_normal_payloads() {
@@ -385,7 +338,6 @@ mod tests {
             let _ = format!("{:?}", decoded);
         }
         
-        // Test RelayRequest serialization separately
         let relay_request = RelayRequest::Connect {
             from_peer: identity,
             target_peer: identity,
@@ -454,9 +406,6 @@ mod tests {
         assert_ne!(hash1, hash3);
     }
 
-    // ========================================================================
-    // PlumTree Message Tests
-    // ========================================================================
 
     #[test]
     fn plumtree_message_variants() {
@@ -518,9 +467,6 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // RPC Envelope Tests
-    // ========================================================================
 
     #[test]
     fn round_trip_dht_ping() {

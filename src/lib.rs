@@ -10,6 +10,5 @@ mod routing;
 mod rpc;
 mod transport;
 
-// Public API - Node is the facade for all operations
 pub use node::Node;
 

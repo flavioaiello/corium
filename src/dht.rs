@@ -17,9 +17,6 @@ use crate::routing::{
 use crate::transport::Contact;
 use crate::rpc::DhtRpc;
 
-// ============================================================================
-// HASH MODULE
-// ============================================================================
 
 pub type Key = [u8; 32];
 
@@ -71,9 +68,6 @@ pub(crate) fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-// ============================================================================
-// PARAMS MODULE
-// ============================================================================
 
 const QUERY_STATS_WINDOW: usize = 100;
 
@@ -152,9 +146,6 @@ pub struct TelemetrySnapshot {
     pub concurrency: usize,
 }
 
-// ============================================================================
-// STORAGE MODULE
-// ============================================================================
 
 pub(crate) const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -581,9 +572,6 @@ impl LocalStore {
     }
 }
 
-// ============================================================================
-// TIERING MODULE
-// ============================================================================
 
 const TIERING_RECOMPUTE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -962,9 +950,6 @@ fn nearest_center_scalar(value: f32, centers: &[f32]) -> usize {
     best_idx
 }
 
-// ============================================================================
-// DHT MAIN STRUCT
-// ============================================================================
 
 pub const DEFAULT_K: usize = 20;
 pub const DEFAULT_ALPHA: usize = 3;
@@ -2119,7 +2104,7 @@ mod tests {
         let snapshot = main.node.telemetry_snapshot().await;
 
         assert!(
-            snapshot.tier_centroids.len() >= 1,
+            !snapshot.tier_centroids.is_empty(),
             "should have at least one tier"
         );
 
@@ -2382,9 +2367,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // HASH MODULE TESTS
-    // ========================================================================
 
     #[test]
     fn hash_content_is_deterministic() {

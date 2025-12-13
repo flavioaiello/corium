@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::transport::Contact;
 
-/// Returns the current time in milliseconds since UNIX epoch.
 #[inline]
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -136,13 +135,13 @@ impl Identity {
     #[inline]
     pub fn xor_distance(&self, other: &Identity) -> [u8; 32] {
         let mut out = [0u8; 32];
-        for i in 0..32 {
-            out[i] = self.0[i] ^ other.0[i];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = self.0[i] ^ other.0[i];
         }
         out
     }
 
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
 
@@ -255,7 +254,6 @@ impl EndpointRecord {
         
         let max_age_ms = max_age_secs * 1000;
         
-        // Allow 10 second future tolerance for clock skew (reduced from 60s for security)
         const FUTURE_TOLERANCE_MS: u64 = 10_000;
         if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
@@ -308,7 +306,6 @@ impl EndpointRecord {
                 return false;
             }
 
-            // Ensure additional addresses are non-empty and not duplicated.
             {
                 use std::collections::HashSet;
                 let mut seen = HashSet::new();
@@ -557,8 +554,8 @@ mod tests {
             let b = Keypair::generate().identity();
             
             let mut expected = [0u8; 32];
-            for i in 0..32 {
-                expected[i] = a.as_bytes()[i] ^ b.as_bytes()[i];
+            for (i, byte) in expected.iter_mut().enumerate() {
+                *byte = a.as_bytes()[i] ^ b.as_bytes()[i];
             }
             
             assert_eq!(

@@ -18,19 +18,7 @@ use tracing::{debug, info, trace, warn};
 use crate::identity::Identity;
 use crate::messages::{RelayRequest, RelayResponse};
 
-// ============================================================================
-// ENDPOINT
-// ============================================================================
 
-/// Unified peer endpoint.
-///
-/// - `identity` is the cryptographic node identity.
-/// - `addr` is the primary socket address (string form).
-/// - `addrs` are additional candidate addresses (string form). These MUST NOT
-///   include `addr`.
-///
-/// Equality and hashing are identity-only to avoid unbounded growth when a
-/// peer's addresses churn.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Contact {
     pub identity: Identity,
@@ -67,9 +55,6 @@ impl Hash for Contact {
     }
 }
 
-// ============================================================================
-// CONSTANTS
-// ============================================================================
 
 pub const RELAY_MAGIC: [u8; 4] = *b"CRLY";
 pub const RELAY_HEADER_SIZE: usize = 20;
@@ -93,9 +78,6 @@ const RELAY_RTT_ADVANTAGE_MS: f32 = 50.0;
 const RTT_EMA_OLD: f32 = 0.8;
 const RTT_EMA_NEW: f32 = 0.2;
 
-// ============================================================================
-// RELAY TYPES
-// ============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NatType {
@@ -226,22 +208,29 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 #[allow(dead_code)] // Relay infrastructure - session tracking
 pub struct ForwarderSession {
     pub session_id: [u8; 16],
+    pub peer_a_identity: Identity,
+    pub peer_b_identity: Identity,
     pub peer_a_addr: SocketAddr,
     pub peer_b_addr: Option<SocketAddr>,
     pub created_at: Instant,
     pub last_activity: Instant,
     pub bytes_forwarded: u64,
     pub packets_forwarded: u64,
-    /// Flag to prevent race condition in session completion.
-    /// Once set to true via complete_session(), process_packet cannot auto-complete.
     pub completion_locked: bool,
 }
 
 impl ForwarderSession {
-    pub fn new_pending(session_id: [u8; 16], peer_a_addr: SocketAddr) -> Self {
+    pub fn new_pending(
+        session_id: [u8; 16],
+        peer_a_identity: Identity,
+        peer_b_identity: Identity,
+        peer_a_addr: SocketAddr,
+    ) -> Self {
         let now = Instant::now();
         Self {
             session_id,
+            peer_a_identity,
+            peer_b_identity,
             peer_a_addr,
             peer_b_addr: None,
             created_at: now,
@@ -260,7 +249,6 @@ impl ForwarderSession {
         if self.is_complete() {
             self.last_activity.elapsed() > SESSION_TIMEOUT
         } else {
-            // Pending sessions expire faster to prevent exhaustion attacks
             self.last_activity.elapsed() > PENDING_SESSION_TIMEOUT
         }
     }
@@ -318,6 +306,8 @@ impl UdpRelayForwarder {
         &self,
         session_id: [u8; 16],
         peer_a_addr: SocketAddr,
+        peer_a_identity: Identity,
+        peer_b_identity: Identity,
     ) -> Result<(), &'static str> {
         let mut sessions = self.sessions.write().await;
         
@@ -329,7 +319,12 @@ impl UdpRelayForwarder {
             return Err("session already exists");
         }
         
-        let session = ForwarderSession::new_pending(session_id, peer_a_addr);
+        let session = ForwarderSession::new_pending(
+            session_id,
+            peer_a_identity,
+            peer_b_identity,
+            peer_a_addr,
+        );
         sessions.insert(session_id, session);
         
         let mut addr_map = self.addr_to_session.write().await;
@@ -348,17 +343,22 @@ impl UdpRelayForwarder {
         &self,
         session_id: [u8; 16],
         peer_b_addr: SocketAddr,
+        from_peer: Identity,
+        target_peer: Identity,
     ) -> Result<(), &'static str> {
         let mut sessions = self.sessions.write().await;
         
         let session = sessions.get_mut(&session_id)
             .ok_or("session not found")?;
+
+        if session.peer_b_identity != from_peer || session.peer_a_identity != target_peer {
+            return Err("peer identity mismatch");
+        }
         
         if session.peer_b_addr.is_some() {
             return Err("session already complete");
         }
         
-        // Lock completion to prevent race with process_packet auto-completion
         session.completion_locked = true;
         session.peer_b_addr = Some(peer_b_addr);
         session.last_activity = Instant::now();
@@ -434,7 +434,7 @@ impl UdpRelayForwarder {
             return 0;
         }
         
-        if &data[0..4] != &RELAY_MAGIC {
+        if data[0..4] != RELAY_MAGIC {
             trace!(from = %from, "dropping non-CRLY packet");
             return 0;
         }
@@ -457,18 +457,20 @@ impl UdpRelayForwarder {
                 }
             };
             
-            // Only auto-complete if not already locked by complete_session RPC
-            if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
+            if !session.is_complete() && session.completion_locked && from != session.peer_a_addr {
                 session.peer_b_addr = Some(from);
                 session.completion_locked = true;
+
+                let dest = session.get_destination(from);
+                if dest.is_some() {
+                    session.record_forward(data.len());
+                }
                 
                 drop(sessions);
                 let mut addr_map = self.addr_to_session.write().await;
                 addr_map.insert(from, session_id);
-                
-                let sessions = self.sessions.read().await;
-                let session = sessions.get(&session_id).unwrap();
-                session.get_destination(from)
+
+                dest
             } else {
                 let dest = session.get_destination(from);
                 if dest.is_some() {
@@ -543,10 +545,6 @@ impl UdpRelayForwarder {
     }
 }
 
-/// Handle an incoming relay request.
-/// 
-/// This function processes `RelayRequest::Connect` messages, managing session
-/// registration and completion on the `UdpRelayForwarder`.
 pub async fn handle_relay_request(
     request: RelayRequest,
     remote_addr: SocketAddr,
@@ -591,7 +589,10 @@ pub async fn handle_relay_request(
                 };
             }
 
-            match forwarder.register_session(session_id, remote_addr).await {
+            match forwarder
+                .register_session(session_id, remote_addr, from_peer, target_peer)
+                .await
+            {
                 Ok(()) => {
                     debug!(
                         session = hex::encode(session_id),
@@ -604,7 +605,10 @@ pub async fn handle_relay_request(
                     }
                 }
                 Err("session already exists") => {
-                    match forwarder.complete_session(session_id, remote_addr).await {
+                    match forwarder
+                        .complete_session(session_id, remote_addr, from_peer, target_peer)
+                        .await
+                    {
                         Ok(()) => {
                             debug!(
                                 session = hex::encode(session_id),
@@ -643,9 +647,6 @@ pub async fn handle_relay_request(
     }
 }
 
-// ============================================================================
-// SMARTSOCK TYPES
-// ============================================================================
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Relay infrastructure - tunnel tracking
@@ -723,7 +724,7 @@ impl PathProbeRequest {
         if data.len() < PROBE_HEADER_SIZE {
             return None;
         }
-        if &data[0..4] != &PROBE_MAGIC || data[4] != PROBE_TYPE_REQUEST {
+        if data[0..4] != PROBE_MAGIC || data[4] != PROBE_TYPE_REQUEST {
             return None;
         }
         Some(Self {
@@ -733,7 +734,7 @@ impl PathProbeRequest {
     }
     
     pub fn is_probe_request(data: &[u8]) -> bool {
-        data.len() >= 5 && &data[0..4] == &PROBE_MAGIC && data[4] == PROBE_TYPE_REQUEST
+        data.len() >= 5 && data[0..4] == PROBE_MAGIC && data[4] == PROBE_TYPE_REQUEST
     }
 }
 
@@ -779,7 +780,7 @@ impl PathProbeResponse {
         if data.len() < PROBE_HEADER_SIZE + 1 {
             return None;
         }
-        if &data[0..4] != &PROBE_MAGIC || data[4] != PROBE_TYPE_RESPONSE {
+        if data[0..4] != PROBE_MAGIC || data[4] != PROBE_TYPE_RESPONSE {
             return None;
         }
         
@@ -807,7 +808,7 @@ impl PathProbeResponse {
     }
     
     pub fn is_probe_response(data: &[u8]) -> bool {
-        data.len() >= 5 && &data[0..4] == &PROBE_MAGIC && data[4] == PROBE_TYPE_RESPONSE
+        data.len() >= 5 && data[0..4] == PROBE_MAGIC && data[4] == PROBE_TYPE_RESPONSE
     }
     
     pub fn rtt_ms(&self) -> f32 {
@@ -982,25 +983,30 @@ pub struct PeerPathState {
     pub last_send: Option<Instant>,
     pub last_recv: Option<Instant>,
     pub candidates: HashMap<SocketAddr, PathCandidateInfo>,
-    /// Maps (tx_id) -> (addr, sent_time). TX IDs are unique per-peer via identity prefix.
     pub pending_probes: HashMap<u64, (SocketAddr, Instant)>,
-    /// Counter portion of probe ID; combined with identity hash for uniqueness.
     next_probe_counter: u64,
-    /// Cached identity hash prefix for probe ID generation.
     identity_probe_prefix: u64,
 }
 
 #[allow(dead_code)] // Path state infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
-        // Use identity hash as prefix to ensure TX IDs are unique across peers
         let identity_hash = blake3::hash(identity.as_bytes());
         let identity_probe_prefix = u64::from_le_bytes(identity_hash.as_bytes()[0..8].try_into().unwrap());
         
-        // Random starting counter for additional entropy
         let mut counter_bytes = [0u8; 8];
-        let _ = getrandom::getrandom(&mut counter_bytes);
-        let next_probe_counter = u64::from_le_bytes(counter_bytes);
+        let next_probe_counter = match getrandom::getrandom(&mut counter_bytes) {
+            Ok(()) => u64::from_le_bytes(counter_bytes),
+            Err(_) => {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let mixed = identity_probe_prefix ^ now_ns ^ (std::process::id() as u64);
+                let h = blake3::hash(&mixed.to_le_bytes());
+                u64::from_le_bytes(h.as_bytes()[0..8].try_into().unwrap())
+            }
+        };
         
         Self {
             identity,
@@ -1016,11 +1022,9 @@ impl PeerPathState {
         }
     }
     
-    /// Generate a unique probe TX ID by combining identity prefix with counter.
     fn next_probe_id(&mut self) -> u64 {
         let counter = self.next_probe_counter;
         self.next_probe_counter = self.next_probe_counter.wrapping_add(1);
-        // XOR prefix with counter to create unique ID that includes peer identity
         self.identity_probe_prefix ^ counter
     }
     
@@ -1049,18 +1053,14 @@ impl PeerPathState {
     }
     
     pub fn add_direct_candidate(&mut self, addr: SocketAddr) {
-        if !self.candidates.contains_key(&addr) {
-            self.candidates.insert(addr, PathCandidateInfo::new_direct(addr));
-        }
+        self.candidates.entry(addr).or_insert_with(|| PathCandidateInfo::new_direct(addr));
         if !self.direct_addrs.contains(&addr) {
             self.direct_addrs.push(addr);
         }
     }
     
     pub fn add_relay_candidate(&mut self, relay_addr: SocketAddr, session_id: [u8; 16]) {
-        if !self.candidates.contains_key(&relay_addr) {
-            self.candidates.insert(relay_addr, PathCandidateInfo::new_relay(relay_addr, session_id));
-        }
+        self.candidates.entry(relay_addr).or_insert_with(|| PathCandidateInfo::new_relay(relay_addr, session_id));
     }
     
     pub fn candidates_needing_probe(&self) -> Vec<SocketAddr> {
@@ -1072,15 +1072,12 @@ impl PeerPathState {
     }
     
     pub fn generate_probe(&mut self, addr: SocketAddr) -> Option<(u64, PathProbeRequest)> {
-        // Check candidate exists first
         if !self.candidates.contains_key(&addr) {
             return None;
         }
         
-        // Generate TX ID before borrowing candidates mutably
         let tx_id = self.next_probe_id();
         
-        // Now get mutable reference and update
         let candidate = self.candidates.get_mut(&addr)?;
         candidate.mark_probed();
         self.pending_probes.insert(tx_id, (addr, Instant::now()));
@@ -1263,14 +1260,12 @@ impl SmartSock {
         {
             let mut peers = self.peers.write().await;
             
-            // Evict oldest peer if at capacity to prevent unbounded growth
             if peers.len() >= MAX_SMARTSOCK_PEERS && !peers.contains_key(&smart_addr) {
                 if let Some(oldest_addr) = peers.iter()
                     .min_by_key(|(_, s)| s.last_recv)
                     .map(|(k, _)| *k)
                 {
                     if let Some(evicted) = peers.remove(&oldest_addr) {
-                        // Also clean up reverse map entries for evicted peer
                         let mut reverse = self.reverse_map.write().await;
                         for addr in &evicted.direct_addrs {
                             reverse.remove(addr);
@@ -1804,10 +1799,19 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
     }
 
+    fn test_identity(seed: u8) -> Identity {
+        Identity::from([seed; 32])
+    }
+
     #[test]
     fn test_forwarder_session_pending() {
         let session_id = [0xAB; 16];
-        let session = ForwarderSession::new_pending(session_id, test_addr(1000));
+        let session = ForwarderSession::new_pending(
+            session_id,
+            test_identity(1),
+            test_identity(2),
+            test_addr(1000),
+        );
         
         assert!(!session.is_complete());
         assert_eq!(session.peer_a_addr.port(), 1000);
@@ -1817,7 +1821,12 @@ mod tests {
     #[test]
     fn test_forwarder_session_destination() {
         let session_id = [0xAB; 16];
-        let mut session = ForwarderSession::new_pending(session_id, test_addr(1000));
+        let mut session = ForwarderSession::new_pending(
+            session_id,
+            test_identity(1),
+            test_identity(2),
+            test_addr(1000),
+        );
         session.peer_b_addr = Some(test_addr(2000));
         
         assert!(session.is_complete());
@@ -1837,11 +1846,20 @@ mod tests {
         let session_id = [0xCD; 16];
         let peer_a = test_addr(3000);
         let peer_b = test_addr(4000);
+
+        let peer_a_id = test_identity(10);
+        let peer_b_id = test_identity(20);
         
-        forwarder.register_session(session_id, peer_a).await.unwrap();
+        forwarder
+            .register_session(session_id, peer_a, peer_a_id, peer_b_id)
+            .await
+            .unwrap();
         assert_eq!(forwarder.session_count().await, 1);
         
-        forwarder.complete_session(session_id, peer_b).await.unwrap();
+        forwarder
+            .complete_session(session_id, peer_b, peer_b_id, peer_a_id)
+            .await
+            .unwrap();
         
         let sessions = forwarder.sessions.read().await;
         let session = sessions.get(&session_id).unwrap();
@@ -1855,7 +1873,10 @@ mod tests {
         let forwarder = UdpRelayForwarder::with_socket(Arc::new(socket));
         
         let session_id = [0xEF; 16];
-        forwarder.register_session(session_id, test_addr(5000)).await.unwrap();
+        forwarder
+            .register_session(session_id, test_addr(5000), test_identity(10), test_identity(20))
+            .await
+            .unwrap();
         assert_eq!(forwarder.session_count().await, 1);
         
         forwarder.remove_session(&session_id).await;

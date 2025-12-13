@@ -1,7 +1,3 @@
-//! Connection rate limiting using token bucket algorithm.
-//!
-//! Provides both global and per-IP rate limiting for incoming connections
-//! to protect against DoS attacks and connection flooding.
 
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
@@ -10,22 +6,13 @@ use std::time::Instant;
 use lru::LruCache;
 use tokio::sync::Mutex;
 
-// ============================================================================
-// Configuration Constants
-// ============================================================================
 
-/// Maximum connections per second across all IPs
 pub const MAX_GLOBAL_CONNECTIONS_PER_SECOND: usize = 100;
 
-/// Maximum connections per second from a single IP
 pub const MAX_CONNECTIONS_PER_IP_PER_SECOND: usize = 20;
 
-/// Maximum number of IPs to track in the LRU cache
 pub const MAX_TRACKED_IPS: usize = 1000;
 
-// ============================================================================
-// Token Bucket Implementation
-// ============================================================================
 
 #[derive(Debug, Clone, Copy)]
 struct TokenBucket {
@@ -57,9 +44,6 @@ impl TokenBucket {
     }
 }
 
-// ============================================================================
-// Rate Limiter
-// ============================================================================
 
 #[derive(Debug)]
 struct RateLimitState {
@@ -67,17 +51,12 @@ struct RateLimitState {
     per_ip: LruCache<IpAddr, TokenBucket>,
 }
 
-/// Connection rate limiter with global and per-IP limits.
-///
-/// Uses token bucket algorithm with automatic refill over time.
-/// Thread-safe via internal mutex.
 #[derive(Debug)]
 pub struct ConnectionRateLimiter {
     state: Mutex<RateLimitState>,
 }
 
 impl ConnectionRateLimiter {
-    /// Create a new rate limiter with default configuration.
     pub fn new() -> Self {
         Self {
             state: Mutex::new(RateLimitState {
@@ -87,13 +66,9 @@ impl ConnectionRateLimiter {
         }
     }
 
-    /// Check if a connection from the given IP should be allowed.
-    ///
-    /// Returns `true` if the connection is allowed, `false` if rate limited.
     pub async fn allow(&self, ip: IpAddr) -> bool {
         let mut state = self.state.lock().await;
 
-        // Check global limit first
         if !state.global.try_consume(
             MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
             MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64,
@@ -101,7 +76,6 @@ impl ConnectionRateLimiter {
             return false;
         }
 
-        // Check per-IP limit
         let ip_bucket = state.per_ip.get_or_insert_mut(ip, || {
             TokenBucket::new(MAX_CONNECTIONS_PER_IP_PER_SECOND)
         });
@@ -110,7 +84,6 @@ impl ConnectionRateLimiter {
             MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
             MAX_CONNECTIONS_PER_IP_PER_SECOND as f64,
         ) {
-            // Refund the global token since we're rejecting
             state.global.tokens = (state.global.tokens + 1.0)
                 .min(MAX_GLOBAL_CONNECTIONS_PER_SECOND as f64);
             return false;
@@ -126,9 +99,6 @@ impl Default for ConnectionRateLimiter {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

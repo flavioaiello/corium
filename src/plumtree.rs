@@ -13,9 +13,6 @@ use crate::identity::{Identity, Keypair};
 use crate::messages::{MessageId, PlumTreeMessage};
 use crate::rpc::PlumTreeRpc;
 
-// ============================================================================
-// PlumTree Configuration Constants
-// ============================================================================
 
 pub const DEFAULT_EAGER_PEERS: usize = 4;
 pub const DEFAULT_LAZY_PEERS: usize = 6;
@@ -90,9 +87,6 @@ impl Default for PlumTreeConfig {
     }
 }
 
-// ============================================================================
-// Signature Types and Functions
-// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureError {
@@ -146,11 +140,7 @@ fn verify_plumtree_signature(
         .map_err(|_| SignatureError::VerificationFailed)
 }
 
-// ============================================================================
-// PlumTree Types
-// ============================================================================
 
-// PlumTree IWant handling
 const MAX_PENDING_IWANTS: usize = 100;
 
 #[derive(Clone, Debug)]
@@ -217,13 +207,11 @@ impl TopicState {
     }
 
     pub fn promote_to_eager(&mut self, peer: Identity) {
-        if self.lazy_peers.remove(&peer) {
+        let was_lazy = self.lazy_peers.remove(&peer);
+        let is_eager = self.eager_peers.contains(&peer);
+        
+        if was_lazy || (!is_eager && self.total_peers() < MAX_PEERS_PER_TOPIC) {
             self.eager_peers.insert(peer);
-        } else if !self.eager_peers.contains(&peer) {
-            // New peer, add as eager
-            if self.total_peers() < MAX_PEERS_PER_TOPIC {
-                self.eager_peers.insert(peer);
-            }
         }
     }
 
@@ -241,9 +229,7 @@ impl TopicState {
     }
 
     pub fn record_iwant(&mut self, msg_id: MessageId, peer: Identity) {
-        // Limit pending IWants to prevent memory growth
         if self.pending_iwants.len() >= MAX_PENDING_IWANTS {
-            // Remove oldest
             if let Some(oldest) = self.pending_iwants
                 .iter()
                 .min_by_key(|(_, (t, _))| *t)
@@ -262,7 +248,6 @@ impl TopicState {
 
         for (msg_id, (requested_at, tried_peers)) in self.pending_iwants.iter_mut() {
             if now.duration_since(*requested_at) > DEFAULT_IHAVE_TIMEOUT {
-                // Find a lazy peer we haven't tried
                 if let Some(next_peer) = self.lazy_peers.iter()
                     .find(|p| !tried_peers.contains(p))
                     .copied()
@@ -271,7 +256,6 @@ impl TopicState {
                     *requested_at = now; // Reset timeout
                     retries.push((*msg_id, next_peer));
                 } else {
-                    // No more peers to try
                     completed.push(*msg_id);
                 }
             }
@@ -366,18 +350,12 @@ pub enum MessageRejection {
     InvalidMessageId,
 }
 
-// ============================================================================
-// PlumTree Handler Trait
-// ============================================================================
 
 #[async_trait::async_trait]
 pub trait PlumTreeHandler: Send + Sync {
     async fn handle_message(&self, from: &Identity, message: PlumTreeMessage) -> anyhow::Result<()>;
 }
 
-// ============================================================================
-// PlumTree Implementation
-// ============================================================================
 
 #[allow(dead_code)] // Infrastructure methods for heartbeat loop
 pub struct PlumTree<N: PlumTreeRpc> {
@@ -425,22 +403,17 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         self.message_rx.take()
     }
 
-    // ========================================================================
-    // HYPARVIEW INTEGRATION
-    // ========================================================================
 
     pub async fn handle_neighbor_up(&self, peer: Identity) {
         if peer == self.local_identity {
             return;
         }
         
-        // Add to known peers
         {
             let mut known = self.known_peers.write().await;
             known.insert(peer);
         }
         
-        // Add as eager peer to all subscribed topics
         let subs = self.subscriptions.read().await;
         if subs.is_empty() {
             return;
@@ -449,7 +422,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         let mut topics = self.topics.write().await;
         for topic in subs.iter() {
             if let Some(state) = topics.get_mut(topic) {
-                // Add as eager - tree will optimize via duplicate detection
                 state.add_eager(peer);
                 debug!(
                     peer = %hex::encode(&peer.as_bytes()[..8]),
@@ -465,19 +437,16 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return;
         }
         
-        // Remove from known peers
         {
             let mut known = self.known_peers.write().await;
             known.remove(peer);
         }
         
-        // Clean up any pending outbound messages for this peer
         {
             let mut outbound = self.outbound.write().await;
             outbound.remove(peer);
         }
         
-        // Remove from all topics
         let mut topics = self.topics.write().await;
         for (topic, state) in topics.iter_mut() {
             let was_eager = state.eager_peers.contains(peer);
@@ -494,9 +463,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
     }
 }
 
-// ============================================================================
-// NeighborCallback Implementation for PlumTree
-// ============================================================================
 
 #[async_trait::async_trait]
 impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
@@ -511,12 +477,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
 
 #[allow(dead_code)] // Public API - methods are exposed for library consumers and heartbeat loop
 impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
-    // ========================================================================
-    // SUBSCRIPTION MANAGEMENT (No DHT involvement)
-    // ========================================================================
 
     pub async fn subscribe(&self, topic: &str) -> anyhow::Result<()> {
-        // Validate topic
         if topic.len() > MAX_TOPIC_LENGTH {
             anyhow::bail!("topic length {} exceeds maximum {}", topic.len(), MAX_TOPIC_LENGTH);
         }
@@ -527,7 +489,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             anyhow::bail!("topic name contains invalid characters");
         }
 
-        // Check subscription limits
         {
             let mut subs = self.subscriptions.write().await;
             if subs.contains(topic) {
@@ -539,13 +500,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             subs.insert(topic.to_string());
         }
 
-        // Initialize topic state with known peers as eager
         {
             let known = self.known_peers.read().await;
             let mut topics = self.topics.write().await;
             
             if !topics.contains_key(topic) && topics.len() >= MAX_TOPICS {
-                // Try to remove an empty topic
                 let empty = topics.iter()
                     .find(|(_, s)| s.eager_peers.is_empty() && s.lazy_peers.is_empty())
                     .map(|(t, _)| t.clone());
@@ -560,7 +519,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
             let state = topics.entry(topic.to_string()).or_default();
             
-            // Add all known peers as eager (PlumTree starts optimistic)
             for peer in known.iter() {
                 if *peer != self.local_identity {
                     state.add_eager(*peer);
@@ -568,7 +526,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // Notify peers of our subscription
         let peers: Vec<Identity> = {
             let topics = self.topics.read().await;
             topics.get(topic)
@@ -594,7 +551,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // Notify all peers and clean up
         let all_peers: Vec<Identity> = {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.remove(topic) {
@@ -616,12 +572,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(())
     }
 
-    // ========================================================================
-    // PUBLISHING
-    // ========================================================================
 
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
-        // Validate
         if data.len() > self.config.max_message_size {
             anyhow::bail!("message size {} exceeds maximum {}", data.len(), self.config.max_message_size);
         }
@@ -629,7 +581,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             anyhow::bail!("topic length {} exceeds maximum {}", topic.len(), MAX_TOPIC_LENGTH);
         }
 
-        // Rate limit check
         {
             let mut rate_limits = self.rate_limits.write().await;
             let limiter = rate_limits.entry(self.local_identity).or_default();
@@ -638,7 +589,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // Generate message ID
         let seqno = {
             let mut seq = self.seqno.write().await;
             *seq = seq.wrapping_add(1);
@@ -653,7 +603,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         id_input.extend_from_slice(&data);
         let msg_id = crate::dht::hash_content(&id_input);
 
-        // Cache the message
         {
             let mut cache = self.message_cache.write().await;
             cache.put(msg_id, CachedMessage {
@@ -665,7 +614,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             });
         }
 
-        // Track in recent messages for lazy push
         {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.get_mut(topic) {
@@ -685,7 +633,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             signature,
         };
 
-        // PlumTree: Send to EAGER peers only (tree edges)
         let eager_peers: Vec<Identity> = {
             let topics = self.topics.read().await;
             topics.get(topic)
@@ -698,7 +645,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             self.queue_message(&peer, publish_msg.clone()).await;
         }
 
-        // Deliver locally if subscribed
         let is_subscribed = {
             let subs = self.subscriptions.read().await;
             subs.contains(topic)
@@ -728,12 +674,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(msg_id)
     }
 
-    // ========================================================================
-    // MESSAGE HANDLING (PlumTree Core Logic)
-    // ========================================================================
 
     pub async fn handle_message(&self, from: &Identity, msg: PlumTreeMessage) -> anyhow::Result<()> {
-        // Validate topic
         let topic_opt = match &msg {
             PlumTreeMessage::Subscribe { topic } 
             | PlumTreeMessage::Unsubscribe { topic }
@@ -788,7 +730,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
         let mut topics = self.topics.write().await;
         if let Some(state) = topics.get_mut(topic) {
-            // New subscriber joins as eager (optimistic)
             state.add_eager(*from);
             trace!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
@@ -817,7 +758,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         };
 
         if !is_subscribed {
-            // We're not subscribed, send Prune
             self.queue_message(from, PlumTreeMessage::Prune {
                 topic: topic.to_string(),
                 peers: Vec::new(),
@@ -859,13 +799,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> anyhow::Result<()> {
-        // Size check
         if data.len() > self.config.max_message_size {
             debug!(from = %hex::encode(&from.as_bytes()[..8]), "rejecting oversized message");
             return Ok(());
         }
 
-        // Signature verification
         if let Err(e) = verify_plumtree_signature(&source, topic, seqno, &data, &signature) {
             debug!(
                 from = %hex::encode(&from.as_bytes()[..8]),
@@ -875,7 +813,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return Ok(());
         }
 
-        // Rate limiting
         {
             let mut rate_limits = self.rate_limits.write().await;
             if rate_limits.len() >= MAX_RATE_LIMIT_ENTRIES {
@@ -889,14 +826,12 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // PLUMTREE CORE: Check if duplicate
         let is_duplicate = {
             let cache = self.message_cache.read().await;
             cache.contains(&msg_id)
         };
 
         if is_duplicate {
-            // DUPLICATE RECEIPT: Demote sender to lazy, send Prune
             {
                 let mut topics = self.topics.write().await;
                 if let Some(state) = topics.get_mut(topic) {
@@ -904,7 +839,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
                 }
             }
             
-            // Send Prune to tell sender to stop sending us full messages
             self.queue_message(from, PlumTreeMessage::Prune {
                 topic: topic.to_string(),
                 peers: Vec::new(),
@@ -918,9 +852,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return Ok(());
         }
 
-        // FIRST RECEIPT: Cache, deliver, forward to eager peers
 
-        // Cache the message
         {
             let mut cache = self.message_cache.write().await;
             cache.put(msg_id, CachedMessage {
@@ -932,13 +864,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             });
         }
 
-        // Clear from pending IWants
         {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.get_mut(topic) {
                 state.message_received(&msg_id);
                 
-                // Track in recent messages for lazy push
                 state.recent_messages.push_back(msg_id);
                 if state.recent_messages.len() > self.config.max_ihave_length {
                     state.recent_messages.pop_front();
@@ -946,7 +876,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // Deliver to application if subscribed
         let is_subscribed = {
             let subs = self.subscriptions.read().await;
             subs.contains(topic)
@@ -966,7 +895,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        // PLUMTREE: Forward to EAGER peers only (not sender)
         let eager_peers: Vec<Identity> = {
             let topics = self.topics.read().await;
             topics.get(topic)
@@ -1008,25 +936,21 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return;
         }
 
-        // PLUMTREE REPAIR: Promote sender to eager (they have messages we need)
         {
             let mut topics = self.topics.write().await;
             if let Some(state) = topics.get_mut(topic) {
                 state.promote_to_eager(*from);
                 
-                // Track pending IWants
                 for msg_id in &missing {
                     state.record_iwant(*msg_id, *from);
                 }
             }
         }
 
-        // Send Graft to tell sender we want full messages now
         self.queue_message(from, PlumTreeMessage::Graft {
             topic: topic.to_string(),
         }).await;
 
-        // Request the missing messages
         self.queue_message(from, PlumTreeMessage::IWant { 
             msg_ids: missing.clone() 
         }).await;
@@ -1049,7 +973,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return;
         }
 
-        // Rate limit IWant
         {
             let mut rate_limits = self.rate_limits.write().await;
             let limiter = rate_limits.entry(*from).or_default();
@@ -1081,9 +1004,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    // ========================================================================
-    // HEARTBEAT / MAINTENANCE
-    // ========================================================================
 
     pub async fn run_heartbeat(&self) {
         let mut interval = tokio::time::interval(self.config.heartbeat_interval);
@@ -1108,7 +1028,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         self.flush_pending_queues().await;
     }
 
-    /// Attempt to flush pending message queues to peers that are now resolvable
     async fn flush_pending_queues(&self) {
         let peers_with_pending: Vec<Identity> = {
             let outbound = self.outbound.read().await;
@@ -1116,7 +1035,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         };
 
         for peer in peers_with_pending {
-            // Try to resolve and send
             if let Some(contact) = self.network.resolve_identity_to_contact(&peer).await {
                 let messages = self.take_pending_messages(&peer).await;
                 for msg in messages {
@@ -1126,8 +1044,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
                             error = %e,
                             "failed to flush pending PlumTree message"
                         );
-                        // Message is lost if send fails during flush - this is acceptable
-                        // as the peer is likely unreachable
                     }
                 }
             }
@@ -1195,12 +1111,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         outbound.retain(|_, msgs| !msgs.is_empty());
     }
 
-    // ========================================================================
-    // OUTBOUND QUEUE
-    // ========================================================================
 
     async fn queue_message(&self, peer: &Identity, msg: PlumTreeMessage) {
-        // Try to resolve identity to contact and send immediately
         if let Some(contact) = self.network.resolve_identity_to_contact(peer).await {
             if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg.clone()).await {
                 trace!(
@@ -1208,16 +1120,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
                     error = %e,
                     "failed to send PlumTree message, queueing for later"
                 );
-                // Fall through to queue as fallback
             } else {
                 return; // Successfully sent
             }
         }
         
-        // Fallback: queue for later delivery (maintains bounded queue semantics)
         let mut outbound = self.outbound.write().await;
         
-        // Limit total peers
         if !outbound.contains_key(peer) && outbound.len() >= MAX_OUTBOUND_PEERS {
             let smallest = outbound.iter()
                 .min_by_key(|(_, msgs)| msgs.len())
@@ -1227,7 +1136,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
         
-        // Limit total messages
         let total: usize = outbound.values().map(|v| v.len()).sum();
         if total >= MAX_TOTAL_OUTBOUND_MESSAGES {
             if let Some(largest) = outbound.iter()
@@ -1243,7 +1151,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         
         let queue = outbound.entry(*peer).or_default();
         
-        // Limit per-peer queue
         if queue.len() >= MAX_OUTBOUND_PER_PEER {
             let drain = queue.len() / 2;
             queue.drain(0..drain);
@@ -1262,9 +1169,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         outbound.keys().copied().collect()
     }
 
-    // ========================================================================
-    // PUBLIC ACCESSORS
-    // ========================================================================
 
     pub async fn subscriptions(&self) -> Vec<String> {
         self.subscriptions.read().await.iter().cloned().collect()
@@ -1320,11 +1224,11 @@ mod tests {
 
     #[test]
     fn flood_protection_constants() {
-        assert!(MAX_MESSAGE_SIZE >= 1024, "max message size too small");
-        assert!(MAX_MESSAGE_SIZE <= 1024 * 1024, "max message size too large");
-        assert!(MAX_TOPIC_LENGTH >= 32, "max topic length too small");
-        assert!(DEFAULT_PUBLISH_RATE_LIMIT > 0);
-        assert!(DEFAULT_PER_PEER_RATE_LIMIT > 0);
+        const _: () = assert!(MAX_MESSAGE_SIZE >= 1024, "max message size too small");
+        const _: () = assert!(MAX_MESSAGE_SIZE <= 1024 * 1024, "max message size too large");
+        const _: () = assert!(MAX_TOPIC_LENGTH >= 32, "max topic length too small");
+        const _: () = assert!(DEFAULT_PUBLISH_RATE_LIMIT > 0);
+        const _: () = assert!(DEFAULT_PER_PEER_RATE_LIMIT > 0);
         assert!(RATE_LIMIT_WINDOW.as_secs() >= 1);
     }
 
@@ -1453,30 +1357,25 @@ mod tests {
         let peer2 = Identity::from_bytes([2u8; 32]);
         let peer3 = Identity::from_bytes([3u8; 32]);
 
-        // Add peers as eager
         assert!(state.add_eager(peer1));
         assert!(state.add_eager(peer2));
         assert_eq!(state.eager_peers.len(), 2);
         assert_eq!(state.lazy_peers.len(), 0);
 
-        // Demote peer1 to lazy (simulating duplicate receipt)
         state.demote_to_lazy(peer1);
         assert_eq!(state.eager_peers.len(), 1);
         assert_eq!(state.lazy_peers.len(), 1);
         assert!(!state.eager_peers.contains(&peer1));
         assert!(state.lazy_peers.contains(&peer1));
 
-        // Promote peer1 back to eager (simulating IHave receipt)
         state.promote_to_eager(peer1);
         assert_eq!(state.eager_peers.len(), 2);
         assert_eq!(state.lazy_peers.len(), 0);
         assert!(state.eager_peers.contains(&peer1));
 
-        // New peer added directly as eager
         state.promote_to_eager(peer3);
         assert_eq!(state.eager_peers.len(), 3);
 
-        // Remove peer
         state.remove_peer(&peer2);
         assert_eq!(state.total_peers(), 2);
         assert!(!state.contains(&peer2));
@@ -1488,12 +1387,10 @@ mod tests {
         let peer1 = Identity::from_bytes([1u8; 32]);
         let msg_id = [0xABu8; 32];
 
-        // Record pending IWant
         state.record_iwant(msg_id, peer1);
         assert_eq!(state.pending_iwants.len(), 1);
         assert!(state.pending_iwants.contains_key(&msg_id));
 
-        // Message received - clear pending
         state.message_received(&msg_id);
         assert!(state.pending_iwants.is_empty());
     }
@@ -1502,9 +1399,7 @@ mod tests {
     fn topic_state_respects_peer_limit() {
         let mut state = TopicState::default();
 
-        // Add peers up to the limit (use unique identities)
         for i in 0..MAX_PEERS_PER_TOPIC {
-            // Create unique 32-byte identity by encoding i into first 4 bytes
             let mut bytes = [0u8; 32];
             bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
             let peer = Identity::from_bytes(bytes);
@@ -1513,7 +1408,6 @@ mod tests {
 
         assert_eq!(state.total_peers(), MAX_PEERS_PER_TOPIC);
 
-        // Adding one more should fail (use a unique identity that wasn't added)
         let mut overflow_bytes = [0xFFu8; 32];
         overflow_bytes[0..4].copy_from_slice(&(MAX_PEERS_PER_TOPIC as u32).to_le_bytes());
         let overflow_peer = Identity::from_bytes(overflow_bytes);

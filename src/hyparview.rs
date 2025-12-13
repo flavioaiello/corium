@@ -11,9 +11,6 @@ use tracing::{debug, warn};
 use crate::identity::Identity;
 use crate::rpc::HyParViewRpc;
 
-// ============================================================================
-// Configuration
-// ============================================================================
 
 #[derive(Clone, Debug)]
 pub struct HyParViewConfig {
@@ -42,9 +39,6 @@ impl Default for HyParViewConfig {
     }
 }
 
-// ============================================================================
-// Protocol Messages
-// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Priority {
@@ -78,9 +72,6 @@ pub enum HyParViewMessage {
     },
 }
 
-// ============================================================================
-// Neighbor Change Callback
-// ============================================================================
 
 #[async_trait::async_trait]
 pub trait NeighborCallback: Send + Sync {
@@ -88,9 +79,6 @@ pub trait NeighborCallback: Send + Sync {
     async fn neighbor_down(&self, peer: &Identity);
 }
 
-// ============================================================================
-// HyParView Implementation
-// ============================================================================
 
 pub struct HyParView<N: HyParViewRpc> {
     me: Identity,
@@ -98,7 +86,6 @@ pub struct HyParView<N: HyParViewRpc> {
     network: Arc<N>,
     neighbor_callback: RwLock<Option<Arc<dyn NeighborCallback>>>,
     
-    // Protocol state
     active_view: RwLock<HashSet<Identity>>,
     passive_view: RwLock<HashSet<Identity>>,
     pending_neighbors: RwLock<HashMap<Identity, Instant>>,
@@ -125,7 +112,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     }
 
     pub fn with_neighbor_callback(self, callback: Arc<dyn NeighborCallback>) -> Self {
-        // Note: This consumes self and reconstructs with the callback set
         Self {
             me: self.me,
             config: self.config,
@@ -144,9 +130,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         *self.neighbor_callback.write().await = Some(callback);
     }
 
-    // ========================================================================
-    // Public API
-    // ========================================================================
 
     pub async fn active_view(&self) -> HashSet<Identity> {
         self.active_view.read().await.clone()
@@ -161,13 +144,11 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             return;
         }
 
-        // Send Join message
         if let Err(e) = self.network.send_hyparview(&bootstrap, self.me, HyParViewMessage::Join).await {
             warn!(peer = %hex::encode(&bootstrap.as_bytes()[..8]), error = %e, "failed to send Join");
             return;
         }
 
-        // Optimistically add to active view
         self.add_to_active(bootstrap, Priority::High, true).await;
     }
 
@@ -202,7 +183,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         };
 
         if removed {
-            // Check if graceful disconnect
             let was_alive = {
                 let mut alive = self.alive_disconnecting.write().await;
                 alive.remove(&peer)
@@ -255,7 +235,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         }
     }
 
-    /// Clean up stale pending neighbor requests that have timed out
     async fn cleanup_stale_pending_neighbors(&self) {
         let timeout = self.config.neighbor_timeout;
         let now = Instant::now();
@@ -277,7 +256,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             }
         }
 
-        // Try to promote passive peers if we cleaned up any
         if !stale_peers.is_empty() {
             self.try_promote_passive().await;
         }
@@ -301,7 +279,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         self.passive_view.write().await.clear();
     }
 
-    /// Spawn the shuffle timer loop
     pub fn spawn_shuffle_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -311,23 +288,17 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             loop {
                 interval.tick().await;
                 this.do_shuffle().await;
-                // Clean up stale pending neighbor requests on each shuffle tick
                 this.cleanup_stale_pending_neighbors().await;
             }
         })
     }
 
-    // ========================================================================
-    // Message Handlers
-    // ========================================================================
 
     async fn on_join(&self, from: Identity) {
         debug!(peer = %hex::encode(&from.as_bytes()[..8]), "received Join");
 
-        // Add the joining peer to our active view
         self.add_to_active(from, Priority::High, true).await;
 
-        // Forward the join to all active peers except sender
         let peers: Vec<Identity> = {
             let active = self.active_view.read().await;
             active.iter().filter(|p| **p != from).copied().collect()
@@ -350,7 +321,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             return;
         }
 
-        // Already have this peer in active view
         {
             let active = self.active_view.read().await;
             if active.contains(&new_peer) {
@@ -360,18 +330,15 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
 
         let active_len = self.active_view.read().await.len();
 
-        // TTL expired or we have only one peer - add to active
         if ttl == 0 || active_len <= 1 {
             self.add_to_active(new_peer, Priority::Low, true).await;
             return;
         }
 
-        // At passive random walk length, add to passive view
         if ttl == self.config.passive_random_walk_length {
             self.add_to_passive(new_peer).await;
         }
 
-        // Forward to a random active peer (not sender or new_peer)
         let next = {
             let active = self.active_view.read().await;
             let mut rng = self.rng.write().await;
@@ -429,7 +396,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     }
 
     async fn on_shuffle(&self, from: Identity, origin: Identity, peers: Vec<Identity>, ttl: u8) {
-        // Validate shuffle peer list size to prevent amplification attacks
         let max_shuffle_size = self.config.shuffle_active_count + self.config.shuffle_passive_count + 1;
         if peers.len() > max_shuffle_size * 2 {
             warn!(
@@ -444,7 +410,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         let active_len = self.active_view.read().await.len();
 
         if ttl == 0 || active_len <= 1 {
-            // Accept shuffle and reply (limited to max_shuffle_size peers)
             for peer in peers.iter().take(max_shuffle_size) {
                 if *peer != self.me {
                     self.add_to_passive(*peer).await;
@@ -457,7 +422,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
                 warn!(peer = %hex::encode(&origin.as_bytes()[..8]), error = %e, "failed to send ShuffleReply");
             }
         } else {
-            // Forward to random active peer
             let next = {
                 let active = self.active_view.read().await;
                 let mut rng = self.rng.write().await;
@@ -510,9 +474,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         }
     }
 
-    // ========================================================================
-    // Internal Helpers
-    // ========================================================================
 
     async fn add_to_passive(&self, peer: Identity) -> bool {
         if peer == self.me {
@@ -528,7 +489,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
 
         let mut passive = self.passive_view.write().await;
         if passive.len() >= self.config.passive_view_capacity {
-            // Remove a random peer to make room
             let evict = {
                 let mut rng = self.rng.write().await;
                 passive.iter().choose(&mut *rng).copied()
@@ -546,7 +506,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             return;
         }
 
-        // Already in active view
         {
             let active = self.active_view.read().await;
             if active.contains(&peer) {
@@ -554,7 +513,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             }
         }
 
-        // If full, only accept high priority
         let is_full = {
             let active = self.active_view.read().await;
             active.len() >= self.config.active_view_capacity
@@ -562,7 +520,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
 
         if is_full {
             if priority == Priority::High {
-                // Evict a random peer
                 let evict = {
                     let active = self.active_view.read().await;
                     let mut rng = self.rng.write().await;
@@ -572,13 +529,11 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
                     self.disconnect_peer(evict, true).await;
                 }
             } else {
-                // Can't add, move to passive
                 self.add_to_passive(peer).await;
                 return;
             }
         }
 
-        // Add to active
         {
             let mut passive = self.passive_view.write().await;
             passive.remove(&peer);
@@ -618,7 +573,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     }
 
     async fn disconnect_peer(&self, peer: Identity, alive: bool) {
-        // Send some peers before disconnecting
         let shuffle_peers = self.sample_for_shuffle().await;
         let _ = self.network.send_hyparview(
             &peer,
@@ -674,7 +628,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     async fn sample_for_shuffle(&self) -> Vec<Identity> {
         let mut peers = Vec::new();
 
-        // Sample from active view
         {
             let active = self.active_view.read().await;
             let mut rng = self.rng.write().await;
@@ -683,7 +636,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             }
         }
 
-        // Sample from passive view
         {
             let passive = self.passive_view.read().await;
             let mut rng = self.rng.write().await;
@@ -692,7 +644,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             }
         }
 
-        // Include ourselves
         peers.push(self.me);
 
         peers
@@ -715,9 +666,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
