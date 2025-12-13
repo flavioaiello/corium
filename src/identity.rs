@@ -2,6 +2,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
+use crate::transport::Contact;
+
 #[derive(Clone)]
 pub struct Keypair {
     signing_key: SigningKey,
@@ -49,7 +51,7 @@ impl Keypair {
     pub fn create_endpoint_record_with_relays(
         &self,
         addrs: Vec<String>,
-        relays: Vec<RelayEndpoint>,
+        relays: Vec<Contact>,
     ) -> EndpointRecord {
         use std::time::{SystemTime, UNIX_EPOCH};
         
@@ -69,9 +71,15 @@ impl Keypair {
         }
         data.extend_from_slice(&(relays.len() as u32).to_le_bytes());
         for relay in &relays {
-            data.extend_from_slice(relay.relay_identity.as_bytes());
-            data.extend_from_slice(&(relay.relay_addrs.len() as u32).to_le_bytes());
-            for addr in &relay.relay_addrs {
+            data.extend_from_slice(relay.identity.as_bytes());
+            let relay_addr_count: u32 = (relay.addrs.len() as u32).saturating_add(1);
+            data.extend_from_slice(&relay_addr_count.to_le_bytes());
+
+            let primary_addr_bytes = relay.addr.as_bytes();
+            data.extend_from_slice(&(primary_addr_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(primary_addr_bytes);
+
+            for addr in &relay.addrs {
                 let addr_bytes = addr.as_bytes();
                 data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
                 data.extend_from_slice(addr_bytes);
@@ -189,15 +197,9 @@ impl AsRef<[u8]> for Identity {
 pub struct EndpointRecord {
     pub identity: Identity,
     pub addrs: Vec<String>,
-    pub relays: Vec<RelayEndpoint>,
+    pub relays: Vec<Contact>,
     pub timestamp: u64,
     pub signature: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayEndpoint {
-    pub relay_identity: Identity,
-    pub relay_addrs: Vec<String>,
 }
 
 impl EndpointRecord {
@@ -212,9 +214,15 @@ impl EndpointRecord {
         }
         data.extend_from_slice(&(self.relays.len() as u32).to_le_bytes());
         for relay in &self.relays {
-            data.extend_from_slice(relay.relay_identity.as_bytes());
-            data.extend_from_slice(&(relay.relay_addrs.len() as u32).to_le_bytes());
-            for addr in &relay.relay_addrs {
+            data.extend_from_slice(relay.identity.as_bytes());
+            let relay_addr_count: u32 = (relay.addrs.len() as u32).saturating_add(1);
+            data.extend_from_slice(&relay_addr_count.to_le_bytes());
+
+            let primary_addr_bytes = relay.addr.as_bytes();
+            data.extend_from_slice(&(primary_addr_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(primary_addr_bytes);
+
+            for addr in &relay.addrs {
                 let addr_bytes = addr.as_bytes();
                 data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
                 data.extend_from_slice(addr_bytes);
@@ -286,10 +294,33 @@ impl EndpointRecord {
         }
         
         for relay in &self.relays {
-            if relay.relay_addrs.len() > MAX_ADDRS {
+            if relay.addr.len() > MAX_ADDR_LEN || relay.addr.is_empty() {
                 return false;
             }
-            for addr in &relay.relay_addrs {
+
+            if relay.addrs.len() + 1 > MAX_ADDRS {
+                return false;
+            }
+
+            if relay.addrs.iter().any(|a| a == &relay.addr) {
+                return false;
+            }
+
+            // Ensure additional addresses are non-empty and not duplicated.
+            {
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
+                for addr in &relay.addrs {
+                    if addr.len() > MAX_ADDR_LEN || addr.is_empty() {
+                        return false;
+                    }
+                    if !seen.insert(addr) {
+                        return false;
+                    }
+                }
+            }
+
+            for addr in &relay.addrs {
                 if addr.len() > MAX_ADDR_LEN || addr.is_empty() {
                     return false;
                 }
@@ -726,9 +757,10 @@ mod tests {
         let keypair = Keypair::generate();
         let relay_keypair = Keypair::generate();
 
-        let relays = vec![RelayEndpoint {
-            relay_identity: relay_keypair.identity(),
-            relay_addrs: vec!["10.0.0.1:9000".to_string()],
+        let relays = vec![Contact {
+            identity: relay_keypair.identity(),
+            addr: "10.0.0.1:9000".to_string(),
+            addrs: vec![],
         }];
 
         let record =

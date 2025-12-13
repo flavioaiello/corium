@@ -9,14 +9,12 @@ use tracing::{debug, info, trace, warn};
 use crate::crypto::{extract_verified_identity, generate_ed25519_cert, create_server_config, create_client_config};
 use crate::dht::{Dht, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::hyparview::{HyParView, HyParViewConfig, HyParViewMessage};
-use crate::identity::{EndpointRecord, Identity, Keypair, RelayEndpoint};
+use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::{DhtRequest, DhtResponse, Message, PlumTreeMessage, RpcRequest, RpcResponse};
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
 use crate::ratelimit::ConnectionRateLimiter;
-use crate::relay::{self, UdpRelayForwarder};
-use crate::routing::Contact;
+use crate::transport::{self, Contact, SmartSock, UdpRelayForwarder};
 use crate::rpc::{DhtRpc, HyParViewRpc, PlumTreeRpc, RpcNode};
-use crate::smartsock::SmartSock;
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
@@ -202,7 +200,7 @@ async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync
             RpcResponse::Dht(dht_response)
         }
         RpcRequest::Relay(relay_request) => {
-            let relay_response = relay::handle_relay_request(
+            let relay_response = transport::handle_relay_request(
                 relay_request,
                 remote_addr,
                 udp_forwarder.as_deref(),
@@ -389,6 +387,7 @@ impl Node {
         let contact = Contact {
             identity,
             addr: local_addr.to_string(),
+            addrs: vec![],
         };
         
         let network = RpcNode::with_identity(
@@ -530,11 +529,13 @@ impl Node {
         &self.keypair
     }
     
-    pub fn contact(&self) -> &Contact {
+    /// Returns this node's endpoint information (identity + addresses).
+    pub fn peer_endpoint(&self) -> &Contact {
         &self.contact
     }
     
-    pub fn endpoint(&self) -> &Endpoint {
+    /// Returns the underlying QUIC endpoint.
+    pub fn quic_endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
     
@@ -562,7 +563,7 @@ impl Node {
     pub async fn publish_address_with_relays(
         &self,
         addresses: Vec<String>,
-        relays: Vec<RelayEndpoint>,
+        relays: Vec<Contact>,
     ) -> Result<()> {
         self.dht.republish_on_network_change(&self.keypair, addresses, relays).await
     }
@@ -571,7 +572,7 @@ impl Node {
         self.udp_forwarder.is_some()
     }
     
-    pub async fn relay_endpoint(&self) -> Option<RelayEndpoint> {
+    pub async fn relay_endpoint(&self) -> Option<Contact> {
         let forwarder_addr = self.udp_forwarder_addr?;
         let local_addr = self.endpoint.local_addr().ok()?;
         
@@ -580,9 +581,10 @@ impl Node {
             .map(|public| SocketAddr::new(public.ip(), forwarder_addr.port()))
             .unwrap_or(forwarder_addr);
         
-        Some(RelayEndpoint {
-            relay_identity: self.keypair.identity(),
-            relay_addrs: vec![relay_addr.to_string(), local_addr.to_string()],
+        Some(Contact {
+            identity: self.keypair.identity(),
+            addr: relay_addr.to_string(),
+            addrs: vec![local_addr.to_string()],
         })
     }
     
@@ -594,8 +596,9 @@ impl Node {
         self.dht.iterative_find_node(target).await
     }
     
-    pub async fn add_peer(&self, contact: Contact) {
-        self.dht.observe_contact(contact).await
+    /// Add a peer to this node's routing table.
+    pub async fn add_peer(&self, endpoint: Contact) {
+        self.dht.observe_contact(endpoint).await
     }
     
     pub async fn bootstrap(&self, identity: &str, addr: &str) -> Result<()> {
@@ -609,6 +612,7 @@ impl Node {
         let contact = Contact {
             identity: peer_identity,
             addr: addr.to_string(),
+            addrs: vec![],
         };
         
         self.dht.observe_contact(contact.clone()).await;

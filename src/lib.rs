@@ -6,10 +6,9 @@ mod messages;
 mod node;
 mod plumtree;
 mod ratelimit;
-mod relay;
 mod routing;
 mod rpc;
-mod smartsock;
+mod transport;
 
 #[inline]
 pub(crate) fn now_ms() -> u64 {
@@ -19,10 +18,6 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub use messages::Message;
+// Public API - Node is the facade for all operations
 pub use node::Node;
-pub use quinn::Connection;
-
-// Re-export types needed for relay integration
-pub use identity::{Identity, RelayEndpoint};
 

@@ -236,7 +236,7 @@ async fn send_direct_message(
 }
 
 async fn accept_direct_messages(node: Arc<Node>) {
-    let endpoint = node.endpoint().clone();
+    let endpoint = node.quic_endpoint().clone();
     
     while let Some(incoming) = endpoint.accept().await {
         tokio::spawn(async move {

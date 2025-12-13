@@ -12,10 +12,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
 use crate::messages::{self as messages, DhtRequest, DhtResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
-use crate::smartsock::SmartSock;
+use crate::transport::SmartSock;
 use crate::crypto::identity_to_sni;
-use crate::relay::{NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
-use crate::routing::Contact;
+use crate::transport::{Contact, NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
 use crate::dht::Key;
 use crate::identity::{EndpointRecord, Identity};
 use crate::hyparview::HyParViewMessage;
@@ -520,11 +519,14 @@ impl RpcNode {
             let relay = record.relays.first()
                 .context("no relays available")?;
             
-            let relay_peer_id = relay.relay_identity;
+            let relay_peer_id = relay.identity;
             let session_id = generate_session_id()
                 .context("failed to generate session ID")?;
             
-            let relay_conn = self.connect_to_peer(&relay_peer_id, &relay.relay_addrs).await
+            let relay_addrs: Vec<String> = std::iter::once(relay.addr.clone())
+                .chain(relay.addrs.iter().cloned())
+                .collect();
+            let relay_conn = self.connect_to_peer(&relay_peer_id, &relay_addrs).await
                 .context("failed to connect to relay")?;
             
             let request = RelayRequest::Connect {

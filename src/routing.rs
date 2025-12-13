@@ -21,15 +21,7 @@ const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
 
-// ============================================================================
-// CONTACT
-// ============================================================================
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Contact {
-    pub identity: Identity,
-    pub addr: String,
-}
+use crate::transport::Contact;
 
 // ============================================================================
 // ROUTING INSERTION LIMITER
@@ -299,34 +291,34 @@ impl RoutingTable {
         }
 
         #[derive(Eq, PartialEq)]
-        struct DistContact {
+        struct DistEndpointInfo {
             dist: [u8; 32],
             contact: Contact,
         }
         
-        impl Ord for DistContact {
+        impl Ord for DistEndpointInfo {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                 distance_cmp(&self.dist, &other.dist)
             }
         }
         
-        impl PartialOrd for DistContact {
+        impl PartialOrd for DistEndpointInfo {
             fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
                 Some(self.cmp(other))
             }
         }
 
-        let mut heap: BinaryHeap<DistContact> = BinaryHeap::with_capacity(k + 1);
+        let mut heap: BinaryHeap<DistEndpointInfo> = BinaryHeap::with_capacity(k + 1);
 
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
                 let dist = xor_distance(&contact.identity, target);
                 
                 if heap.len() < k {
-                    heap.push(DistContact { dist, contact: contact.clone() });
+                    heap.push(DistEndpointInfo { dist, contact: contact.clone() });
                 } else if let Some(max_entry) = heap.peek() {
                     if distance_cmp(&dist, &max_entry.dist) == std::cmp::Ordering::Less {
-                        heap.push(DistContact { dist, contact: contact.clone() });
+                        heap.push(DistEndpointInfo { dist, contact: contact.clone() });
                         heap.pop(); // Remove the now-largest element
                     }
                 }
@@ -622,6 +614,7 @@ mod tests {
         Contact {
             identity: make_test_identity(byte),
             addr: format!("node-{byte}"),
+            addrs: vec![],
         }
     }
 }

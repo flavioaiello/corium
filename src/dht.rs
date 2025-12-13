@@ -11,9 +11,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::routing::{
-    random_id_for_bucket, Contact, PendingBucketUpdate, RoutingInsertionLimiter, RoutingTable,
+    random_id_for_bucket, PendingBucketUpdate, RoutingInsertionLimiter, RoutingTable,
     BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
 };
+use crate::transport::Contact;
 use crate::rpc::DhtRpc;
 
 // ============================================================================
@@ -1563,7 +1564,7 @@ impl<N: DhtRpc> Dht<N> {
         &self,
         keypair: &Keypair,
         new_addrs: Vec<String>,
-        relays: Vec<crate::identity::RelayEndpoint>,
+        relays: Vec<Contact>,
     ) -> Result<()> {
         debug!(
             "republishing address after network change: {:?}",
@@ -1738,6 +1739,7 @@ mod tests {
         Contact {
             identity: make_identity(index),
             addr: format!("node-{index}"),
+            addrs: vec![],
         }
     }
 

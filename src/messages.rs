@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::dht::Key;
 use crate::identity::Identity;
-use crate::routing::Contact;
+use crate::transport::Contact;
 use crate::hyparview::HyParViewMessage;
 
 // ============================================================================
@@ -274,7 +274,7 @@ pub enum RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::Contact;
+    use crate::transport::Contact;
     use crate::identity::{Identity, Keypair};
     use bincode::Options;
 
@@ -310,10 +310,7 @@ mod tests {
     }
 
     fn test_contact() -> Contact {
-        Contact {
-            identity: test_identity(),
-            addr: "127.0.0.1:4433".to_string(),
-        }
+        Contact { identity: test_identity(), addr: "127.0.0.1:4433".to_string(), addrs: vec![] }
     }
 
     // ========================================================================
@@ -323,10 +320,7 @@ mod tests {
     #[test]
     fn bounded_deserialization_normal_payloads() {
         let request = DhtRequest::Store {
-            from: Contact {
-                identity: make_identity(1),
-                addr: "127.0.0.1:8080".to_string(),
-            },
+            from: Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] },
             key: [0u8; 32],
             value: vec![0u8; 100],
         };
@@ -341,10 +335,7 @@ mod tests {
         assert!(test_deserialize_request(&garbage).is_err());
 
         let request = DhtRequest::Ping {
-            from: Contact {
-                identity: make_identity(1),
-                addr: "127.0.0.1:8080".to_string(),
-            },
+            from: Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] },
         };
         let bytes = serialize(&request).unwrap();
         let truncated = &bytes[..bytes.len() / 2];
@@ -353,20 +344,14 @@ mod tests {
 
     #[test]
     fn response_deserialization() {
-        let response = DhtResponse::Nodes(vec![Contact {
-            identity: make_identity(1),
-            addr: "127.0.0.1:8080".to_string(),
-        }]);
+        let response = DhtResponse::Nodes(vec![Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] }]);
         let bytes = bincode::serialize(&response).unwrap();
         assert!(test_deserialize_response(&bytes).is_ok());
     }
 
     #[test]
     fn request_types_roundtrip() {
-        let contact = Contact {
-            identity: make_identity(1),
-            addr: "127.0.0.1:8080".to_string(),
-        };
+        let contact = Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] };
         let keypair = Keypair::generate();
         let identity = keypair.identity();
 
@@ -407,10 +392,7 @@ mod tests {
 
     #[test]
     fn sender_identity_extraction() {
-        let contact = Contact {
-            identity: make_identity(42),
-            addr: "127.0.0.1:8080".to_string(),
-        };
+        let contact = Contact { identity: make_identity(42), addr: "127.0.0.1:8080".to_string(), addrs: vec![] };
 
         let ping = DhtRequest::Ping { from: contact.clone() };
         assert_eq!(ping.sender_identity(), Some(make_identity(42)));
