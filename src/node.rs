@@ -653,7 +653,7 @@ impl Node {
             identity: peer_identity,
             addrs: vec![addr.to_string()],
             relays: vec![],
-            timestamp: crate::now_ms(),
+            timestamp: crate::identity::now_ms(),
             signature: vec![], // Not needed for outbound connection
         };
         

@@ -74,10 +74,9 @@ async fn main() -> Result<()> {
     println!("║ Your Identity (for DMs):                                       ║");
     println!("║ {:<64} ║", identity);
     println!("╠════════════════════════════════════════════════════════════════╣");
-    println!("║ Bootstrap string for other peers:                              ║");
-    println!("║ {}/{} ║", local_addr, &identity[..32]);
-    println!("║ ...{} ║", &identity[32..]);
+    println!("║ Bootstrap string (copy this line):                             ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
+    println!("{}/{}", local_addr, identity);
 
     if let Some(bootstrap_str) = &args.bootstrap {
         let (addr, peer_identity) = parse_bootstrap(bootstrap_str)?;
@@ -135,7 +134,7 @@ async fn main() -> Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut stdin_reader = tokio::io::BufReader::new(stdin).lines();
-    let my_id_prefix = &identity[..8]; // Short prefix for display
+    let my_id_prefix = &identity[..8];
 
     while let Some(line) = stdin_reader.next_line().await? {
         let line = line.trim();
@@ -240,33 +239,41 @@ async fn accept_direct_messages(node: Arc<Node>) {
     
     while let Some(incoming) = endpoint.accept().await {
         tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => {
-                    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                        let mut len_buf = [0u8; 4];
-                        if recv.read_exact(&mut len_buf).await.is_ok() {
-                            let len = u32::from_be_bytes(len_buf) as usize;
-                            
-                            if len > 0 && len < 65536 {
-                                let mut buf = vec![0u8; len];
-                                if recv.read_exact(&mut buf).await.is_ok() {
-                                    if let Ok(payload) = String::from_utf8(buf) {
-                                        if let Some(rest) = payload.strip_prefix("DM:") {
-                                            if let Some((sender, msg)) = rest.split_once(':') {
-                                                println!("\x1b[35m[dm ← {}]\x1b[0m {}", sender, msg);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        let _ = send.write_all(&[0u8; 4]).await;
-                        let _ = send.finish();
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let (mut send, mut recv) = match conn.accept_bi().await {
+                Ok(streams) => streams,
+                Err(_) => return,
+            };
+
+            let mut len_buf = [0u8; 4];
+            if recv.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len == 0 || len > 65536 {
+                return;
+            }
+            
+            let mut buf = vec![0u8; len];
+            if recv.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            
+            if let Ok(payload) = String::from_utf8(buf) {
+                if let Some(rest) = payload.strip_prefix("DM:") {
+                    if let Some((sender_name, msg)) = rest.split_once(':') {
+                        println!("\x1b[35m[dm ← {}]\x1b[0m {}", sender_name, msg);
                     }
                 }
-                Err(_) => {}
             }
+            
+            let _ = send.write_all(&[0u8; 4]).await;
+            let _ = send.finish();
         });
     }
 }

@@ -740,6 +740,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)] // Test infrastructure for future assertions
         async fn sent_messages(&self) -> Vec<(Identity, HyParViewMessage)> {
             self.sent.lock().await.clone()
         }

@@ -1,8 +1,18 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::transport::Contact;
+
+/// Returns the current time in milliseconds since UNIX epoch.
+#[inline]
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Clone)]
 pub struct Keypair {
@@ -53,13 +63,8 @@ impl Keypair {
         addrs: Vec<String>,
         relays: Vec<Contact>,
     ) -> EndpointRecord {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
         let identity = self.identity();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let timestamp = now_ms();
         
         let mut data = Vec::new();
         data.extend_from_slice(identity.as_bytes());
@@ -242,26 +247,21 @@ impl EndpointRecord {
     }
 
     pub fn verify_fresh(&self, max_age_secs: u64) -> bool {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
         if !self.verify() {
             return false;
         }
         
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let current_time = now_ms();
         
         let max_age_ms = max_age_secs * 1000;
         
         // Allow 10 second future tolerance for clock skew (reduced from 60s for security)
         const FUTURE_TOLERANCE_MS: u64 = 10_000;
-        if self.timestamp > now_ms + FUTURE_TOLERANCE_MS {
+        if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
         }
         
-        if now_ms.saturating_sub(self.timestamp) > max_age_ms {
+        if current_time.saturating_sub(self.timestamp) > max_age_ms {
             return false;
         }
         
