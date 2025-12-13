@@ -343,12 +343,10 @@ pub struct Node {
     contact: Contact,
     dht: Dht<RpcNode>,
     network: RpcNode,
-    #[allow(dead_code)] // Used for connection rate limiting in server loop
-    rate_limiter: Arc<ConnectionRateLimiter>,
+    _rate_limiter: Arc<ConnectionRateLimiter>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
-    #[allow(dead_code)] // HyParView state machine - used in RPC handlers
-    hyparview: Arc<HyParView<RpcNode>>,
+    _hyparview: Arc<HyParView<RpcNode>>,
     plumtree: Option<Arc<PlumTree<RpcNode>>>,
     plumtree_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
     _server_handle: tokio::task::JoinHandle<Result<()>>,
@@ -501,10 +499,10 @@ impl Node {
             contact,
             dht,
             network,
-            rate_limiter,
+            _rate_limiter: rate_limiter,
             udp_forwarder,
             udp_forwarder_addr,
-            hyparview,
+            _hyparview: hyparview,
             plumtree,
             plumtree_receiver,
             _server_handle: server_handle,
@@ -560,7 +558,9 @@ impl Node {
         addresses: Vec<String>,
         relays: Vec<Contact>,
     ) -> Result<()> {
-        self.dht.republish_on_network_change(&self.keypair, addresses, relays).await
+        self.dht
+            .republish_on_network_change(&self.keypair, addresses, relays)
+            .await
     }
     
     pub fn is_relay_capable(&self) -> bool {
@@ -637,7 +637,7 @@ impl Node {
             signature: vec![], // Not needed for outbound connection
         };
         
-        let conn = self.network.smart_connect(&record).await?;
+        let conn = self.network.smartconnect(&record).await?;
         Ok(conn)
     }
     
@@ -656,10 +656,10 @@ impl Node {
             peer = %identity,
             addrs = ?record.addrs,
             relays = record.relays.len(),
-            "resolved peer endpoint, attempting smart_connect"
+            "resolved peer endpoint, attempting smartconnect"
         );
         
-        let conn = self.network.smart_connect(&record).await?;
+        let conn = self.network.smartconnect(&record).await?;
         Ok(conn)
     }
     

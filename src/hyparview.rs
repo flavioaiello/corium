@@ -94,7 +94,7 @@ pub struct HyParView<N: HyParViewRpc> {
     rng: RwLock<rand::rngs::StdRng>,
 }
 
-#[allow(dead_code)] // Public API - methods are exposed for library consumers
+#[allow(dead_code)] // Library public API - HyParView membership protocol
 impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     pub fn new(me: Identity, config: HyParViewConfig, network: Arc<N>) -> Self {
         Self {
@@ -688,7 +688,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)] // Test infrastructure for future assertions
         async fn sent_messages(&self) -> Vec<(Identity, HyParViewMessage)> {
             self.sent.lock().await.clone()
         }
@@ -774,5 +773,14 @@ mod tests {
         
         assert!(!hv.active_view().await.contains(&peer1));
         assert!(hv.passive_view().await.contains(&peer1));
+    }
+
+    #[tokio::test]
+    async fn mock_network_sent_messages_accessible() {
+        let network = MockNetwork::new();
+        
+        // Initially empty
+        let sent = network.sent_messages().await;
+        assert!(sent.is_empty());
     }
 }

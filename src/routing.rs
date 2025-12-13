@@ -247,7 +247,8 @@ impl RoutingTable {
         }
     }
 
-    #[allow(dead_code)] // Public API for direct routing updates
+    /// Adds or updates a contact in the routing table.
+    #[allow(dead_code)] // Library public API
     pub fn update(&mut self, contact: Contact) {
         let _ = self.update_with_pending(contact);
     }
@@ -598,5 +599,20 @@ mod tests {
             addr: format!("node-{byte}"),
             addrs: vec![],
         }
+    }
+
+    #[test]
+    fn routing_table_update_api() {
+        let self_id = make_test_identity(0x00);
+        let mut rt = RoutingTable::new(self_id, 20);
+        
+        let peer = make_test_contact(0x80);
+        
+        // Use the public update() API
+        rt.update(peer.clone());
+        
+        let closest = rt.closest(&peer.identity, 1);
+        assert_eq!(closest.len(), 1);
+        assert_eq!(closest[0].identity, peer.identity);
     }
 }

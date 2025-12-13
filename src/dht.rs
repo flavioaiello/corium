@@ -328,7 +328,7 @@ impl LocalStore {
         }
     }
 
-    #[allow(dead_code)] // Test infrastructure for overriding limits
+    #[cfg(test)]
     pub fn override_limits(&mut self, disk_limit: usize, memory_limit: usize, request_limit: usize) {
         self.pressure.disk_limit = disk_limit;
         self.pressure.memory_limit = memory_limit;
@@ -996,12 +996,14 @@ impl<N: DhtRpc> Dht<N> {
         node
     }
 
-    #[allow(dead_code)] // Public API accessor
+    /// Returns this DHT node's identity.
+    #[allow(dead_code)] // Library public API
     pub fn identity(&self) -> Identity {
         self.id
     }
 
-    #[allow(dead_code)] // Public API accessor
+    /// Returns this DHT node's contact information.
+    #[allow(dead_code)] // Library public API
     pub fn contact(&self) -> Contact {
         self.self_contact.clone()
     }
@@ -1396,7 +1398,7 @@ impl<N: DhtRpc> Dht<N> {
         result
     }
 
-    #[allow(dead_code)] // Test infrastructure
+    #[cfg(test)]
     pub async fn override_pressure_limits(
         &self,
         disk_limit: usize,
@@ -1610,7 +1612,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)]
         async fn set_latency(&self, node: Identity, latency: Duration) {
             self.latencies.lock().await.insert(node, latency);
         }
@@ -1620,12 +1621,10 @@ mod tests {
             if fail { failures.insert(node); } else { failures.remove(&node); }
         }
 
-        #[allow(dead_code)]
         async fn store_calls(&self) -> Vec<(Contact, Key, usize)> {
             self.stores.lock().await.clone()
         }
 
-        #[allow(dead_code)]
         async fn ping_calls(&self) -> Vec<Identity> {
             self.pings.lock().await.clone()
         }
@@ -2438,5 +2437,15 @@ mod tests {
         assert_eq!(distance_cmp(&smaller, &larger), Ordering::Less);
         assert_eq!(distance_cmp(&larger, &smaller), Ordering::Greater);
         assert_eq!(distance_cmp(&smaller, &smaller), Ordering::Equal);
+    }
+
+    #[tokio::test]
+    async fn dht_identity_accessor() {
+        let registry = Arc::new(NetworkRegistry::default());
+        let node = TestNode::new(registry.clone(), 0x42, 20, 3).await;
+        
+        // Test the identity() accessor
+        let expected_id = make_identity(0x42);
+        assert_eq!(node.node.identity(), expected_id);
     }
 }

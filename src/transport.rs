@@ -150,7 +150,6 @@ pub fn detect_nat_type(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
 pub struct RelayInfo {
     pub relay_peer: Identity,
     pub relay_addrs: Vec<String>,
@@ -162,7 +161,6 @@ pub struct RelayInfo {
     pub tier: Option<u8>,
 }
 
-#[allow(dead_code)] // Relay infrastructure
 impl RelayInfo {
     pub fn selection_score(&self) -> f32 {
         let rtt_score = self.rtt_ms.unwrap_or(200.0);
@@ -205,7 +203,6 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay infrastructure - session tracking
 pub struct ForwarderSession {
     pub session_id: [u8; 16],
     pub peer_a_identity: Identity,
@@ -277,7 +274,6 @@ pub struct UdpRelayForwarder {
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
 }
 
-#[allow(dead_code)] // Relay infrastructure
 impl UdpRelayForwarder {
     pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
@@ -649,7 +645,6 @@ pub async fn handle_relay_request(
 
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay infrastructure - tunnel tracking
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
@@ -974,7 +969,6 @@ pub enum PathChoice {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Path state tracking - used by probe loop
 pub struct PeerPathState {
     pub identity: Identity,
     pub direct_addrs: Vec<SocketAddr>,
@@ -988,7 +982,6 @@ pub struct PeerPathState {
     identity_probe_prefix: u64,
 }
 
-#[allow(dead_code)] // Path state infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
         let identity_hash = blake3::hash(identity.as_bytes());
@@ -1526,18 +1519,6 @@ impl SmartSock {
                 sock.switch_to_best_paths().await;
             }
         })
-    }
-
-    #[allow(dead_code)] // Path resolution infrastructure
-    async fn resolve_destination(&self, smart_addr: &SmartAddr) -> Option<SocketAddr> {
-        let peers = self.peers.read().await;
-        peers.get(smart_addr).and_then(|state| state.best_addr())
-    }
-    
-    #[allow(dead_code)] // Path resolution infrastructure
-    async fn translate_source(&self, real_addr: SocketAddr) -> Option<SmartAddr> {
-        let reverse = self.reverse_map.read().await;
-        reverse.get(&real_addr).copied()
     }
     
     pub fn inner_socket(&self) -> &Arc<tokio::net::UdpSocket> {
@@ -2128,5 +2109,115 @@ mod tests {
             PathChoice::Relay { relay_addr, .. } => assert_eq!(relay_addr, relay),
             _ => panic!("Expected relay path"),
         }
+    }
+
+    #[test]
+    fn relay_info_selection_score() {
+        let info = RelayInfo {
+            relay_peer: Identity::from_bytes([1u8; 32]),
+            relay_addrs: vec!["127.0.0.1:5000".into()],
+            load: 0.5,
+            accepting: true,
+            rtt_ms: Some(50.0),
+            tier: Some(1),
+        };
+        
+        let score = info.selection_score();
+        assert!(score > 0.0);
+        assert!(info.has_latency_info());
+        
+        let no_latency = RelayInfo {
+            relay_peer: Identity::from_bytes([2u8; 32]),
+            relay_addrs: vec![],
+            load: 0.0,
+            accepting: false,
+            rtt_ms: None,
+            tier: None,
+        };
+        assert!(!no_latency.has_latency_info());
+        
+        let cloned = info.clone();
+        let _debug = format!("{:?}", cloned);
+    }
+
+    #[test]
+    fn forwarder_session_fields() {
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let session = ForwarderSession::new_pending(
+            [0u8; 16],
+            Identity::from_bytes([1u8; 32]),
+            Identity::from_bytes([2u8; 32]),
+            addr,
+        );
+        
+        assert_eq!(session.session_id, [0u8; 16]);
+        let _ = session.peer_a_identity;
+        let _ = session.peer_b_identity;
+        let _ = session.peer_a_addr;
+        assert!(session.peer_b_addr.is_none());
+        let _ = session.created_at;
+        let _ = session.last_activity;
+        assert_eq!(session.bytes_forwarded, 0);
+        assert_eq!(session.packets_forwarded, 0);
+        assert!(!session.completion_locked);
+        
+        let cloned = session.clone();
+        let _debug = format!("{:?}", cloned);
+    }
+
+    #[test]
+    fn relay_tunnel_encode_frame() {
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let tunnel = RelayTunnel::new(
+            [0xABu8; 16],
+            addr,
+            Identity::from_bytes([1u8; 32]),
+        );
+        
+        assert_eq!(tunnel.session_id, [0xABu8; 16]);
+        let _ = tunnel.relay_addr;
+        let _ = tunnel.peer_identity;
+        let _ = tunnel.established_at;
+        let _ = tunnel.last_activity;
+        
+        let quic_data = vec![1, 2, 3, 4, 5];
+        let frame = tunnel.encode_frame(&quic_data);
+        assert!(frame.len() > quic_data.len());
+        
+        let cloned = tunnel.clone();
+        let _debug = format!("{:?}", cloned);
+    }
+
+    #[test]
+    fn peer_path_state_new_and_fields() {
+        let id = Identity::from_bytes([1u8; 32]);
+        let state = PeerPathState::new(id);
+        
+        assert_eq!(state.identity, id);
+        assert!(state.direct_addrs.is_empty());
+        assert!(state.relay_tunnels.is_empty());
+        assert!(state.active_path.is_none());
+        assert!(state.last_send.is_none());
+        assert!(state.last_recv.is_none());
+        assert!(state.candidates.is_empty());
+        assert!(state.pending_probes.is_empty());
+        
+        let _debug = format!("{:?}", state);
+    }
+
+    #[test]
+    fn path_choice_variants() {
+        let direct = PathChoice::Direct { 
+            addr: "127.0.0.1:5000".parse().unwrap(),
+            rtt_ms: 10.0,
+        };
+        let relay = PathChoice::Relay {
+            relay_addr: "127.0.0.1:6000".parse().unwrap(),
+            session_id: [0u8; 16],
+            rtt_ms: 50.0,
+        };
+        
+        let _debug_direct = format!("{:?}", direct);
+        let _debug_relay = format!("{:?}", relay);
     }
 }

@@ -33,29 +33,17 @@ pub trait DhtRpc: Send + Sync + 'static {
 
 
 #[async_trait]
-#[allow(dead_code)]
+
 pub trait PlumTreeRpc: Send + Sync {
     async fn send_plumtree(&self, to: &Contact, from: Identity, message: PlumTreeMessage)
         -> Result<()>;
-
-    async fn send_plumtree_batch(
-        &self,
-        to: &Contact,
-        from: Identity,
-        messages: Vec<PlumTreeMessage>,
-    ) -> Result<()> {
-        for msg in messages {
-            self.send_plumtree(to, from, msg).await?;
-        }
-        Ok(())
-    }
     
     async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact>;
 }
 
 
 #[async_trait]
-#[allow(dead_code)]
+
 pub trait HyParViewRpc: Send + Sync {
     async fn send_hyparview(
         &self,
@@ -63,23 +51,6 @@ pub trait HyParViewRpc: Send + Sync {
         from: Identity,
         message: HyParViewMessage,
     ) -> Result<()>;
-}
-
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
-pub struct RelaySession {
-    pub session_id: [u8; 16],
-    pub relay_data_addr: String,
-    pub relay_identity: Identity,
-}
-
-#[async_trait]
-#[allow(dead_code)] // Relay infrastructure - trait for relay operations
-pub trait RelayRpc: Send + Sync {
-    async fn request_relay(&self, relay: &Contact, target: Identity) -> Result<RelaySession>;
-
-    async fn join_relay(&self, relay: &Contact, session_id: [u8; 16]) -> Result<RelaySession>;
 }
 
 
@@ -94,6 +65,8 @@ const MAX_CACHED_CONNECTIONS: usize = 1000;
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const RPC_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+const RELAY_ASSISTED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 
 
@@ -358,18 +331,6 @@ impl RpcNode {
         }
     }
 
-    #[allow(dead_code)] // Relay infrastructure - used when relay discovery is enabled
-    pub(crate) async fn relay_rpc(&self, contact: &Contact, request: RelayRequest) -> Result<RelayResponse> {
-        let rpc_request = RpcRequest::Relay(request);
-        let rpc_response = self.rpc_raw(contact, rpc_request).await?;
-        
-        match rpc_response {
-            RpcResponse::Relay(relay_response) => Ok(relay_response),
-            RpcResponse::Error { message } => anyhow::bail!("Relay RPC error: {}", message),
-            other => anyhow::bail!("unexpected response type for Relay request: {:?}", other),
-        }
-    }
-
     async fn rpc_raw(&self, contact: &Contact, request: RpcRequest) -> Result<RpcResponse> {
         let peer_id = contact.identity;
         let conn = self.get_or_connect(contact).await?;
@@ -427,7 +388,7 @@ impl RpcNode {
             let mut response_bytes = vec![0u8; len];
             recv.read_exact(&mut response_bytes).await?;
 
-            let response: RpcResponse = messages::deserialize_response(&response_bytes)
+            let response: RpcResponse = bincode::deserialize(&response_bytes)
                 .context("failed to deserialize response")?;
             Ok(response)
         })
@@ -475,6 +436,71 @@ impl RpcNode {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no addresses provided for peer")))
     }
 
+    pub async fn request_relay_session(
+        &self,
+        relay: &Contact,
+        from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<(Connection, RelayResponse)> {
+        let relay_addrs: Vec<String> = std::iter::once(relay.addr.clone())
+            .chain(relay.addrs.iter().cloned())
+            .collect();
+
+        let relay_conn = self
+            .connect_to_peer(&relay.identity, &relay_addrs)
+            .await
+            .context("failed to connect to relay")?;
+
+        let request = RelayRequest::Connect {
+            from_peer,
+            target_peer,
+            session_id,
+        };
+
+        let response = self.send_relay_rpc(&relay_conn, request).await?;
+        Ok((relay_conn, response))
+    }
+
+    pub async fn configure_relay_path_for_peer(
+        &self,
+        peer_id: Identity,
+        direct_addrs: &[String],
+        session_id: [u8; 16],
+        relay_data_addr: &str,
+    ) -> Result<()> {
+        let smartsock = self
+            .smartsock
+            .as_ref()
+            .context("SmartSock not configured")?;
+
+        let direct_socket_addrs: Vec<std::net::SocketAddr> = direct_addrs
+            .iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
+
+        smartsock.register_peer(peer_id, direct_socket_addrs).await;
+
+        let relay_data: std::net::SocketAddr = relay_data_addr
+            .parse()
+            .context("invalid relay data address")?;
+
+        let added = smartsock
+            .add_relay_tunnel(&peer_id, session_id, relay_data)
+            .await
+            .is_some();
+        if !added {
+            anyhow::bail!("failed to add relay tunnel (peer not registered)");
+        }
+
+        let switched = smartsock.use_relay_path(&peer_id, session_id).await;
+        if !switched {
+            anyhow::bail!("failed to activate relay path");
+        }
+
+        Ok(())
+    }
+
     async fn connect_and_verify(
         &self,
         addr: SocketAddr,
@@ -491,7 +517,7 @@ impl RpcNode {
         Ok(conn)
     }
 
-    pub async fn smart_connect(&self, record: &EndpointRecord) -> Result<Connection> {
+    pub async fn smartconnect(&self, record: &EndpointRecord) -> Result<Connection> {
         let peer_id = &record.identity;
         
         let our_nat_type = *self.nat_type.read().await;
@@ -550,121 +576,65 @@ impl RpcNode {
             let session_id = generate_session_id()
                 .context("failed to generate session ID")?;
             
-            let relay_addrs: Vec<String> = std::iter::once(relay.addr.clone())
-                .chain(relay.addrs.iter().cloned())
-                .collect();
-            let relay_conn = self.connect_to_peer(&relay_peer_id, &relay_addrs).await
-                .context("failed to connect to relay")?;
-            
-            let request = RelayRequest::Connect {
-                from_peer: *our_peer_id,
-                target_peer: *peer_id,
-                session_id,
-            };
-            
-            let response = self.send_relay_rpc(&relay_conn, request).await?;
-            
+            let (relay_conn, response) = self
+                .request_relay_session(relay, *our_peer_id, *peer_id, session_id)
+                .await?;
+
             let direct_addrs = record.addrs.clone();
-            
-            match response {
-                RelayResponse::Accepted { session_id, relay_data_addr } => {
+            if direct_addrs.is_empty() {
+                anyhow::bail!("cannot use relay without at least one target address");
+            }
+
+            let (session_id, relay_data_addr) = match response {
+                RelayResponse::Accepted {
+                    session_id,
+                    relay_data_addr,
+                } => {
                     debug!(
                         peer = ?peer_id,
                         relay = ?relay_peer_id,
                         session = hex::encode(session_id),
                         relay_data = %relay_data_addr,
-                        "relay session pending, waiting for peer"
+                        "relay session pending, attempting relay-assisted QUIC connect"
                     );
-                    
-                    let data_addr: Option<std::net::SocketAddr> = relay_data_addr.parse().ok();
-                    
-                    if let (Some(smartsock), Some(relay_data)) = (&self.smartsock, data_addr) {
-                        let addrs: Vec<std::net::SocketAddr> = direct_addrs.iter()
-                            .filter_map(|a| a.parse().ok())
-                            .collect();
-                        smartsock.register_peer(*peer_id, addrs).await;
-                        smartsock.add_relay_tunnel(peer_id, session_id, relay_data).await;
-                        smartsock.use_relay_path(peer_id, session_id).await;
-                        debug!(peer = ?peer_id, "registered peer with SmartSock (relay pending)");
-                    }
-                    
-                    Ok(relay_conn)
+                    (session_id, relay_data_addr)
                 }
-                RelayResponse::Connected { session_id, relay_data_addr } => {
+                RelayResponse::Connected {
+                    session_id,
+                    relay_data_addr,
+                } => {
                     debug!(
                         peer = ?peer_id,
                         relay = ?relay_peer_id,
                         session = hex::encode(session_id),
                         relay_data = %relay_data_addr,
-                        "relay session established"
+                        "relay session established, attempting relay-assisted QUIC connect"
                     );
-                    
-                    let data_addr: Option<std::net::SocketAddr> = relay_data_addr.parse().ok();
-                    
-                    if let (Some(smartsock), Some(relay_data)) = (&self.smartsock, data_addr) {
-                        let addrs: Vec<std::net::SocketAddr> = direct_addrs.iter()
-                            .filter_map(|a| a.parse().ok())
-                            .collect();
-                        smartsock.register_peer(*peer_id, addrs).await;
-                        smartsock.add_relay_tunnel(peer_id, session_id, relay_data).await;
-                        smartsock.use_relay_path(peer_id, session_id).await;
-                        debug!(peer = ?peer_id, "registered peer with SmartSock (relay connected)");
-                    }
-                    
-                    Ok(relay_conn)
+                    (session_id, relay_data_addr)
                 }
                 RelayResponse::Rejected { reason } => {
                     anyhow::bail!("relay rejected: {}", reason);
                 }
-            }
+            };
+
+            self.configure_relay_path_for_peer(*peer_id, &direct_addrs, session_id, &relay_data_addr)
+                .await?;
+
+            let peer_conn = tokio::time::timeout(
+                RELAY_ASSISTED_CONNECT_TIMEOUT,
+                self.connect_to_peer(peer_id, &direct_addrs),
+            )
+            .await
+            .context("relay-assisted connect timed out")?
+            .context("relay-assisted connect failed")?;
+
+            // Best-effort: keep the relay control connection around for future refreshes.
+            drop(relay_conn);
+
+            Ok(peer_conn)
         } else {
             anyhow::bail!("direct connection failed and no relays available");
         }
-    }
-
-    #[allow(dead_code)] // Used by smart_connect relay path
-    async fn send_rpc(&self, conn: &Connection, request: DhtRequest) -> Result<DhtResponse> {
-        tokio::time::timeout(RPC_STREAM_TIMEOUT, async {
-            let (mut send, mut recv) = conn
-                .open_bi()
-                .await
-                .context("failed to open bidirectional stream")?;
-
-            let rpc_request = RpcRequest::Dht(request);
-            let request_bytes = messages::serialize_request(&rpc_request)
-                .context("failed to serialize request")?;
-            let len = request_bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await?;
-            send.write_all(&request_bytes).await?;
-            send.finish()?;
-
-            let mut len_buf = [0u8; 4];
-            recv.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-
-            if len > MAX_RESPONSE_SIZE {
-                warn!(
-                    size = len,
-                    max = MAX_RESPONSE_SIZE,
-                    "peer sent oversized response on existing connection"
-                );
-                anyhow::bail!("response too large: {} bytes (max {})", len, MAX_RESPONSE_SIZE);
-            }
-
-            let mut response_bytes = vec![0u8; len];
-            recv.read_exact(&mut response_bytes).await?;
-
-            let rpc_response: RpcResponse = messages::deserialize_response(&response_bytes)
-                .context("failed to deserialize response")?;
-            
-            match rpc_response {
-                RpcResponse::Dht(dht_response) => Ok(dht_response),
-                RpcResponse::Error { message } => anyhow::bail!("RPC error: {}", message),
-                other => anyhow::bail!("unexpected response type: {:?}", other),
-            }
-        })
-        .await
-        .context("RPC timed out")?
     }
 
     async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
@@ -698,7 +668,7 @@ impl RpcNode {
             let mut response_bytes = vec![0u8; len];
             recv.read_exact(&mut response_bytes).await?;
 
-            let rpc_response: RpcResponse = messages::deserialize_response(&response_bytes)
+            let rpc_response: RpcResponse = bincode::deserialize(&response_bytes)
                 .context("failed to deserialize response")?;
             
             match rpc_response {
@@ -808,13 +778,6 @@ impl PlumTreeRpc for RpcNode {
             other => anyhow::bail!("unexpected response to PlumTree: {:?}", other),
         }
     }
-
-    async fn send_plumtree_batch(&self, to: &Contact, from: Identity, messages: Vec<PlumTreeMessage>) -> Result<()> {
-        for msg in messages {
-            self.send_plumtree(to, from, msg).await?;
-        }
-        Ok(())
-    }
     
     async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
         let mut cache = self.contact_cache.write().await;
@@ -834,97 +797,6 @@ impl HyParViewRpc for RpcNode {
             RpcResponse::HyParViewAck => Ok(()),
             RpcResponse::Error { message } => anyhow::bail!("HyParView rejected: {}", message),
             other => anyhow::bail!("unexpected response to HyParView: {:?}", other),
-        }
-    }
-}
-
-
-#[async_trait]
-impl RelayRpc for RpcNode {
-    async fn request_relay(
-        &self,
-        relay: &Contact,
-        target: Identity,
-    ) -> Result<RelaySession> {
-        let our_peer_id = self.our_peer_id.as_ref()
-            .context("cannot use relay without our_peer_id set")?;
-        
-        let session_id = generate_session_id()
-            .context("failed to generate session ID")?;
-        
-        let request = RelayRequest::Connect {
-            from_peer: *our_peer_id,
-            target_peer: target,
-            session_id,
-        };
-        
-        match self.relay_rpc(relay, request).await? {
-            RelayResponse::Accepted { session_id, relay_data_addr } => {
-                debug!(
-                    target = ?target,
-                    relay = ?relay.identity,
-                    session = hex::encode(session_id),
-                    relay_data = %relay_data_addr,
-                    "relay session pending, waiting for peer"
-                );
-                Ok(RelaySession {
-                    session_id,
-                    relay_data_addr,
-                    relay_identity: relay.identity,
-                })
-            }
-            RelayResponse::Connected { session_id, relay_data_addr } => {
-                debug!(
-                    target = ?target,
-                    relay = ?relay.identity,
-                    session = hex::encode(session_id),
-                    relay_data = %relay_data_addr,
-                    "relay session established"
-                );
-                Ok(RelaySession {
-                    session_id,
-                    relay_data_addr,
-                    relay_identity: relay.identity,
-                })
-            }
-            RelayResponse::Rejected { reason } => {
-                anyhow::bail!("relay rejected: {}", reason);
-            }
-        }
-    }
-
-    async fn join_relay(
-        &self,
-        relay: &Contact,
-        session_id: [u8; 16],
-    ) -> Result<RelaySession> {
-        let our_peer_id = self.our_peer_id.as_ref()
-            .context("cannot use relay without our_peer_id set")?;
-        
-        let request = RelayRequest::Connect {
-            from_peer: *our_peer_id,
-            target_peer: *our_peer_id, // Placeholder, relay matches by session_id
-            session_id,
-        };
-        
-        match self.relay_rpc(relay, request).await? {
-            RelayResponse::Connected { session_id, relay_data_addr } => {
-                debug!(
-                    relay = ?relay.identity,
-                    session = hex::encode(session_id),
-                    relay_data = %relay_data_addr,
-                    "joined relay session"
-                );
-                Ok(RelaySession {
-                    session_id,
-                    relay_data_addr,
-                    relay_identity: relay.identity,
-                })
-            }
-            RelayResponse::Rejected { reason } => {
-                anyhow::bail!("relay rejected join: {}", reason);
-            }
-            other => anyhow::bail!("unexpected relay response for join: {:?}", other),
         }
     }
 }

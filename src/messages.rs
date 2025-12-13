@@ -12,13 +12,6 @@ pub const MAX_VALUE_SIZE: usize = 1024 * 1024;
 
 pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
 
-#[allow(dead_code)]
-pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-
-#[allow(dead_code)]
-pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
-
-
 fn bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(MAX_DESERIALIZE_SIZE)
@@ -34,15 +27,6 @@ pub fn serialize_request(request: &RpcRequest) -> Result<Vec<u8>, bincode::Error
 }
 
 pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
-    bincode_options().deserialize(data)
-}
-
-#[allow(dead_code)]
-pub fn serialize_response(response: &RpcResponse) -> Result<Vec<u8>, bincode::Error> {
-    bincode::serialize(response)
-}
-
-pub fn deserialize_response(data: &[u8]) -> Result<RpcResponse, bincode::Error> {
     bincode_options().deserialize(data)
 }
 
@@ -165,7 +149,7 @@ pub enum PlumTreeMessage {
 }
 
 impl PlumTreeMessage {
-    #[allow(dead_code)] // Used for message routing
+    /// Returns the topic for this message, if applicable.
     pub fn topic(&self) -> Option<&str> {
         match self {
             PlumTreeMessage::Subscribe { topic } => Some(topic),
@@ -490,7 +474,7 @@ mod tests {
         let response = RpcResponse::Dht(DhtResponse::Ack);
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
-            deserialize_response(&bytes).expect("deserialize should succeed");
+            bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
             RpcResponse::Dht(DhtResponse::Ack) => {}
@@ -532,7 +516,7 @@ mod tests {
         let response = RpcResponse::PlumTreeAck;
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
-            deserialize_response(&bytes).expect("deserialize should succeed");
+            bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
             RpcResponse::PlumTreeAck => {}
@@ -545,7 +529,7 @@ mod tests {
         let response = RpcResponse::HyParViewAck;
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
-            deserialize_response(&bytes).expect("deserialize should succeed");
+            bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
             RpcResponse::HyParViewAck => {}
@@ -560,7 +544,7 @@ mod tests {
         };
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
-            deserialize_response(&bytes).expect("deserialize should succeed");
+            bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
             RpcResponse::Error { message } => {
@@ -568,5 +552,36 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn plumtree_message_topic_accessor() {
+        let subscribe = PlumTreeMessage::Subscribe { topic: "test".into() };
+        assert_eq!(subscribe.topic(), Some("test"));
+        
+        let unsubscribe = PlumTreeMessage::Unsubscribe { topic: "foo".into() };
+        assert_eq!(unsubscribe.topic(), Some("foo"));
+        
+        let graft = PlumTreeMessage::Graft { topic: "bar".into() };
+        assert_eq!(graft.topic(), Some("bar"));
+        
+        let prune = PlumTreeMessage::Prune { topic: "baz".into(), peers: vec![] };
+        assert_eq!(prune.topic(), Some("baz"));
+        
+        let publish = PlumTreeMessage::Publish {
+            topic: "pub".into(),
+            msg_id: [0u8; 32],
+            source: test_identity(),
+            seqno: 1,
+            data: vec![],
+            signature: vec![],
+        };
+        assert_eq!(publish.topic(), Some("pub"));
+        
+        let ihave = PlumTreeMessage::IHave { topic: "ih".into(), msg_ids: vec![] };
+        assert_eq!(ihave.topic(), Some("ih"));
+        
+        let iwant = PlumTreeMessage::IWant { msg_ids: vec![] };
+        assert_eq!(iwant.topic(), None);
     }
 }

@@ -136,7 +136,9 @@ pub fn extract_verified_identity(connection: &quinn::Connection) -> Option<Ident
     Some(Identity::from_bytes(public_key))
 }
 
-#[allow(dead_code)] // Used by test infrastructure
+/// Verifies that a certificate's public key matches the expected identity.
+/// Used for peer certificate validation.
+#[allow(dead_code)] // Library public API
 pub fn verify_peer_identity(cert_der: &[u8], expected_identity: &Identity) -> bool {
     if let Some(public_key) = extract_public_key_from_cert(cert_der) {
         crate::identity::verify_identity(expected_identity, &public_key)
@@ -404,5 +406,21 @@ mod tests {
                 "P4 violation: Certificate public key collision between different keypairs"
             );
         }
+    }
+
+    #[test]
+    fn verify_peer_identity_function() {
+        let keypair = Keypair::generate();
+        let (certs, _) = generate_ed25519_cert(&keypair)
+            .expect("cert generation must succeed");
+        
+        let identity = keypair.identity();
+        
+        // Test the verify_peer_identity function
+        assert!(verify_peer_identity(certs[0].as_ref(), &identity));
+        
+        // Test with wrong identity
+        let wrong_id = Identity::from_bytes([0xFFu8; 32]);
+        assert!(!verify_peer_identity(certs[0].as_ref(), &wrong_id));
     }
 }
