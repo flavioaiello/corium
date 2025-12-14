@@ -14,10 +14,11 @@ use tracing::{debug, info, trace, warn};
 use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
-use crate::transport::{self, Contact, NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
+use crate::transport::{self, Contact, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
 use crate::dht::{DhtNode, Key};
 use crate::identity::{EndpointRecord, Identity};
-use crate::hyparview::{HyParView, HyParViewMessage};
+use crate::hyparview::HyParView;
+use crate::messages::HyParViewMessage;
 use crate::plumtree::PlumTreeHandler;
 
 
@@ -113,7 +114,6 @@ pub struct RpcNode {
     pub self_contact: Contact,
     client_config: ClientConfig,
     our_peer_id: Option<Identity>,
-    nat_type: Arc<RwLock<NatType>>,
     public_addr: Arc<RwLock<Option<SocketAddr>>>,
     connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
     contact_cache: Arc<RwLock<LruCache<Identity, Contact>>>,
@@ -133,7 +133,6 @@ impl RpcNode {
             self_contact,
             client_config,
             our_peer_id: Some(our_peer_id),
-            nat_type: Arc::new(RwLock::new(NatType::Unknown)),
             public_addr: Arc::new(RwLock::new(None)),
             connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
@@ -165,52 +164,19 @@ impl RpcNode {
         *self.public_addr.read().await
     }
 
-    pub async fn detect_nat(&self, stun_contacts: &[Contact]) -> NatType {
-        if stun_contacts.len() < 2 {
-            debug!("not enough STUN contacts for NAT detection, need at least 2");
-            return NatType::Unknown;
-        }
-
-        let mut mapped_addrs: Vec<SocketAddr> = Vec::new();
-        
-        for contact in stun_contacts.iter().take(2) {
-            match self.what_is_my_addr(contact).await {
-                Ok(addr) => {
-                    mapped_addrs.push(addr);
-                }
-                Err(e) => {
-                    debug!(contact = %contact.addr, error = %e, "STUN query failed");
-                }
+    /// Discover our public address by asking a peer what address they see us as.
+    /// This is used to populate our externally-visible address for relay endpoints.
+    pub async fn discover_public_addr(&self, contact: &Contact) {
+        match self.what_is_my_addr(contact).await {
+            Ok(addr) => {
+                let mut public_addr = self.public_addr.write().await;
+                *public_addr = Some(addr);
+                info!(public_addr = %addr, "discovered public address");
+            }
+            Err(e) => {
+                debug!(contact = %contact.addr, error = %e, "failed to discover public address");
             }
         }
-
-        let local_addr: SocketAddr = self.self_contact.addr.parse().unwrap_or_else(|_| {
-            "0.0.0.0:0".parse().unwrap()
-        });
-
-        let report = detect_nat_type(
-            mapped_addrs.first().copied(),
-            mapped_addrs.get(1).copied(),
-            local_addr,
-        );
-
-        {
-            let mut nat_type = self.nat_type.write().await;
-            *nat_type = report.nat_type;
-        }
-        
-        if let Some(addr) = report.mapped_addr_1 {
-            let mut public_addr = self.public_addr.write().await;
-            *public_addr = Some(addr);
-        }
-
-        info!(
-            nat_type = ?report.nat_type,
-            public_addr = ?report.mapped_addr_1,
-            "NAT detection complete"
-        );
-
-        report.nat_type
     }
 
     fn parse_addr(&self, contact: &Contact) -> Result<SocketAddr> {
@@ -522,21 +488,11 @@ impl RpcNode {
         Ok(conn)
     }
 
-    pub async fn smartconnect(&self, record: &EndpointRecord) -> Result<Connection> {
+    pub async fn smartconnect(&self, record: &EndpointRecord, path_nodes: Vec<Contact>) -> Result<Connection> {
         let peer_id = &record.identity;
-        
-        let our_nat_type = *self.nat_type.read().await;
-        let skip_direct = our_nat_type == NatType::Symmetric;
-        
-        if skip_direct {
-            debug!(
-                peer = ?peer_id,
-                nat_type = ?our_nat_type,
-                "Symmetric NAT detected, skipping direct connection (CGNAT mode)"
-            );
-        }
 
-        if !record.addrs.is_empty() && !skip_direct {
+        // Try direct connection first (SmartSock handles path probing and fallback)
+        if !record.addrs.is_empty() {
             debug!(peer = ?peer_id, addrs = ?record.addrs, "trying direct connection");
             
             let direct_result = tokio::time::timeout(
@@ -568,77 +524,157 @@ impl RpcNode {
             }
         }
 
-        if record.has_relays() {
-            debug!(peer = ?peer_id, relays = record.relays.len(), "trying relay connection");
+        // Use path nodes from DHT lookup as relay candidates (they are reachable by us
+        // and likely reachable by the target peer since they're in the DHT path)
+        if !path_nodes.is_empty() {
+            debug!(
+                peer = ?peer_id,
+                path_node_count = path_nodes.len(),
+                "trying relay connection via DHT path nodes"
+            );
             
             let our_peer_id = self.our_peer_id.as_ref()
                 .context("cannot use relay without our_peer_id set")?;
-            
-            let relay = record.relays.first()
-                .context("no relays available")?;
-            
-            let relay_peer_id = relay.identity;
-            let session_id = generate_session_id()
-                .context("failed to generate session ID")?;
-            
-            let (relay_conn, response) = self
-                .request_relay_session(relay, *our_peer_id, *peer_id, session_id)
-                .await?;
 
             let direct_addrs = record.addrs.clone();
             if direct_addrs.is_empty() {
                 anyhow::bail!("cannot use relay without at least one target address");
             }
+            
+            // Try each path node as a potential relay
+            let mut last_error = None;
+            for relay in &path_nodes {
+                // Skip if the relay is the target peer itself
+                if relay.identity == *peer_id {
+                    continue;
+                }
+                
+                let relay_peer_id = relay.identity;
+                let session_id = match generate_session_id() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                
+                debug!(
+                    peer = ?peer_id,
+                    relay = ?relay_peer_id,
+                    "attempting relay via DHT path node"
+                );
+                
+                let relay_result = self
+                    .request_relay_session(relay, *our_peer_id, *peer_id, session_id)
+                    .await;
 
-            let (session_id, relay_data_addr) = match response {
-                RelayResponse::Accepted {
+                let (relay_conn, response) = match relay_result {
+                    Ok((conn, resp)) => (conn, resp),
+                    Err(e) => {
+                        debug!(
+                            relay = ?relay_peer_id,
+                            error = %e,
+                            "failed to request relay session, trying next"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                };
+
+                let (session_id, relay_data_addr) = match response {
+                    RelayResponse::Accepted {
+                        session_id,
+                        relay_data_addr,
+                    } => {
+                        debug!(
+                            peer = ?peer_id,
+                            relay = ?relay_peer_id,
+                            session = hex::encode(session_id),
+                            relay_data = %relay_data_addr,
+                            "relay session pending via path node"
+                        );
+                        (session_id, relay_data_addr)
+                    }
+                    RelayResponse::Connected {
+                        session_id,
+                        relay_data_addr,
+                    } => {
+                        debug!(
+                            peer = ?peer_id,
+                            relay = ?relay_peer_id,
+                            session = hex::encode(session_id),
+                            relay_data = %relay_data_addr,
+                            "relay session established via path node"
+                        );
+                        (session_id, relay_data_addr)
+                    }
+                    RelayResponse::Rejected { reason } => {
+                        debug!(
+                            relay = ?relay_peer_id,
+                            reason = %reason,
+                            "relay rejected, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!("relay rejected: {}", reason));
+                        continue;
+                    }
+                };
+
+                if let Err(e) = self.configure_relay_path_for_peer(
+                    *peer_id,
+                    &direct_addrs,
                     session_id,
-                    relay_data_addr,
-                } => {
+                    &relay_data_addr,
+                ).await {
                     debug!(
-                        peer = ?peer_id,
                         relay = ?relay_peer_id,
-                        session = hex::encode(session_id),
-                        relay_data = %relay_data_addr,
-                        "relay session pending, attempting relay-assisted QUIC connect"
+                        error = %e,
+                        "failed to configure relay path, trying next"
                     );
-                    (session_id, relay_data_addr)
+                    last_error = Some(e);
+                    continue;
                 }
-                RelayResponse::Connected {
-                    session_id,
-                    relay_data_addr,
-                } => {
-                    debug!(
-                        peer = ?peer_id,
-                        relay = ?relay_peer_id,
-                        session = hex::encode(session_id),
-                        relay_data = %relay_data_addr,
-                        "relay session established, attempting relay-assisted QUIC connect"
-                    );
-                    (session_id, relay_data_addr)
+
+                let peer_conn_result = tokio::time::timeout(
+                    RELAY_ASSISTED_CONNECT_TIMEOUT,
+                    self.connect_to_peer(peer_id, &direct_addrs),
+                )
+                .await;
+
+                drop(relay_conn);
+
+                match peer_conn_result {
+                    Ok(Ok(conn)) => {
+                        info!(
+                            peer = ?peer_id,
+                            relay = ?relay_peer_id,
+                            "relay connection successful via DHT path node"
+                        );
+                        return Ok(conn);
+                    }
+                    Ok(Err(e)) => {
+                        debug!(
+                            relay = ?relay_peer_id,
+                            error = %e,
+                            "relay-assisted connect failed, trying next"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(_) => {
+                        debug!(
+                            relay = ?relay_peer_id,
+                            "relay-assisted connect timed out, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!("relay-assisted connect timed out"));
+                        continue;
+                    }
                 }
-                RelayResponse::Rejected { reason } => {
-                    anyhow::bail!("relay rejected: {}", reason);
-                }
-            };
+            }
 
-            self.configure_relay_path_for_peer(*peer_id, &direct_addrs, session_id, &relay_data_addr)
-                .await?;
-
-            let peer_conn = tokio::time::timeout(
-                RELAY_ASSISTED_CONNECT_TIMEOUT,
-                self.connect_to_peer(peer_id, &direct_addrs),
-            )
-            .await
-            .context("relay-assisted connect timed out")?
-            .context("relay-assisted connect failed")?;
-
-            drop(relay_conn);
-
-            Ok(peer_conn)
-        } else {
-            anyhow::bail!("direct connection failed and no relays available");
+            // All path nodes failed
+            if let Some(e) = last_error {
+                anyhow::bail!("all relay attempts failed, last error: {}", e);
+            }
         }
+
+        anyhow::bail!("direct connection failed and no relay path nodes available");
     }
 
     async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {

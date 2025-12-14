@@ -11,7 +11,6 @@ use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
-use crate::ratelimit::ConnectionRateLimiter;
 use crate::transport::{Contact, SmartSock, UdpRelayForwarder};
 use crate::rpc::{self, RpcNode};
 
@@ -23,7 +22,6 @@ pub struct Node {
     contact: Contact,
     dhtnode: DhtNode<RpcNode>,
     rpcnode: RpcNode,
-    rate_limiter: Arc<ConnectionRateLimiter>,
     udp_forwarder_addr: SocketAddr,
     hyparview: HyParView,
     plumtree: PlumTree<RpcNode>,
@@ -80,8 +78,6 @@ impl Node {
             DEFAULT_ALPHA,
         );
         
-        let rate_limiter = Arc::new(ConnectionRateLimiter::new());
-        
         let udp_forwarder = UdpRelayForwarder::with_socket(smartsock.inner_socket().clone());
         smartsock.set_forwarder(udp_forwarder.clone());
         let udp_forwarder_addr = local_addr;
@@ -97,7 +93,6 @@ impl Node {
         let server_handle = {
             let endpoint = endpoint.clone();
             let dhtnode = dhtnode.clone();
-            let rate_limiter = rate_limiter.clone();
             let udp_forwarder = udp_forwarder.clone();
             let smartsock_for_server = Some(smartsock.clone());
             let plumtree_handler: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
@@ -108,12 +103,6 @@ impl Node {
             
             let server_task = tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
-                    let remote_addr = incoming.remote_address();
-                    if !rate_limiter.allow(remote_addr.ip()).await {
-                        warn!(remote = %remote_addr, "rate limiting: rejecting connection");
-                        continue;
-                    }
-
                     let node = dhtnode.clone();
                     let plumtree = Some(plumtree_handler.clone());
                     let forwarder = Some(udp_forwarder.clone());
@@ -144,7 +133,6 @@ impl Node {
             contact,
             dhtnode,
             rpcnode,
-            rate_limiter,
             udp_forwarder_addr,
             hyparview,
             plumtree,
@@ -208,9 +196,6 @@ impl Node {
             .await
     }
     
-    pub fn is_relay_capable(&self) -> bool {
-        true    }
-    
     pub async fn relay_endpoint(&self) -> Option<Contact> {
         let forwarder_addr = self.udp_forwarder_addr;
         let local_addr = self.endpoint.local_addr().ok()?;
@@ -240,12 +225,8 @@ impl Node {
     }
     
     pub async fn bootstrap(&self, identity: &str, addr: &str) -> Result<()> {
-        let identity_bytes = hex::decode(identity)
+        let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
-        if identity_bytes.len() != 32 {
-            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
-        }
-        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
         let contact = Contact {
             identity: peer_identity,
@@ -258,7 +239,7 @@ impl Node {
         
         self.hyparview.request_join(peer_identity).await;
         
-        self.rpcnode.detect_nat(&[contact]).await;
+        self.rpcnode.discover_public_addr(&contact).await;
         
         let self_identity = self.keypair.identity();
         self.dhtnode.iterative_find_node(self_identity).await?;
@@ -268,53 +249,34 @@ impl Node {
     
     
     pub async fn connect(&self, identity: &str, addr: &str) -> Result<Connection> {
-        let identity_bytes = hex::decode(identity)
+        let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
-        if identity_bytes.len() != 32 {
-            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
-        }
-        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        let record = EndpointRecord {
-            identity: peer_identity,
-            addrs: vec![addr.to_string()],
-            relays: vec![],
-            timestamp: crate::identity::now_ms(),
-            signature: vec![],        };
-        
-        let conn = self.rpcnode.smartconnect(&record).await?;
+        let conn = self.rpcnode.connect_to_peer(&peer_identity, &[addr.to_string()]).await?;
         Ok(conn)
     }
     
     pub async fn connect_peer(&self, identity: &str) -> Result<Connection> {
-        let identity_bytes = hex::decode(identity)
+        let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
-        if identity_bytes.len() != 32 {
-            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
-        }
-        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        let record = self.dhtnode.resolve_peer(&peer_identity).await?
-            .context("peer not found in DHT")?;
+        let (record, path_nodes) = self.dhtnode.resolve_peer_with_path(&peer_identity).await?;
+        let record = record.context("peer not found in DHT")?;
         
         debug!(
             peer = %identity,
             addrs = ?record.addrs,
-            relays = record.relays.len(),
+            path_nodes = path_nodes.len(),
             "resolved peer endpoint, attempting smartconnect"
         );
         
-        let conn = self.rpcnode.smartconnect(&record).await?;
+        let conn = self.rpcnode.smartconnect(&record, path_nodes).await?;
         Ok(conn)
     }
     
     pub async fn send_direct(&self, identity: &str, data: Vec<u8>) -> Result<()> {
-        let identity_bytes = hex::decode(identity)
+        let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
-        if identity_bytes.len() != 32 {
-            anyhow::bail!("invalid identity: must be 32 bytes (64 hex chars)");
-        }
-        let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
         let record = self.dhtnode.resolve_peer(&peer_identity).await?
             .context("peer not found in DHT")?;
@@ -400,10 +362,6 @@ impl Node {
         self.plumtree.quit().await;
         self.dhtnode.quit().await;
         self.server_handle.abort();
-    }
-    
-    pub async fn connection_stats(&self) -> crate::ratelimit::RateLimitStats {
-        self.rate_limiter.stats().await
     }
     
     

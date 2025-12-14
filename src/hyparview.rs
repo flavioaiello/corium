@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use rand::seq::IteratorRandom;
 use rand::SeedableRng;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::identity::Identity;
+use crate::messages::{HyParViewMessage, Priority};
 use crate::rpc::HyParViewRpc;
 
 
@@ -37,39 +37,6 @@ impl Default for HyParViewConfig {
             neighbor_timeout: Duration::from_secs(5),
         }
     }
-}
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Priority {
-    High,
-    Low,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HyParViewMessage {
-    Join,
-    ForwardJoin {
-        new_peer: Identity,
-        ttl: u8,
-    },
-    Neighbor {
-        priority: Priority,
-    },
-    NeighborReply {
-        accepted: bool,
-    },
-    Shuffle {
-        origin: Identity,
-        peers: Vec<Identity>,
-        ttl: u8,
-    },
-    ShuffleReply {
-        peers: Vec<Identity>,
-    },
-    Disconnect {
-        alive: bool,
-    },
 }
 
 

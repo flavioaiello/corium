@@ -5,7 +5,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::dht::Key;
 use crate::identity::Identity;
 use crate::transport::Contact;
-use crate::hyparview::HyParViewMessage;
 
 pub type DirectMessageSender = tokio::sync::mpsc::Sender<(Identity, Vec<u8>)>;
 
@@ -161,6 +160,39 @@ impl PlumTreeMessage {
             PlumTreeMessage::IWant { .. } => None,
         }
     }
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Priority {
+    High,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HyParViewMessage {
+    Join,
+    ForwardJoin {
+        new_peer: Identity,
+        ttl: u8,
+    },
+    Neighbor {
+        priority: Priority,
+    },
+    NeighborReply {
+        accepted: bool,
+    },
+    Shuffle {
+        origin: Identity,
+        peers: Vec<Identity>,
+        ttl: u8,
+    },
+    ShuffleReply {
+        peers: Vec<Identity>,
+    },
+    Disconnect {
+        alive: bool,
+    },
 }
 
 

@@ -32,22 +32,16 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 async fn node_relay_capability_check() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Check if relay is available
-    let is_relay = node.is_relay_capable();
+    // Relay is mandatory for all nodes
+    let relay_ep = node.relay_endpoint().await;
+    assert!(relay_ep.is_some(), "relay endpoint should exist");
     
-    // The relay forwarder binds to port+1, so it may or may not succeed
-    // Just verify the API works correctly
-    if is_relay {
-        let relay_ep = node.relay_endpoint().await;
-        assert!(relay_ep.is_some(), "relay endpoint should exist");
-        
-        let contact = relay_ep.unwrap();
-        assert_eq!(
-            hex::encode(contact.identity),
-            node.identity(),
-            "relay identity should match node"
-        );
-    }
+    let contact = relay_ep.unwrap();
+    assert_eq!(
+        hex::encode(contact.identity),
+        node.identity(),
+        "relay identity should match node"
+    );
 }
 
 #[tokio::test]
@@ -55,13 +49,12 @@ async fn two_relay_nodes_capability() {
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
     
-    // Both should have relay capability status
-    let _ = node1.is_relay_capable();
-    let _ = node2.is_relay_capable();
+    // Both nodes should have relay endpoints (relay is mandatory)
+    let relay1 = node1.relay_endpoint().await;
+    let relay2 = node2.relay_endpoint().await;
     
-    // Verify both can report their endpoints
-    let _ = node1.relay_endpoint().await;
-    let _ = node2.relay_endpoint().await;
+    assert!(relay1.is_some(), "node1 relay endpoint should exist");
+    assert!(relay2.is_some(), "node2 relay endpoint should exist");
 }
 
 // ============================================================================
@@ -215,26 +208,20 @@ async fn relay_forwarder_port_availability() {
     // Bind a node
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // The relay forwarder should have tried to bind to port+1
-    // If it failed, is_relay_capable returns false
-    let is_capable = node.is_relay_capable();
+    // Relay is mandatory - verify endpoint exists
+    let relay1 = node.relay_endpoint().await;
+    assert!(relay1.is_some(), "relay endpoint should exist");
     
     // Create another node
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
-    let is_capable2 = node2.is_relay_capable();
-    
-    // At least one should be relay capable
-    let _ = is_capable || is_capable2;
+    let relay2 = node2.relay_endpoint().await;
+    assert!(relay2.is_some(), "relay endpoint should exist");
 }
 
 #[tokio::test]
 async fn relay_forwarder_shares_socket() {
     // With socket multiplexing, the relay forwarder shares the QUIC socket
-    // so no separate port is needed and relay is always capable
     let node = Node::bind(&test_addr()).await.expect("node bind failed");
-    
-    // Relay should always be capable since it shares the socket
-    assert!(node.is_relay_capable(), "relay should be capable with socket multiplexing");
     
     // Verify the relay endpoint uses the same port as QUIC
     let relay = node.relay_endpoint().await.expect("relay endpoint should exist");
@@ -342,8 +329,8 @@ async fn multiple_relay_endpoints_sequential() {
     for _ in 0..3 {
         let node = Node::bind(&test_addr()).await.expect("bind failed");
         
-        let _ = node.is_relay_capable();
-        let _ = node.relay_endpoint().await;
+        let relay = node.relay_endpoint().await;
+        assert!(relay.is_some(), "relay endpoint should exist");
         
         // Clean up
         drop(node);

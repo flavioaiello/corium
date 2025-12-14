@@ -89,14 +89,9 @@ async fn node_smartsock_accessor() {
 async fn node_relay_capability() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Node should attempt to bind relay forwarder
-    let is_relay = node.is_relay_capable();
-    
-    // Relay endpoint should be available if relay capable
-    if is_relay {
-        let relay_ep = node.relay_endpoint().await;
-        assert!(relay_ep.is_some(), "relay endpoint should exist if relay capable");
-    }
+    // Relay is mandatory for all nodes
+    let relay_ep = node.relay_endpoint().await;
+    assert!(relay_ep.is_some(), "relay endpoint should exist");
 }
 
 #[tokio::test]
