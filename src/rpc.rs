@@ -649,6 +649,10 @@ impl RpcNode {
                         return Ok(conn);
                     }
                     Ok(Err(e)) => {
+                        // Clean up the relay tunnel we configured since connection failed
+                        if let Some(smartsock) = &self.smartsock {
+                            smartsock.remove_relay_tunnel(peer_id, &session_id).await;
+                        }
                         debug!(
                             relay = ?relay_peer_id,
                             error = %e,
@@ -658,6 +662,10 @@ impl RpcNode {
                         continue;
                     }
                     Err(_) => {
+                        // Clean up the relay tunnel we configured since connection timed out
+                        if let Some(smartsock) = &self.smartsock {
+                            smartsock.remove_relay_tunnel(peer_id, &session_id).await;
+                        }
                         debug!(
                             relay = ?relay_peer_id,
                             "relay-assisted connect timed out, trying next"

@@ -364,8 +364,11 @@ impl UdpRelayForwarder {
         let mut session_id = [0u8; 16];
         session_id.copy_from_slice(&data[4..20]);
         
+        // Hold both locks atomically to prevent race conditions during session completion.
+        // This ensures addr_to_session stays consistent with session state.
         let dest = {
             let mut sessions = self.sessions.write().await;
+            let mut addr_map = self.addr_to_session.write().await;
             
             let session = match sessions.get_mut(&session_id) {
                 Some(s) => s,
@@ -382,16 +385,12 @@ impl UdpRelayForwarder {
             if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
                 session.completion_locked = true;
                 session.peer_b_addr = Some(from);
+                addr_map.insert(from, session_id);
 
                 let dest = session.get_destination(from);
                 if dest.is_some() {
                     session.record_forward(data.len());
                 }
-                
-                drop(sessions);
-                let mut addr_map = self.addr_to_session.write().await;
-                addr_map.insert(from, session_id);
-
                 dest
             } else {
                 let dest = session.get_destination(from);
