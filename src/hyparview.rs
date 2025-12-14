@@ -129,11 +129,6 @@ impl HyParView {
     }
 }
 
-
-// ============================================================================
-// HyParView Actor (internal state + event loop)
-// ============================================================================
-
 struct HyParViewActor<N: HyParViewRpc> {
     me: Identity,
     config: HyParViewConfig,
@@ -213,10 +208,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         
         debug!("HyParView actor shutting down");
     }
-
-    // ========================================================================
-    // Public command handlers
-    // ========================================================================
 
     async fn request_join(&mut self, bootstrap: Identity) {
         if bootstrap == self.me {
@@ -306,10 +297,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         self.active_view.clear();
         self.passive_view.clear();
     }
-
-    // ========================================================================
-    // Message handlers
-    // ========================================================================
 
     async fn on_join(&mut self, from: Identity) {
         debug!(peer = %hex::encode(&from.as_bytes()[..8]), "received Join");
@@ -481,9 +468,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         }
     }
 
-    // ========================================================================
-    // Helper methods
-    // ========================================================================
 
     async fn cleanup_stale_pending_neighbors(&mut self) {
         let timeout = self.config.neighbor_timeout;

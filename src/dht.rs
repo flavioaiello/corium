@@ -138,15 +138,9 @@ impl AdaptiveParams {
     }
 }
 
-/// Result of an iterative DHT lookup, containing both the closest nodes
-/// and the nodes that were successfully queried during the lookup.
-/// The `path_nodes` are natural relay candidates since they were reachable
-/// during the lookup and are likely reachable by the target peer as well.
 #[derive(Clone, Debug)]
 pub struct LookupResult {
-    /// Nodes closest to the target (sorted by XOR distance)
     pub closest: Vec<Contact>,
-    /// Nodes that successfully responded during the lookup (potential relays)
     pub path_nodes: Vec<Contact>,
 }
 
