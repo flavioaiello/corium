@@ -430,9 +430,13 @@ impl UdpRelayForwarder {
                 }
             };
             
-            if !session.is_complete() && session.completion_locked && from != session.peer_a_addr {
-                session.peer_b_addr = Some(from);
+            // Handle session completion via first data packet from peer B.
+            // Condition: session is pending (!is_complete), not yet locked for completion,
+            // and packet is from a different address than peer A (i.e., peer B).
+            if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
+                // Lock to prevent race with concurrent packets
                 session.completion_locked = true;
+                session.peer_b_addr = Some(from);
 
                 let dest = session.get_destination(from);
                 if dest.is_some() {

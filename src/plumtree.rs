@@ -53,6 +53,9 @@ pub const MAX_OUTBOUND_PEERS: usize = 1000;
 pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 pub const RATE_LIMIT_ENTRY_MAX_AGE: Duration = Duration::from_secs(300);
 
+/// Maximum total bytes for the message cache (64 MB)
+pub const MAX_MESSAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Configuration for the PlumTree gossip protocol.
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // eager_peers, lazy_peers, message_cache_ttl reserved for protocol tuning
@@ -174,6 +177,14 @@ pub(crate) struct CachedMessage {
     pub seqno: u64,
     pub data: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+impl CachedMessage {
+    /// Returns the approximate memory footprint of this cached message in bytes.
+    pub fn size_bytes(&self) -> usize {
+        // topic string + data vec + signature vec + fixed fields overhead
+        self.topic.len() + self.data.len() + self.signature.len() + 64
+    }
 }
 
 #[derive(Debug)]
@@ -380,6 +391,8 @@ pub struct PlumTree<N: PlumTreeRpc> {
     subscriptions: Arc<RwLock<HashSet<String>>>,
     topics: Arc<RwLock<HashMap<String, TopicState>>>,
     message_cache: Arc<RwLock<LruCache<MessageId, CachedMessage>>>,
+    /// Current total bytes stored in message_cache for memory-based eviction
+    message_cache_bytes: Arc<RwLock<usize>>,
     seqno: Arc<RwLock<u64>>,
     message_tx: mpsc::Sender<ReceivedMessage>,
     message_rx: Option<mpsc::Receiver<ReceivedMessage>>,
@@ -403,6 +416,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             subscriptions: Arc::new(RwLock::new(HashSet::new())),
             topics: Arc::new(RwLock::new(HashMap::new())),
             message_cache: Arc::new(RwLock::new(LruCache::new(cache_size))),
+            message_cache_bytes: Arc::new(RwLock::new(0)),
             seqno: Arc::new(RwLock::new(0)),
             message_tx: tx,
             message_rx: Some(rx),
@@ -414,6 +428,38 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
     pub fn take_message_receiver(&mut self) -> Option<mpsc::Receiver<ReceivedMessage>> {
         self.message_rx.take()
+    }
+
+    /// Insert a message into the cache with memory-based eviction.
+    /// Evicts LRU entries until total cache size is under MAX_MESSAGE_CACHE_BYTES.
+    async fn cache_message(&self, msg_id: MessageId, message: CachedMessage) {
+        let message_size = message.size_bytes();
+        
+        let mut cache = self.message_cache.write().await;
+        let mut cache_bytes = self.message_cache_bytes.write().await;
+        
+        // If this message already exists, remove its old size first
+        if let Some(existing) = cache.peek(&msg_id) {
+            *cache_bytes = cache_bytes.saturating_sub(existing.size_bytes());
+        }
+        
+        // Evict LRU entries until we have room for the new message
+        while *cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES && !cache.is_empty() {
+            if let Some((_, evicted)) = cache.pop_lru() {
+                *cache_bytes = cache_bytes.saturating_sub(evicted.size_bytes());
+                trace!(
+                    evicted_bytes = evicted.size_bytes(),
+                    cache_bytes = *cache_bytes,
+                    "evicted message from cache due to memory pressure"
+                );
+            } else {
+                break;
+            }
+        }
+        
+        // Insert the new message and track its size
+        cache.put(msg_id, message);
+        *cache_bytes = cache_bytes.saturating_add(message_size);
     }
 
 
@@ -615,16 +661,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         id_input.extend_from_slice(&data);
         let msg_id = crate::dht::hash_content(&id_input);
 
-        {
-            let mut cache = self.message_cache.write().await;
-            cache.put(msg_id, CachedMessage {
-                topic: topic.to_string(),
-                source: self.local_identity,
-                seqno,
-                data: data.clone(),
-                signature: signature.clone(),
-            });
-        }
+        self.cache_message(msg_id, CachedMessage {
+            topic: topic.to_string(),
+            source: self.local_identity,
+            seqno,
+            data: data.clone(),
+            signature: signature.clone(),
+        }).await;
 
         {
             let mut topics = self.topics.write().await;
@@ -855,16 +898,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
 
-        {
-            let mut cache = self.message_cache.write().await;
-            cache.put(msg_id, CachedMessage {
-                topic: topic.to_string(),
-                source,
-                seqno,
-                data: data.clone(),
-                signature: signature.clone(),
-            });
-        }
+        self.cache_message(msg_id, CachedMessage {
+            topic: topic.to_string(),
+            source,
+            seqno,
+            data: data.clone(),
+            signature: signature.clone(),
+        }).await;
 
         {
             let mut topics = self.topics.write().await;
