@@ -6,7 +6,8 @@ use quinn::{Connection, Endpoint};
 use tracing::{debug, info, warn};
 
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
-use crate::dht::{DhtNode, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
+use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
+use crate::storage::Key;
 use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;

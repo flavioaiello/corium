@@ -7,6 +7,7 @@ mod node;
 mod plumtree;
 mod routing;
 mod rpc;
+mod storage;
 mod transport;
 
 pub use node::Node;

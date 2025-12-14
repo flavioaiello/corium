@@ -15,7 +15,8 @@ use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtN
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
 use crate::transport::{self, Contact, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
-use crate::dht::{DhtNode, Key};
+use crate::dht::DhtNode;
+use crate::storage::Key;
 use crate::identity::{EndpointRecord, Identity};
 use crate::hyparview::HyParView;
 use crate::messages::HyParViewMessage;

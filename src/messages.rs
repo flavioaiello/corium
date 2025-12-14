@@ -2,7 +2,7 @@
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::dht::Key;
+use crate::storage::Key;
 use crate::identity::Identity;
 use crate::transport::Contact;
 
