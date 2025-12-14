@@ -996,14 +996,12 @@ impl<N: DhtRpc> Dht<N> {
         node
     }
 
-    /// Returns this DHT node's identity.
-    #[allow(dead_code)] // Library public API
+    #[allow(dead_code)]
     pub fn identity(&self) -> Identity {
         self.id
     }
 
-    /// Returns this DHT node's contact information.
-    #[allow(dead_code)] // Library public API
+    #[allow(dead_code)]
     pub fn contact(&self) -> Contact {
         self.self_contact.clone()
     }
@@ -1093,8 +1091,7 @@ impl<N: DhtRpc> Dht<N> {
         let node = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(BUCKET_REFRESH_INTERVAL);
-            interval.tick().await; // Skip first immediate tick
-
+            interval.tick().await;
             loop {
                 interval.tick().await;
 
@@ -1809,8 +1806,7 @@ mod tests {
             .await;
 
         let peer = make_contact(0x02);
-        let value = vec![42u8; 50 * 1024]; // 50KB, under 64KB limit
-        let key = hash_content(&value);
+        let value = vec![42u8; 50 * 1024];        let key = hash_content(&value);
 
         node.node
             .handle_store_request(&peer, key, value.clone())
@@ -2002,8 +1998,7 @@ mod tests {
         let peer = make_contact(0x02);
 
         for i in 0..5 {
-            let value = vec![i as u8; 15 * 1024]; // 15KB each
-            let key = hash_content(&value);
+            let value = vec![i as u8; 15 * 1024];            let key = hash_content(&value);
             node.node.handle_store_request(&peer, key, value).await;
         }
 
@@ -2015,8 +2010,7 @@ mod tests {
             snapshot.pressure
         );
 
-        let large_value = vec![0xFFu8; 40 * 1024]; // 40KB
-        let large_key = hash_content(&large_value);
+        let large_value = vec![0xFFu8; 40 * 1024];        let large_key = hash_content(&large_value);
         node.node
             .handle_store_request(&peer, large_key, large_value.clone())
             .await;
@@ -2052,8 +2046,7 @@ mod tests {
             let node_clone = node.node.clone();
             let peer_clone = peer.clone();
             let handle = tokio::spawn(async move {
-                let value = vec![i as u8; 5 * 1024]; // 5KB each
-                let key = hash_content(&value);
+                let value = vec![i as u8; 5 * 1024];                let key = hash_content(&value);
                 node_clone
                     .handle_store_request(&peer_clone, key, value)
                     .await;
@@ -2126,8 +2119,7 @@ mod tests {
 
         let peer = make_contact(0x02);
 
-        let hot_value = vec![0xAAu8; 8 * 1024]; // 8KB
-        let hot_key = hash_content(&hot_value);
+        let hot_value = vec![0xAAu8; 8 * 1024];        let hot_key = hash_content(&hot_value);
         node.node
             .handle_store_request(&peer, hot_key, hot_value.clone())
             .await;
@@ -2137,8 +2129,7 @@ mod tests {
         }
 
         for i in 0..5 {
-            let cold_value = vec![i as u8; 8 * 1024]; // 8KB each
-            let cold_key = hash_content(&cold_value);
+            let cold_value = vec![i as u8; 8 * 1024];            let cold_key = hash_content(&cold_value);
             node.node
                 .handle_store_request(&peer, cold_key, cold_value)
                 .await;
@@ -2444,7 +2435,6 @@ mod tests {
         let registry = Arc::new(NetworkRegistry::default());
         let node = TestNode::new(registry.clone(), 0x42, 20, 3).await;
         
-        // Test the identity() accessor
         let expected_id = make_identity(0x42);
         assert_eq!(node.node.identity(), expected_id);
     }

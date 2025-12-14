@@ -178,10 +178,8 @@ pub(crate) fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
     let dist = xor_distance(self_id, other);
     for (byte_idx, byte) in dist.iter().enumerate() {
         if *byte != 0 {
-            let leading = byte.leading_zeros() as usize; // 0..7
-            let bit_index = byte_idx * 8 + leading;
-            return bit_index; // 0..=255
-        }
+            let leading = byte.leading_zeros() as usize;            let bit_index = byte_idx * 8 + leading;
+            return bit_index;        }
     }
     255
 }
@@ -247,8 +245,7 @@ impl RoutingTable {
         }
     }
 
-    /// Adds or updates a contact in the routing table.
-    #[allow(dead_code)] // Library public API
+    #[allow(dead_code)]
     pub fn update(&mut self, contact: Contact) {
         let _ = self.update_with_pending(contact);
     }
@@ -305,8 +302,7 @@ impl RoutingTable {
                 } else if let Some(max_entry) = heap.peek() {
                     if distance_cmp(&dist, &max_entry.dist) == std::cmp::Ordering::Less {
                         heap.push(DistEndpointInfo { dist, contact: contact.clone() });
-                        heap.pop(); // Remove the now-largest element
-                    }
+                        heap.pop();                    }
                 }
             }
         }
@@ -384,8 +380,7 @@ mod tests {
 
     #[test]
     fn random_id_for_bucket_lands_in_correct_bucket() {
-        let self_id = Identity::from_bytes([0x42u8; 32]); // Arbitrary self ID
-
+        let self_id = Identity::from_bytes([0x42u8; 32]);
         for bucket_idx in [0, 1, 7, 8, 15, 127, 200, 255] {
             for _ in 0..10 {
                 let target = random_id_for_bucket(&self_id, bucket_idx);
@@ -608,7 +603,6 @@ mod tests {
         
         let peer = make_test_contact(0x80);
         
-        // Use the public update() API
         rt.update(peer.clone());
         
         let closest = rt.closest(&peer.identity, 1);

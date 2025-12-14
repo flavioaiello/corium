@@ -24,7 +24,7 @@ pub struct Node {
     dht: Dht<RpcNode>,
     network: RpcNode,
     rate_limiter: Arc<ConnectionRateLimiter>,
-    #[allow(dead_code)] // Held to keep Arc alive for spawned task
+    #[allow(dead_code)]
     udp_forwarder: Arc<UdpRelayForwarder>,
     udp_forwarder_addr: SocketAddr,
     hyparview: Arc<HyParView<RpcNode>>,
@@ -88,7 +88,6 @@ impl Node {
         
         let rate_limiter = Arc::new(ConnectionRateLimiter::new());
         
-        // Share the same UDP socket for both QUIC and relay forwarding (port multiplexing)
         let udp_forwarder = Arc::new(UdpRelayForwarder::with_socket(smartsock.inner_socket().clone()));
         let udp_forwarder_addr = local_addr;
         info!("UDP relay forwarder sharing port {}", local_addr);
@@ -241,8 +240,7 @@ impl Node {
     }
     
     pub fn is_relay_capable(&self) -> bool {
-        true // Always capable - relay forwarder shares the QUIC socket
-    }
+        true    }
     
     pub async fn relay_endpoint(&self) -> Option<Contact> {
         let forwarder_addr = self.udp_forwarder_addr;
@@ -289,7 +287,6 @@ impl Node {
         self.network.cache_contact(&contact).await;
         self.dht.observe_contact(contact.clone()).await;
         
-        // Join the HyParView overlay via the bootstrap peer
         self.hyparview.request_join(peer_identity).await;
         
         self.network.detect_nat(&[contact]).await;
@@ -314,8 +311,7 @@ impl Node {
             addrs: vec![addr.to_string()],
             relays: vec![],
             timestamp: crate::identity::now_ms(),
-            signature: vec![], // Not needed for outbound connection
-        };
+            signature: vec![],        };
         
         let conn = self.network.smartconnect(&record).await?;
         Ok(conn)
@@ -396,29 +392,22 @@ impl Node {
         self.plumtree.is_some()
     }
     
-    /// Returns true if the server is still running.
     pub fn is_running(&self) -> bool {
         !self.server_handle.is_finished()
     }
     
-    /// Gracefully shuts down the node, notifying peers of departure.
     pub async fn shutdown(&self) {
-        // Notify HyParView peers we're leaving
         self.hyparview.quit().await;
         
-        // Abort the heartbeat task if running
         if let Some(ref handle) = self.heartbeat_handle {
             handle.abort();
         }
         
-        // Abort the probe loop
         self.probe_handle.abort();
         
-        // Abort the server task
         self.server_handle.abort();
     }
     
-    /// Returns connection rate limiter statistics.
     pub async fn connection_stats(&self) -> crate::ratelimit::RateLimitStats {
         self.rate_limiter.stats().await
     }

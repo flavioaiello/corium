@@ -53,34 +53,21 @@ pub const MAX_OUTBOUND_PEERS: usize = 1000;
 pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 pub const RATE_LIMIT_ENTRY_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// Maximum total bytes for the message cache (64 MB)
 pub const MAX_MESSAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Configuration for the PlumTree gossip protocol.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // eager_peers, lazy_peers, message_cache_ttl reserved for protocol tuning
+#[allow(dead_code)]
 pub struct PlumTreeConfig {
-    /// Target number of eager peers per topic (reserved for protocol optimization)
     pub eager_peers: usize,
-    /// Target number of lazy peers per topic (reserved for protocol optimization)
     pub lazy_peers: usize,
-    /// Timeout before retrying IWant requests
     pub ihave_timeout: Duration,
-    /// Interval between lazy push (IHave) rounds
     pub lazy_push_interval: Duration,
-    /// Maximum number of messages to cache
     pub message_cache_size: usize,
-    /// TTL for cached messages (reserved for TTL-based eviction)
     pub message_cache_ttl: Duration,
-    /// Interval between heartbeat ticks
     pub heartbeat_interval: Duration,
-    /// Maximum size of a single message in bytes
     pub max_message_size: usize,
-    /// Maximum number of message IDs in an IHave announcement
     pub max_ihave_length: usize,
-    /// Maximum publish rate (messages per second) for local node
     pub publish_rate_limit: usize,
-    /// Maximum message rate per remote peer
     pub per_peer_rate_limit: usize,
 }
 
@@ -158,9 +145,8 @@ fn verify_plumtree_signature(
 
 const MAX_PENDING_IWANTS: usize = 100;
 
-/// A message received from the gossip network.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Library API - fields returned to consumers
+#[allow(dead_code)]
 pub struct ReceivedMessage {
     pub topic: String,
     pub source: Identity,
@@ -180,15 +166,12 @@ pub(crate) struct CachedMessage {
 }
 
 impl CachedMessage {
-    /// Returns the approximate memory footprint of this cached message in bytes.
     pub fn size_bytes(&self) -> usize {
-        // topic string + data vec + signature vec + fixed fields overhead
         self.topic.len() + self.data.len() + self.signature.len() + 64
     }
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Heartbeat infrastructure - last_lazy_push tracked for timing
 pub(crate) struct TopicState {
     pub eager_peers: HashSet<Identity>,
     pub lazy_peers: HashSet<Identity>,
@@ -209,7 +192,6 @@ impl Default for TopicState {
     }
 }
 
-#[allow(dead_code)] // Heartbeat infrastructure
 impl TopicState {
     pub fn total_peers(&self) -> usize {
         self.eager_peers.len() + self.lazy_peers.len()
@@ -277,8 +259,7 @@ impl TopicState {
                     .copied()
                 {
                     tried_peers.push(next_peer);
-                    *requested_at = now; // Reset timeout
-                    retries.push((*msg_id, next_peer));
+                    *requested_at = now;                    retries.push((*msg_id, next_peer));
                 } else {
                     completed.push(*msg_id);
                 }
@@ -332,8 +313,7 @@ impl PeerRateLimit {
         }
         
         if self.iwant_times.len() >= max_rate {
-            return true; // Rate limited
-        }
+            return true;        }
         
         self.iwant_times.push_back(now);
         false
@@ -352,8 +332,7 @@ impl PeerRateLimit {
         }
         
         if self.publish_times.len() >= max_rate {
-            return true; // Rate limited
-        }
+            return true;        }
         
         self.publish_times.push_back(now);
         false
@@ -364,8 +343,7 @@ impl PeerRateLimit {
     }
 }
 
-/// Reasons why a message might be rejected.
-#[allow(dead_code)] // Library API - error type for consumers
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRejection {
     MessageTooLarge,
@@ -382,7 +360,6 @@ pub trait PlumTreeHandler: Send + Sync {
 }
 
 
-/// PlumTree epidemic broadcast protocol implementation.
 pub struct PlumTree<N: PlumTreeRpc> {
     network: Arc<N>,
     keypair: Keypair,
@@ -391,7 +368,6 @@ pub struct PlumTree<N: PlumTreeRpc> {
     subscriptions: Arc<RwLock<HashSet<String>>>,
     topics: Arc<RwLock<HashMap<String, TopicState>>>,
     message_cache: Arc<RwLock<LruCache<MessageId, CachedMessage>>>,
-    /// Current total bytes stored in message_cache for memory-based eviction
     message_cache_bytes: Arc<RwLock<usize>>,
     seqno: Arc<RwLock<u64>>,
     message_tx: mpsc::Sender<ReceivedMessage>,
@@ -430,20 +406,16 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         self.message_rx.take()
     }
 
-    /// Insert a message into the cache with memory-based eviction.
-    /// Evicts LRU entries until total cache size is under MAX_MESSAGE_CACHE_BYTES.
     async fn cache_message(&self, msg_id: MessageId, message: CachedMessage) {
         let message_size = message.size_bytes();
         
         let mut cache = self.message_cache.write().await;
         let mut cache_bytes = self.message_cache_bytes.write().await;
         
-        // If this message already exists, remove its old size first
         if let Some(existing) = cache.peek(&msg_id) {
             *cache_bytes = cache_bytes.saturating_sub(existing.size_bytes());
         }
         
-        // Evict LRU entries until we have room for the new message
         while *cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES && !cache.is_empty() {
             if let Some((_, evicted)) = cache.pop_lru() {
                 *cache_bytes = cache_bytes.saturating_sub(evicted.size_bytes());
@@ -457,7 +429,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
         
-        // Insert the new message and track its size
         cache.put(msg_id, message);
         *cache_bytes = cache_bytes.saturating_add(message_size);
     }
@@ -550,8 +521,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         {
             let mut subs = self.subscriptions.write().await;
             if subs.contains(topic) {
-                return Ok(()); // Already subscribed
-            }
+                return Ok(());            }
             if subs.len() >= MAX_SUBSCRIPTIONS_PER_PEER {
                 anyhow::bail!("subscription limit reached (max {})", MAX_SUBSCRIPTIONS_PER_PEER);
             }
@@ -605,8 +575,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         {
             let mut subs = self.subscriptions.write().await;
             if !subs.remove(topic) {
-                return Ok(()); // Wasn't subscribed
-            }
+                return Ok(());            }
         }
 
         let all_peers: Vec<Identity> = {
@@ -770,8 +739,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         };
 
         if !is_subscribed {
-            return; // We're not subscribed, ignore
-        }
+            return;        }
 
         let mut topics = self.topics.write().await;
         if let Some(state) = topics.get_mut(topic) {
@@ -1162,8 +1130,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
                     "failed to send PlumTree message, queueing for later"
                 );
             } else {
-                return; // Successfully sent
-            }
+                return;            }
         }
         
         let mut outbound = self.outbound.write().await;
@@ -1205,18 +1172,18 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         outbound.remove(peer).unwrap_or_default()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub async fn peers_with_pending(&self) -> Vec<Identity> {
         let outbound = self.outbound.read().await;
         outbound.keys().copied().collect()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub async fn subscriptions(&self) -> Vec<String> {
         self.subscriptions.read().await.iter().cloned().collect()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub async fn eager_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1224,7 +1191,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub async fn lazy_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1232,7 +1199,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub async fn topic_peers(&self, topic: &str) -> Vec<Identity> {
         let topics = self.topics.read().await;
         topics.get(topic)
@@ -1240,7 +1207,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)] // Library API - accessor
+    #[allow(dead_code)]
     pub fn local_identity(&self) -> Identity {
         self.local_identity
     }
@@ -1465,7 +1432,6 @@ mod tests {
     fn plumtree_config_all_fields_accessible() {
         let config = PlumTreeConfig::default();
         
-        // Access all fields to prove they're not dead
         assert!(config.eager_peers > 0);
         assert!(config.lazy_peers > 0);
         assert!(config.ihave_timeout.as_secs() > 0);
@@ -1478,7 +1444,6 @@ mod tests {
         assert!(config.publish_rate_limit > 0);
         assert!(config.per_peer_rate_limit > 0);
         
-        // Clone and debug
         let cloned = config.clone();
         let _debug = format!("{:?}", cloned);
     }
@@ -1494,7 +1459,6 @@ mod tests {
             received_at: Instant::now(),
         };
         
-        // Access all fields
         assert_eq!(msg.topic, "test");
         assert_eq!(msg.seqno, 42);
         assert_eq!(msg.data, vec![1, 2, 3]);
@@ -1502,7 +1466,6 @@ mod tests {
         let _ = msg.source;
         let _ = msg.received_at;
         
-        // Clone and debug
         let cloned = msg.clone();
         let _debug = format!("{:?}", cloned);
     }
@@ -1512,15 +1475,11 @@ mod tests {
         let mut state = TopicState::default();
         let peer = Identity::from_bytes([1u8; 32]);
         
-        // Add a lazy peer
         state.add_eager(peer);
         state.demote_to_lazy(peer);
         
-        // Initially no push needed (just created)
-        // After waiting, should_lazy_push would return true
         let _ = state.should_lazy_push(DEFAULT_LAZY_PUSH_INTERVAL);
         
-        // Check timeout tracking
         let retries = state.check_iwant_timeouts(DEFAULT_IHAVE_TIMEOUT);
         assert!(retries.is_empty());
     }

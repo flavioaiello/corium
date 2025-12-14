@@ -178,7 +178,7 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay infrastructure - session_id, created_at reserved for session management
+#[allow(dead_code)]
 pub struct ForwarderSession {
     pub session_id: [u8; 16],
     pub peer_a_identity: Identity,
@@ -250,8 +250,8 @@ pub struct UdpRelayForwarder {
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
 }
 
-#[allow(dead_code)] // Relay infrastructure
 impl UdpRelayForwarder {
+    #[allow(dead_code)]
     pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         info!(addr = %socket.local_addr()?, "UDP relay forwarder started");
@@ -271,6 +271,7 @@ impl UdpRelayForwarder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -349,6 +350,7 @@ impl UdpRelayForwarder {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn remove_session(&self, session_id: &[u8; 16]) {
         let mut sessions = self.sessions.write().await;
         
@@ -430,11 +432,7 @@ impl UdpRelayForwarder {
                 }
             };
             
-            // Handle session completion via first data packet from peer B.
-            // Condition: session is pending (!is_complete), not yet locked for completion,
-            // and packet is from a different address than peer A (i.e., peer B).
             if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
-                // Lock to prevent race with concurrent packets
                 session.completion_locked = true;
                 session.peer_b_addr = Some(from);
 
@@ -626,12 +624,14 @@ pub async fn handle_relay_request(
 
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay infrastructure
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
+    #[allow(dead_code)]
     pub peer_identity: Identity,
+    #[allow(dead_code)]
     pub established_at: Instant,
+    #[allow(dead_code)]
     pub last_activity: Instant,
 }
 
@@ -951,12 +951,12 @@ pub enum PathChoice {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Path probing infrastructure
 pub struct PeerPathState {
     pub identity: Identity,
     pub direct_addrs: Vec<SocketAddr>,
     pub relay_tunnels: HashMap<[u8; 16], RelayTunnel>,
     pub active_path: Option<PathChoice>,
+    #[allow(dead_code)]
     pub last_send: Option<Instant>,
     pub last_recv: Option<Instant>,
     pub candidates: HashMap<SocketAddr, PathCandidateInfo>,
@@ -965,7 +965,6 @@ pub struct PeerPathState {
     identity_probe_prefix: u64,
 }
 
-#[allow(dead_code)] // Path probing infrastructure
 impl PeerPathState {
     pub fn new(identity: Identity) -> Self {
         let identity_hash = blake3::hash(identity.as_bytes());
@@ -1015,7 +1014,8 @@ impl PeerPathState {
             }
         }
     }
-    
+
+    #[allow(dead_code)]
     pub fn active_tunnel(&self) -> Option<&RelayTunnel> {
         match &self.active_path {
             Some(PathChoice::Relay { session_id, .. }) => {
@@ -1024,7 +1024,8 @@ impl PeerPathState {
             _ => None,
         }
     }
-    
+
+    #[allow(dead_code)]
     pub fn is_relayed(&self) -> bool {
         matches!(self.active_path, Some(PathChoice::Relay { .. }))
     }
@@ -1230,8 +1231,7 @@ impl SmartSock {
         if let Some(addr) = direct_addrs.first() {
             state.active_path = Some(PathChoice::Direct { 
                 addr: *addr, 
-                rtt_ms: f32::MAX, // Unknown RTT
-            });
+                rtt_ms: f32::MAX,            });
         }
         
         {
@@ -1338,8 +1338,7 @@ impl SmartSock {
                 state.active_path = Some(PathChoice::Relay {
                     relay_addr: tunnel.relay_addr,
                     session_id,
-                    rtt_ms: f32::MAX, // Will be updated by path probing
-                });
+                    rtt_ms: f32::MAX,                });
                 tracing::debug!(
                     peer = ?identity,
                     session = hex::encode(session_id),
@@ -1703,8 +1702,7 @@ impl AsyncUdpSocket for SmartSock {
                                 }
                                 None
                             }
-                            Err(_) => Some(sa), // Fallback on contention
-                        }
+                            Err(_) => Some(sa),                        }
                     });
                     
                     let addr = verified_smart_addr

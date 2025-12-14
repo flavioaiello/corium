@@ -629,7 +629,6 @@ impl RpcNode {
             .context("relay-assisted connect timed out")?
             .context("relay-assisted connect failed")?;
 
-            // Best-effort: keep the relay control connection around for future refreshes.
             drop(relay_conn);
 
             Ok(peer_conn)
@@ -803,16 +802,11 @@ impl HyParViewRpc for RpcNode {
 }
 
 
-// ============================================================================
-// Server-side RPC handling (inbound connections)
-// ============================================================================
 
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
-/// Handle an incoming QUIC connection, extracting the verified identity
-/// and dispatching streams to appropriate protocol handlers.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
     node: Dht<N>,
@@ -1010,11 +1004,7 @@ async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync
     }
 }
 
-// ============================================================================
-// Protocol-specific RPC handlers
-// ============================================================================
 
-/// Handle an incoming DHT RPC request and return the appropriate response.
 async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
     node: &Dht<N>,
     request: DhtRequest,
@@ -1077,7 +1067,6 @@ async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
     }
 }
 
-/// Handle an incoming PlumTree RPC request and return the appropriate response.
 async fn handle_plumtree_rpc(
     from: Identity,
     message: PlumTreeMessage,
@@ -1109,7 +1098,6 @@ async fn handle_plumtree_rpc(
     }
 }
 
-/// Handle an incoming HyParView RPC request and return the appropriate response.
 async fn handle_hyparview_rpc<N: HyParViewRpc + Send + Sync + 'static>(
     from: Identity,
     message: HyParViewMessage,

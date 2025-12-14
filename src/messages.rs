@@ -149,7 +149,6 @@ pub enum PlumTreeMessage {
 }
 
 impl PlumTreeMessage {
-    /// Returns the topic for this message, if applicable.
     pub fn topic(&self) -> Option<&str> {
         match self {
             PlumTreeMessage::Subscribe { topic } => Some(topic),
@@ -385,8 +384,7 @@ mod tests {
 
         assert_ne!(hash1, hash2);
 
-        let data3 = b"data onf"; // One bit different
-        let hash3 = hash_content(data3);
+        let data3 = b"data onf";        let hash3 = hash_content(data3);
         assert_ne!(hash1, hash3);
     }
 

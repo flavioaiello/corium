@@ -110,7 +110,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         }
     }
 
-    #[allow(dead_code)] // Library API - builder pattern alternative
+    #[allow(dead_code)]
     pub fn with_neighbor_callback(self, callback: Arc<dyn NeighborCallback>) -> Self {
         Self {
             me: self.me,
@@ -130,12 +130,12 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         *self.neighbor_callback.write().await = Some(callback);
     }
 
-    #[allow(dead_code)] // Library API - diagnostic accessor
+    #[allow(dead_code)]
     pub async fn active_view(&self) -> HashSet<Identity> {
         self.active_view.read().await.clone()
     }
 
-    #[allow(dead_code)] // Library API - diagnostic accessor
+    #[allow(dead_code)]
     pub async fn passive_view(&self) -> HashSet<Identity> {
         self.passive_view.read().await.clone()
     }
@@ -197,8 +197,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
             self.try_promote_passive().await;
         }
 
-        self.pending_neighbors.write().await.remove(&peer);  // Returns Option, discard result
-    }
+        self.pending_neighbors.write().await.remove(&peer);    }
 
     pub async fn do_shuffle(&self) {
         let target = {
@@ -224,7 +223,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         *self.last_shuffle.write().await = Instant::now();
     }
 
-    #[allow(dead_code)] // Timeout handling - to be wired
     pub async fn handle_neighbor_timeout(&self, peer: Identity) {
         let was_pending = {
             let mut pending = self.pending_neighbors.write().await;
@@ -250,16 +248,8 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
                 .collect()
         };
 
-        if !stale_peers.is_empty() {
-            let mut pending = self.pending_neighbors.write().await;
-            for peer in &stale_peers {
-                pending.remove(peer);
-                debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "cleaned up stale pending neighbor");
-            }
-        }
-
-        if !stale_peers.is_empty() {
-            self.try_promote_passive().await;
+        for peer in stale_peers {
+            self.handle_neighbor_timeout(peer).await;
         }
     }
 
@@ -285,8 +275,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(this.config.shuffle_interval);
-            interval.tick().await; // Skip immediate first tick
-
+            interval.tick().await;
             loop {
                 interval.tick().await;
                 this.do_shuffle().await;
@@ -781,7 +770,6 @@ mod tests {
     async fn mock_network_sent_messages_accessible() {
         let network = MockNetwork::new();
         
-        // Initially empty
         let sent = network.sent_messages().await;
         assert!(sent.is_empty());
     }

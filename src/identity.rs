@@ -417,8 +417,7 @@ mod tests {
         let kp = Keypair::generate();
         let record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
         
-        assert!(record.verify_fresh(3600)); // 1 hour
-    }
+        assert!(record.verify_fresh(3600));    }
 
     #[test]
     fn test_endpoint_record_verify_fresh_rejects_old() {
@@ -430,8 +429,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64 - (2 * 60 * 60 * 1000);
         
-        assert!(!record.verify_fresh(3600)); // 1 hour max age, record is 2 hours old
-    }
+        assert!(!record.verify_fresh(3600));    }
 
     #[test]
     fn test_endpoint_record_verify_fresh_rejects_future() {
@@ -485,8 +483,7 @@ mod tests {
         let kp = Keypair::generate();
         let mut record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
         
-        record.signature = vec![0u8; 32]; // Wrong size (should be 64)
-        
+        record.signature = vec![0u8; 32];        
         assert!(!record.validate_structure());
     }
 
@@ -721,8 +718,7 @@ mod tests {
         let record = keypair.create_endpoint_record(addrs);
 
         assert!(record.verify());
-        assert!(record.verify_fresh(3600)); // 1 hour max age
-    }
+        assert!(record.verify_fresh(3600));    }
 
     #[test]
     fn record_with_relays_verifies() {
@@ -779,8 +775,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let old_timestamp = now_ms - (2 * 60 * 60 * 1000); // 2 hours ago
-
+        let old_timestamp = now_ms - (2 * 60 * 60 * 1000);
         let mut data = Vec::new();
         data.extend_from_slice(identity.as_bytes());
         data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
@@ -789,8 +784,7 @@ mod tests {
             data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(addr_bytes);
         }
-        data.extend_from_slice(&(0u32).to_le_bytes()); // no relays
-        data.extend_from_slice(&old_timestamp.to_le_bytes());
+        data.extend_from_slice(&(0u32).to_le_bytes());        data.extend_from_slice(&old_timestamp.to_le_bytes());
 
         let signature = keypair.sign(&data);
 
@@ -802,9 +796,7 @@ mod tests {
             signature: signature.to_bytes().to_vec(),
         };
 
-        assert!(old_record.verify()); // Signature is valid
-        assert!(!old_record.verify_fresh(3600)); // But too old (> 1 hour)
-    }
+        assert!(old_record.verify());        assert!(!old_record.verify_fresh(3600));    }
 
     #[test]
     fn future_dated_records_rejected() {
@@ -818,8 +810,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let future_timestamp = now_ms + (2 * 60 * 60 * 1000); // 2 hours ahead
-
+        let future_timestamp = now_ms + (2 * 60 * 60 * 1000);
         let mut data = Vec::new();
         data.extend_from_slice(identity.as_bytes());
         data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
@@ -841,8 +832,7 @@ mod tests {
             signature: signature.to_bytes().to_vec(),
         };
 
-        assert!(!future_record.verify_fresh(3600)); // Should fail freshness check
-    }
+        assert!(!future_record.verify_fresh(3600));    }
 
     #[test]
     fn structure_validation_limits() {

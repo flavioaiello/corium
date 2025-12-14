@@ -22,17 +22,12 @@ pub fn generate_ed25519_cert(
     
     let mut pkcs8 = Vec::with_capacity(48);
     pkcs8.extend_from_slice(&[
-        0x30, 0x2e, // SEQUENCE, 46 bytes
-    ]);
-    pkcs8.extend_from_slice(&PKCS8_VERSION); // INTEGER 0 (version)
-    pkcs8.extend_from_slice(&[
-        0x30, 0x05, // SEQUENCE, 5 bytes (algorithm identifier)
-    ]);
+        0x30, 0x2e,    ]);
+    pkcs8.extend_from_slice(&PKCS8_VERSION);    pkcs8.extend_from_slice(&[
+        0x30, 0x05,    ]);
     pkcs8.extend_from_slice(&ED25519_OID);
     pkcs8.extend_from_slice(&[
-        0x04, 0x22, // OCTET STRING, 34 bytes
-        0x04, 0x20, // OCTET STRING, 32 bytes (the actual key)
-    ]);
+        0x04, 0x22,        0x04, 0x20,    ]);
     pkcs8.extend_from_slice(&secret_key);
     
     let pkcs8_der = PrivatePkcs8KeyDer::from(pkcs8.clone());

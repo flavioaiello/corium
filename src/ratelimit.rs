@@ -92,7 +92,6 @@ impl ConnectionRateLimiter {
         true
     }
     
-    /// Returns current rate limiter statistics.
     pub async fn stats(&self) -> RateLimitStats {
         let state = self.state.lock().await;
         RateLimitStats {
@@ -105,18 +104,12 @@ impl ConnectionRateLimiter {
     }
 }
 
-/// Statistics about the connection rate limiter.
 #[derive(Debug, Clone)]
 pub struct RateLimitStats {
-    /// Current available tokens in the global bucket.
     pub global_tokens_available: f64,
-    /// Number of IPs currently being tracked.
     pub tracked_ips: usize,
-    /// Maximum number of IPs that can be tracked.
     pub max_tracked_ips: usize,
-    /// Global connections per second limit.
     pub global_rate_limit: usize,
-    /// Per-IP connections per second limit.
     pub per_ip_rate_limit: usize,
 }
 
