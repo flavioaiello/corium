@@ -33,7 +33,7 @@ pub fn deserialize_request(data: &[u8]) -> Result<RpcRequest, bincode::Error> {
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DhtRequest {
+pub enum DhtNodeRequest {
     Ping {
         from: Contact,
     },
@@ -53,20 +53,20 @@ pub enum DhtRequest {
     WhatIsMyAddr,
 }
 
-impl DhtRequest {
+impl DhtNodeRequest {
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
-            DhtRequest::Ping { from } => Some(from.identity),
-            DhtRequest::FindNode { from, .. } => Some(from.identity),
-            DhtRequest::FindValue { from, .. } => Some(from.identity),
-            DhtRequest::Store { from, .. } => Some(from.identity),
-            DhtRequest::WhatIsMyAddr => None,
+            DhtNodeRequest::Ping { from } => Some(from.identity),
+            DhtNodeRequest::FindNode { from, .. } => Some(from.identity),
+            DhtNodeRequest::FindValue { from, .. } => Some(from.identity),
+            DhtNodeRequest::Store { from, .. } => Some(from.identity),
+            DhtNodeRequest::WhatIsMyAddr => None,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DhtResponse {
+pub enum DhtNodeResponse {
     Ack,
     Nodes(Vec<Contact>),
     Value {
@@ -192,7 +192,7 @@ pub struct DirectRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {
-    Dht(DhtRequest),
+    DhtNode(DhtNodeRequest),
     Relay(RelayRequest),
     PlumTree(PlumTreeRequest),
     HyParView(HyParViewRequest),
@@ -202,7 +202,7 @@ pub enum RpcRequest {
 impl RpcRequest {
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
-            RpcRequest::Dht(dht_req) => dht_req.sender_identity(),
+            RpcRequest::DhtNode(dht_req) => dht_req.sender_identity(),
             RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
             RpcRequest::PlumTree(req) => Some(req.from),
             RpcRequest::HyParView(req) => Some(req.from),
@@ -213,7 +213,7 @@ impl RpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcResponse {
-    Dht(DhtResponse),
+    DhtNode(DhtNodeResponse),
 
     Relay(RelayResponse),
 
@@ -247,11 +247,11 @@ mod tests {
         test_bincode_options().serialize(value)
     }
 
-    fn test_deserialize_request(bytes: &[u8]) -> Result<DhtRequest, bincode::Error> {
+    fn test_deserialize_request(bytes: &[u8]) -> Result<DhtNodeRequest, bincode::Error> {
         test_bincode_options().deserialize(bytes)
     }
 
-    fn test_deserialize_response(bytes: &[u8]) -> Result<DhtResponse, bincode::Error> {
+    fn test_deserialize_response(bytes: &[u8]) -> Result<DhtNodeResponse, bincode::Error> {
         test_bincode_options().deserialize(bytes)
     }
 
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn bounded_deserialization_normal_payloads() {
-        let request = DhtRequest::Store {
+        let request = DhtNodeRequest::Store {
             from: Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] },
             key: [0u8; 32],
             value: vec![0u8; 100],
@@ -287,7 +287,7 @@ mod tests {
         let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
         assert!(test_deserialize_request(&garbage).is_err());
 
-        let request = DhtRequest::Ping {
+        let request = DhtNodeRequest::Ping {
             from: Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] },
         };
         let bytes = serialize(&request).unwrap();
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn response_deserialization() {
-        let response = DhtResponse::Nodes(vec![Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] }]);
+        let response = DhtNodeResponse::Nodes(vec![Contact { identity: make_identity(1), addr: "127.0.0.1:8080".to_string(), addrs: vec![] }]);
         let bytes = bincode::serialize(&response).unwrap();
         assert!(test_deserialize_response(&bytes).is_ok());
     }
@@ -309,21 +309,21 @@ mod tests {
         let identity = keypair.identity();
 
         let requests = vec![
-            DhtRequest::Ping { from: contact.clone() },
-            DhtRequest::FindNode {
+            DhtNodeRequest::Ping { from: contact.clone() },
+            DhtNodeRequest::FindNode {
                 from: contact.clone(),
                 target: make_identity(2),
             },
-            DhtRequest::FindValue {
+            DhtNodeRequest::FindValue {
                 from: contact.clone(),
                 key: [0u8; 32],
             },
-            DhtRequest::Store {
+            DhtNodeRequest::Store {
                 from: contact.clone(),
                 key: [0u8; 32],
                 value: b"test".to_vec(),
             },
-            DhtRequest::WhatIsMyAddr,
+            DhtNodeRequest::WhatIsMyAddr,
         ];
 
         for req in requests {
@@ -346,16 +346,16 @@ mod tests {
     fn sender_identity_extraction() {
         let contact = Contact { identity: make_identity(42), addr: "127.0.0.1:8080".to_string(), addrs: vec![] };
 
-        let ping = DhtRequest::Ping { from: contact.clone() };
+        let ping = DhtNodeRequest::Ping { from: contact.clone() };
         assert_eq!(ping.sender_identity(), Some(make_identity(42)));
 
-        let find_node = DhtRequest::FindNode {
+        let find_node = DhtNodeRequest::FindNode {
             from: contact.clone(),
             target: make_identity(1),
         };
         assert_eq!(find_node.sender_identity(), Some(make_identity(42)));
 
-        let what_is_my_addr = DhtRequest::WhatIsMyAddr;
+        let what_is_my_addr = DhtNodeRequest::WhatIsMyAddr;
         assert_eq!(what_is_my_addr.sender_identity(), None);
     }
 
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn round_trip_dht_ping() {
-        let request = RpcRequest::Dht(DhtRequest::Ping {
+        let request = RpcRequest::DhtNode(DhtNodeRequest::Ping {
             from: test_contact(),
         });
 
@@ -471,7 +471,7 @@ mod tests {
         let decoded = deserialize_request(&bytes).expect("deserialize should succeed");
 
         match decoded {
-            RpcRequest::Dht(DhtRequest::Ping { from }) => {
+            RpcRequest::DhtNode(DhtNodeRequest::Ping { from }) => {
                 assert_eq!(from.identity, test_identity());
             }
             _ => panic!("unexpected variant"),
@@ -480,13 +480,13 @@ mod tests {
 
     #[test]
     fn round_trip_dht_response() {
-        let response = RpcResponse::Dht(DhtResponse::Ack);
+        let response = RpcResponse::DhtNode(DhtNodeResponse::Ack);
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
             bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
-            RpcResponse::Dht(DhtResponse::Ack) => {}
+            RpcResponse::DhtNode(DhtNodeResponse::Ack) => {}
             _ => panic!("unexpected variant"),
         }
     }

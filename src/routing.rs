@@ -350,10 +350,6 @@ impl RoutingTable {
             self.buckets[bucket_idx].mark_refreshed();
         }
     }
-
-    pub(crate) fn self_id(&self) -> Identity {
-        self.self_id
-    }
 }
 
 

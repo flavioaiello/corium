@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use lru::LruCache;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
 
 use crate::hyparview::NeighborCallback;
@@ -298,7 +298,8 @@ impl TopicState {
                     .copied()
                 {
                     tried_peers.push(next_peer);
-                    *requested_at = now;                    retries.push((*msg_id, next_peer));
+                    *requested_at = now;
+                    retries.push((*msg_id, next_peer));
                 } else {
                     completed.push(*msg_id);
                 }
@@ -352,7 +353,8 @@ impl PeerRateLimit {
         }
         
         if self.iwant_times.len() >= max_rate {
-            return true;        }
+            return true;
+        }
         
         self.iwant_times.push_back(now);
         false
@@ -371,7 +373,8 @@ impl PeerRateLimit {
         }
         
         if self.publish_times.len() >= max_rate {
-            return true;        }
+            return true;
+        }
         
         self.publish_times.push_back(now);
         false
@@ -399,29 +402,162 @@ pub trait PlumTreeHandler: Send + Sync {
 }
 
 
+// ============================================================================
+// Commands sent from Handle to Actor
+// ============================================================================
+
+enum Command {
+    Subscribe(String, oneshot::Sender<anyhow::Result<()>>),
+    Unsubscribe(String, oneshot::Sender<anyhow::Result<()>>),
+    Publish(String, Vec<u8>, oneshot::Sender<anyhow::Result<MessageId>>),
+    HandleMessage(Identity, PlumTreeMessage, oneshot::Sender<anyhow::Result<()>>),
+    NeighborUp(Identity),
+    NeighborDown(Identity),
+    GetSubscriptions(oneshot::Sender<Vec<String>>),
+    Quit,
+    // Debug/Test accessors
+    GetEagerPeers(String, oneshot::Sender<Vec<Identity>>),
+    GetLazyPeers(String, oneshot::Sender<Vec<Identity>>),
+}
+
+
+// ============================================================================
+// PlumTree Handle (public API - cheap to clone)
+// ============================================================================
+
+#[derive(Clone)]
 pub struct PlumTree<N: PlumTreeRpc> {
+    cmd_tx: mpsc::Sender<Command>,
+    // We keep phantom data to satisfy the generic parameter, though it's not strictly needed for the handle
+    _phantom: std::marker::PhantomData<N>,
+}
+
+impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
+    pub fn spawn(
+        network: Arc<N>,
+        keypair: Keypair,
+        config: PlumTreeConfig,
+    ) -> (Self, mpsc::Receiver<ReceivedMessage>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1000);
+        let (msg_tx, msg_rx) = mpsc::channel(1000);
+        
+        let actor = PlumTreeActor::new(network, keypair, config, msg_tx);
+        tokio::spawn(actor.run(cmd_rx));
+        
+        (
+            Self {
+                cmd_tx,
+                _phantom: std::marker::PhantomData,
+            },
+            msg_rx,
+        )
+    }
+
+    pub async fn subscribe(&self, topic: &str) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::Subscribe(topic.to_string(), tx)).await
+            .map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?
+    }
+
+    pub async fn unsubscribe(&self, topic: &str) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::Unsubscribe(topic.to_string(), tx)).await
+            .map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?
+    }
+
+    pub async fn publish(&self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::Publish(topic.to_string(), data, tx)).await
+            .map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?
+    }
+
+    pub async fn subscriptions(&self) -> Vec<String> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetSubscriptions(tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn quit(&self) {
+        let _ = self.cmd_tx.send(Command::Quit).await;
+    }
+
+    // Test helpers
+    #[allow(dead_code)]
+    pub async fn eager_peers(&self, topic: &str) -> Vec<Identity> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetEagerPeers(topic.to_string(), tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub async fn lazy_peers(&self, topic: &str) -> Vec<Identity> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetLazyPeers(topic.to_string(), tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
+    async fn neighbor_up(&self, peer: Identity) {
+        let _ = self.cmd_tx.send(Command::NeighborUp(peer)).await;
+    }
+
+    async fn neighbor_down(&self, peer: &Identity) {
+        let _ = self.cmd_tx.send(Command::NeighborDown(*peer)).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeHandler for PlumTree<N> {
+    async fn handle_message(&self, from: &Identity, message: PlumTreeMessage) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(Command::HandleMessage(*from, message, tx)).await
+            .map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?
+    }
+}
+
+
+// ============================================================================
+// PlumTree Actor (owns state)
+// ============================================================================
+
+struct PlumTreeActor<N: PlumTreeRpc> {
     network: Arc<N>,
     keypair: Keypair,
     local_identity: Identity,
     config: PlumTreeConfig,
-    subscriptions: Arc<RwLock<HashSet<String>>>,
-    topics: Arc<RwLock<HashMap<String, TopicState>>>,
-    message_cache: Arc<RwLock<LruCache<MessageId, CachedMessage>>>,
-    message_cache_bytes: Arc<RwLock<usize>>,
-    seqno: Arc<RwLock<u64>>,
-    seqno_tracker: Arc<RwLock<HashMap<Identity, SeqnoTracker>>>,
+    subscriptions: HashSet<String>,
+    topics: HashMap<String, TopicState>,
+    message_cache: LruCache<MessageId, CachedMessage>,
+    message_cache_bytes: usize,
+    seqno: u64,
+    seqno_tracker: HashMap<Identity, SeqnoTracker>,
     message_tx: mpsc::Sender<ReceivedMessage>,
-    message_rx: Option<mpsc::Receiver<ReceivedMessage>>,
-    outbound: Arc<RwLock<HashMap<Identity, Vec<PlumTreeMessage>>>>,
-    rate_limits: Arc<RwLock<HashMap<Identity, PeerRateLimit>>>,
-    known_peers: Arc<RwLock<HashSet<Identity>>>,
+    outbound: HashMap<Identity, Vec<PlumTreeMessage>>,
+    rate_limits: HashMap<Identity, PeerRateLimit>,
+    known_peers: HashSet<Identity>,
 }
 
-impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
-    pub fn new(network: Arc<N>, keypair: Keypair, config: PlumTreeConfig) -> Self {
+impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
+    fn new(
+        network: Arc<N>,
+        keypair: Keypair,
+        config: PlumTreeConfig,
+        message_tx: mpsc::Sender<ReceivedMessage>,
+    ) -> Self {
         let cache_size = NonZeroUsize::new(config.message_cache_size)
             .unwrap_or(NonZeroUsize::new(1).expect("1 is non-zero"));
-        let (tx, rx) = mpsc::channel(1000);
         let local_identity = keypair.identity();
         
         Self {
@@ -429,126 +565,77 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             keypair,
             local_identity,
             config,
-            subscriptions: Arc::new(RwLock::new(HashSet::new())),
-            topics: Arc::new(RwLock::new(HashMap::new())),
-            message_cache: Arc::new(RwLock::new(LruCache::new(cache_size))),
-            message_cache_bytes: Arc::new(RwLock::new(0)),
-            seqno: Arc::new(RwLock::new(0)),
-            seqno_tracker: Arc::new(RwLock::new(HashMap::new())),
-            message_tx: tx,
-            message_rx: Some(rx),
-            outbound: Arc::new(RwLock::new(HashMap::new())),
-            rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            known_peers: Arc::new(RwLock::new(HashSet::new())),
+            subscriptions: HashSet::new(),
+            topics: HashMap::new(),
+            message_cache: LruCache::new(cache_size),
+            message_cache_bytes: 0,
+            seqno: 0,
+            seqno_tracker: HashMap::new(),
+            message_tx,
+            outbound: HashMap::new(),
+            rate_limits: HashMap::new(),
+            known_peers: HashSet::new(),
         }
     }
 
-    pub fn take_message_receiver(&mut self) -> Option<mpsc::Receiver<ReceivedMessage>> {
-        self.message_rx.take()
-    }
-
-    async fn cache_message(&self, msg_id: MessageId, message: CachedMessage) {
-        let message_size = message.size_bytes();
+    async fn run(mut self, mut cmd_rx: mpsc::Receiver<Command>) {
+        let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
         
-        let mut cache = self.message_cache.write().await;
-        let mut cache_bytes = self.message_cache_bytes.write().await;
-        
-        if let Some(existing) = cache.peek(&msg_id) {
-            *cache_bytes = cache_bytes.saturating_sub(existing.size_bytes());
-        }
-        
-        while *cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES && !cache.is_empty() {
-            if let Some((_, evicted)) = cache.pop_lru() {
-                *cache_bytes = cache_bytes.saturating_sub(evicted.size_bytes());
-                trace!(
-                    evicted_bytes = evicted.size_bytes(),
-                    cache_bytes = *cache_bytes,
-                    "evicted message from cache due to memory pressure"
-                );
-            } else {
-                break;
-            }
-        }
-        
-        cache.put(msg_id, message);
-        *cache_bytes = cache_bytes.saturating_add(message_size);
-    }
-
-
-    pub async fn handle_neighbor_up(&self, peer: Identity) {
-        if peer == self.local_identity {
-            return;
-        }
-        
-        {
-            let mut known = self.known_peers.write().await;
-            known.insert(peer);
-        }
-        
-        let subs = self.subscriptions.read().await;
-        if subs.is_empty() {
-            return;
-        }
-        
-        let mut topics = self.topics.write().await;
-        for topic in subs.iter() {
-            if let Some(state) = topics.get_mut(topic) {
-                state.add_eager(peer);
-                debug!(
-                    peer = %hex::encode(&peer.as_bytes()[..8]),
-                    topic = %topic,
-                    "added HyParView neighbor as eager peer"
-                );
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(Command::Subscribe(topic, reply)) => {
+                            let _ = reply.send(self.handle_subscribe_cmd(&topic).await);
+                        }
+                        Some(Command::Unsubscribe(topic, reply)) => {
+                            let _ = reply.send(self.handle_unsubscribe_cmd(&topic).await);
+                        }
+                        Some(Command::Publish(topic, data, reply)) => {
+                            let _ = reply.send(self.handle_publish_cmd(&topic, data).await);
+                        }
+                        Some(Command::HandleMessage(from, msg, reply)) => {
+                            let _ = reply.send(self.handle_message_internal(&from, msg).await);
+                        }
+                        Some(Command::NeighborUp(peer)) => {
+                            self.handle_neighbor_up(peer).await;
+                        }
+                        Some(Command::NeighborDown(peer)) => {
+                            self.handle_neighbor_down(&peer).await;
+                        }
+                        Some(Command::GetSubscriptions(reply)) => {
+                            let _ = reply.send(self.subscriptions.iter().cloned().collect());
+                        }
+                        Some(Command::GetEagerPeers(topic, reply)) => {
+                            let peers = self.topics.get(&topic)
+                                .map(|s| s.eager_peers.iter().copied().collect())
+                                .unwrap_or_default();
+                            let _ = reply.send(peers);
+                        }
+                        Some(Command::GetLazyPeers(topic, reply)) => {
+                            let peers = self.topics.get(&topic)
+                                .map(|s| s.lazy_peers.iter().copied().collect())
+                                .unwrap_or_default();
+                            let _ = reply.send(peers);
+                        }
+                        Some(Command::Quit) => {
+                            debug!("PlumTree actor quitting");
+                            break;
+                        }
+                        None => {
+                            debug!("PlumTree handle dropped, actor quitting");
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    self.heartbeat().await;
+                }
             }
         }
     }
 
-    pub async fn handle_neighbor_down(&self, peer: &Identity) {
-        if *peer == self.local_identity {
-            return;
-        }
-        
-        {
-            let mut known = self.known_peers.write().await;
-            known.remove(peer);
-        }
-        
-        {
-            let mut outbound = self.outbound.write().await;
-            outbound.remove(peer);
-        }
-        
-        let mut topics = self.topics.write().await;
-        for (topic, state) in topics.iter_mut() {
-            let was_eager = state.eager_peers.contains(peer);
-            let was_lazy = state.lazy_peers.contains(peer);
-            state.remove_peer(peer);
-            if was_eager || was_lazy {
-                debug!(
-                    peer = %hex::encode(&peer.as_bytes()[..8]),
-                    topic = %topic,
-                    "removed HyParView neighbor from topic"
-                );
-            }
-        }
-    }
-}
-
-
-#[async_trait::async_trait]
-impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
-    async fn neighbor_up(&self, peer: Identity) {
-        self.handle_neighbor_up(peer).await;
-    }
-
-    async fn neighbor_down(&self, peer: &Identity) {
-        self.handle_neighbor_down(peer).await;
-    }
-}
-
-impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
-
-    pub async fn subscribe(&self, topic: &str) -> anyhow::Result<()> {
+    async fn handle_subscribe_cmd(&mut self, topic: &str) -> anyhow::Result<()> {
         if topic.len() > MAX_TOPIC_LENGTH {
             anyhow::bail!("topic length {} exceeds maximum {}", topic.len(), MAX_TOPIC_LENGTH);
         }
@@ -559,49 +646,36 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             anyhow::bail!("topic name contains invalid characters");
         }
 
-        {
-            let mut subs = self.subscriptions.write().await;
-            if subs.contains(topic) {
-                return Ok(());            }
-            if subs.len() >= MAX_SUBSCRIPTIONS_PER_PEER {
-                anyhow::bail!("subscription limit reached (max {})", MAX_SUBSCRIPTIONS_PER_PEER);
-            }
-            subs.insert(topic.to_string());
+        if self.subscriptions.contains(topic) {
+            return Ok(());
         }
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_PEER {
+            anyhow::bail!("subscription limit reached (max {})", MAX_SUBSCRIPTIONS_PER_PEER);
+        }
+        self.subscriptions.insert(topic.to_string());
 
-        {
-            let known = self.known_peers.read().await;
-            let mut topics = self.topics.write().await;
-            
-            if !topics.contains_key(topic) && topics.len() >= MAX_TOPICS {
-                let empty = topics.iter()
-                    .find(|(_, s)| s.eager_peers.is_empty() && s.lazy_peers.is_empty())
-                    .map(|(t, _)| t.clone());
-                if let Some(t) = empty {
-                    topics.remove(&t);
-                    debug!(evicted_topic = %t, new_topic = %topic, "evicted empty topic to make room");
-                } else {
-                    let mut subs = self.subscriptions.write().await;
-                    subs.remove(topic);
-                    anyhow::bail!("topic limit reached (max {})", MAX_TOPICS);
-                }
-            }
-
-            let state = topics.entry(topic.to_string()).or_default();
-            
-            for peer in known.iter() {
-                if *peer != self.local_identity {
-                    state.add_eager(*peer);
-                }
+        if !self.topics.contains_key(topic) && self.topics.len() >= MAX_TOPICS {
+            let empty = self.topics.iter()
+                .find(|(_, s)| s.eager_peers.is_empty() && s.lazy_peers.is_empty())
+                .map(|(t, _)| t.clone());
+            if let Some(t) = empty {
+                self.topics.remove(&t);
+                debug!(evicted_topic = %t, new_topic = %topic, "evicted empty topic to make room");
+            } else {
+                self.subscriptions.remove(topic);
+                anyhow::bail!("topic limit reached (max {})", MAX_TOPICS);
             }
         }
 
-        let peers: Vec<Identity> = {
-            let topics = self.topics.read().await;
-            topics.get(topic)
-                .map(|s| s.eager_peers.iter().chain(s.lazy_peers.iter()).copied().collect())
-                .unwrap_or_default()
-        };
+        let state = self.topics.entry(topic.to_string()).or_default();
+        
+        for peer in self.known_peers.iter() {
+            if *peer != self.local_identity {
+                state.add_eager(*peer);
+            }
+        }
+
+        let peers: Vec<Identity> = state.eager_peers.iter().chain(state.lazy_peers.iter()).copied().collect();
 
         for peer in peers {
             self.queue_message(&peer, PlumTreeMessage::Subscribe {
@@ -613,22 +687,17 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(())
     }
 
-    pub async fn unsubscribe(&self, topic: &str) -> anyhow::Result<()> {
-        {
-            let mut subs = self.subscriptions.write().await;
-            if !subs.remove(topic) {
-                return Ok(());            }
+    async fn handle_unsubscribe_cmd(&mut self, topic: &str) -> anyhow::Result<()> {
+        if !self.subscriptions.remove(topic) {
+            return Ok(());
         }
 
-        let all_peers: Vec<Identity> = {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.remove(topic) {
-                state.eager_peers.into_iter()
-                    .chain(state.lazy_peers.into_iter())
-                    .collect()
-            } else {
-                Vec::new()
-            }
+        let all_peers: Vec<Identity> = if let Some(state) = self.topics.remove(topic) {
+            state.eager_peers.into_iter()
+                .chain(state.lazy_peers.into_iter())
+                .collect()
+        } else {
+            Vec::new()
         };
 
         for peer in all_peers {
@@ -641,8 +710,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(())
     }
 
-
-    pub async fn publish(&self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
+    async fn handle_publish_cmd(&mut self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
         if data.len() > self.config.max_message_size {
             anyhow::bail!("message size {} exceeds maximum {}", data.len(), self.config.max_message_size);
         }
@@ -651,18 +719,14 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
         {
-            let mut rate_limits = self.rate_limits.write().await;
-            let limiter = rate_limits.entry(self.local_identity).or_default();
+            let limiter = self.rate_limits.entry(self.local_identity).or_default();
             if limiter.check_and_record(self.config.publish_rate_limit) {
                 anyhow::bail!("local publish rate limit exceeded");
             }
         }
 
-        let seqno = {
-            let mut seq = self.seqno.write().await;
-            *seq = seq.wrapping_add(1);
-            *seq
-        };
+        self.seqno = self.seqno.wrapping_add(1);
+        let seqno = self.seqno;
         
         let signature = sign_plumtree_message(&self.keypair, topic, seqno, &data);
         
@@ -678,15 +742,12 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             seqno,
             data: data.clone(),
             signature: signature.clone(),
-        }).await;
+        });
 
-        {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.get_mut(topic) {
-                state.recent_messages.push_back(msg_id);
-                if state.recent_messages.len() > self.config.max_ihave_length {
-                    state.recent_messages.pop_front();
-                }
+        if let Some(state) = self.topics.get_mut(topic) {
+            state.recent_messages.push_back(msg_id);
+            if state.recent_messages.len() > self.config.max_ihave_length {
+                state.recent_messages.pop_front();
             }
         }
 
@@ -699,24 +760,16 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             signature,
         };
 
-        let eager_peers: Vec<Identity> = {
-            let topics = self.topics.read().await;
-            topics.get(topic)
-                .map(|s| s.eager_peers.iter().copied().collect())
-                .unwrap_or_default()
-        };
+        let eager_peers: Vec<Identity> = self.topics.get(topic)
+            .map(|s| s.eager_peers.iter().copied().collect())
+            .unwrap_or_default();
 
         let eager_count = eager_peers.len();
         for peer in eager_peers {
             self.queue_message(&peer, publish_msg.clone()).await;
         }
 
-        let is_subscribed = {
-            let subs = self.subscriptions.read().await;
-            subs.contains(topic)
-        };
-
-        if is_subscribed {
+        if self.subscriptions.contains(topic) {
             let received = ReceivedMessage {
                 topic: topic.to_string(),
                 source: self.local_identity,
@@ -740,8 +793,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(msg_id)
     }
 
-
-    pub async fn handle_message(&self, from: &Identity, msg: PlumTreeMessage) -> anyhow::Result<()> {
+    async fn handle_message_internal(&mut self, from: &Identity, msg: PlumTreeMessage) -> anyhow::Result<()> {
         if let Some(topic) = msg.topic() {
             if !is_valid_topic(topic) {
                 anyhow::bail!("invalid topic name from peer");
@@ -774,17 +826,81 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(())
     }
 
-    async fn handle_subscribe(&self, from: &Identity, topic: &str) {
-        let is_subscribed = {
-            let subs = self.subscriptions.read().await;
-            subs.contains(topic)
-        };
+    fn cache_message(&mut self, msg_id: MessageId, message: CachedMessage) {
+        let message_size = message.size_bytes();
+        
+        if let Some(existing) = self.message_cache.peek(&msg_id) {
+            self.message_cache_bytes = self.message_cache_bytes.saturating_sub(existing.size_bytes());
+        }
+        
+        while self.message_cache_bytes + message_size > MAX_MESSAGE_CACHE_BYTES && !self.message_cache.is_empty() {
+            if let Some((_, evicted)) = self.message_cache.pop_lru() {
+                self.message_cache_bytes = self.message_cache_bytes.saturating_sub(evicted.size_bytes());
+                trace!(
+                    evicted_bytes = evicted.size_bytes(),
+                    cache_bytes = self.message_cache_bytes,
+                    "evicted message from cache due to memory pressure"
+                );
+            } else {
+                break;
+            }
+        }
+        
+        self.message_cache.put(msg_id, message);
+        self.message_cache_bytes = self.message_cache_bytes.saturating_add(message_size);
+    }
 
-        if !is_subscribed {
-            return;        }
+    async fn handle_neighbor_up(&mut self, peer: Identity) {
+        if peer == self.local_identity {
+            return;
+        }
+        
+        self.known_peers.insert(peer);
+        
+        if self.subscriptions.is_empty() {
+            return;
+        }
+        
+        for topic in self.subscriptions.iter() {
+            if let Some(state) = self.topics.get_mut(topic) {
+                state.add_eager(peer);
+                debug!(
+                    peer = %hex::encode(&peer.as_bytes()[..8]),
+                    topic = %topic,
+                    "added HyParView neighbor as eager peer"
+                );
+            }
+        }
+    }
 
-        let mut topics = self.topics.write().await;
-        if let Some(state) = topics.get_mut(topic) {
+    async fn handle_neighbor_down(&mut self, peer: &Identity) {
+        if *peer == self.local_identity {
+            return;
+        }
+        
+        self.known_peers.remove(peer);
+        self.outbound.remove(peer);
+        
+        for (topic, state) in self.topics.iter_mut() {
+            let was_eager = state.eager_peers.contains(peer);
+            let was_lazy = state.lazy_peers.contains(peer);
+            state.remove_peer(peer);
+            if was_eager || was_lazy {
+                debug!(
+                    peer = %hex::encode(&peer.as_bytes()[..8]),
+                    topic = %topic,
+                    "removed HyParView neighbor from topic"
+                );
+            }
+        }
+    }
+
+    async fn handle_subscribe(&mut self, from: &Identity, topic: &str) {
+        if !self.subscriptions.contains(topic) {
+            return;
+        }
+
+        if let Some(state) = self.topics.get_mut(topic) {
             state.add_eager(*from);
             trace!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
@@ -794,9 +910,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    async fn handle_unsubscribe(&self, from: &Identity, topic: &str) {
-        let mut topics = self.topics.write().await;
-        if let Some(state) = topics.get_mut(topic) {
+    async fn handle_unsubscribe(&mut self, from: &Identity, topic: &str) {
+        if let Some(state) = self.topics.get_mut(topic) {
             state.remove_peer(from);
             trace!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
@@ -806,13 +921,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    async fn handle_graft(&self, from: &Identity, topic: &str) {
-        let is_subscribed = {
-            let subs = self.subscriptions.read().await;
-            subs.contains(topic)
-        };
-
-        if !is_subscribed {
+    async fn handle_graft(&mut self, from: &Identity, topic: &str) {
+        if !self.subscriptions.contains(topic) {
             self.queue_message(from, PlumTreeMessage::Prune {
                 topic: topic.to_string(),
                 peers: Vec::new(),
@@ -820,8 +930,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             return;
         }
 
-        let mut topics = self.topics.write().await;
-        let state = topics.entry(topic.to_string()).or_default();
+        let state = self.topics.entry(topic.to_string()).or_default();
         state.promote_to_eager(*from);
         
         debug!(
@@ -831,9 +940,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         );
     }
 
-    async fn handle_prune(&self, from: &Identity, topic: &str) {
-        let mut topics = self.topics.write().await;
-        if let Some(state) = topics.get_mut(topic) {
+    async fn handle_prune(&mut self, from: &Identity, topic: &str) {
+        if let Some(state) = self.topics.get_mut(topic) {
             state.demote_to_lazy(*from);
             debug!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
@@ -845,7 +953,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_publish(
-        &self,
+        &mut self,
         from: &Identity,
         topic: &str,
         msg_id: MessageId,
@@ -869,18 +977,16 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
         {
-            let mut tracker = self.seqno_tracker.write().await;
-            
-            if tracker.len() >= MAX_SEQNO_TRACKING_SOURCES && !tracker.contains_key(&source) {
-                let oldest = tracker.iter()
+            if self.seqno_tracker.len() >= MAX_SEQNO_TRACKING_SOURCES && !self.seqno_tracker.contains_key(&source) {
+                let oldest = self.seqno_tracker.iter()
                     .min_by_key(|(_, t)| t.highest_seen)
                     .map(|(id, _)| *id);
                 if let Some(id) = oldest {
-                    tracker.remove(&id);
+                    self.seqno_tracker.remove(&id);
                 }
             }
             
-            let source_tracker = tracker.entry(source).or_default();
+            let source_tracker = self.seqno_tracker.entry(source).or_default();
             if !source_tracker.check_and_record(seqno) {
                 debug!(
                     from = %hex::encode(&from.as_bytes()[..8]),
@@ -893,29 +999,22 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
         {
-            let mut rate_limits = self.rate_limits.write().await;
-            if rate_limits.len() >= MAX_RATE_LIMIT_ENTRIES {
+            if self.rate_limits.len() >= MAX_RATE_LIMIT_ENTRIES {
                 let now = Instant::now();
-                rate_limits.retain(|_, limiter| !limiter.is_stale(now));
+                self.rate_limits.retain(|_, limiter| !limiter.is_stale(now));
             }
-            let limiter = rate_limits.entry(*from).or_default();
+            let limiter = self.rate_limits.entry(*from).or_default();
             if limiter.check_and_record(self.config.per_peer_rate_limit) {
                 debug!(from = %hex::encode(&from.as_bytes()[..8]), "peer rate limited");
                 return Ok(());
             }
         }
 
-        let is_duplicate = {
-            let cache = self.message_cache.read().await;
-            cache.contains(&msg_id)
-        };
+        let is_duplicate = self.message_cache.contains(&msg_id);
 
         if is_duplicate {
-            {
-                let mut topics = self.topics.write().await;
-                if let Some(state) = topics.get_mut(topic) {
-                    state.demote_to_lazy(*from);
-                }
+            if let Some(state) = self.topics.get_mut(topic) {
+                state.demote_to_lazy(*from);
             }
             
             self.queue_message(from, PlumTreeMessage::Prune {
@@ -938,26 +1037,18 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             seqno,
             data: data.clone(),
             signature: signature.clone(),
-        }).await;
+        });
 
-        {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.get_mut(topic) {
-                state.message_received(&msg_id);
-                
-                state.recent_messages.push_back(msg_id);
-                if state.recent_messages.len() > self.config.max_ihave_length {
-                    state.recent_messages.pop_front();
-                }
+        if let Some(state) = self.topics.get_mut(topic) {
+            state.message_received(&msg_id);
+            
+            state.recent_messages.push_back(msg_id);
+            if state.recent_messages.len() > self.config.max_ihave_length {
+                state.recent_messages.pop_front();
             }
         }
 
-        let is_subscribed = {
-            let subs = self.subscriptions.read().await;
-            subs.contains(topic)
-        };
-
-        if is_subscribed {
+        if self.subscriptions.contains(topic) {
             let received = ReceivedMessage {
                 topic: topic.to_string(),
                 source,
@@ -971,12 +1062,9 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
             }
         }
 
-        let eager_peers: Vec<Identity> = {
-            let topics = self.topics.read().await;
-            topics.get(topic)
-                .map(|s| s.eager_peers.iter().filter(|p| *p != from).copied().collect())
-                .unwrap_or_default()
-        };
+        let eager_peers: Vec<Identity> = self.topics.get(topic)
+            .map(|s| s.eager_peers.iter().filter(|p| **p != *from).copied().collect())
+            .unwrap_or_default();
 
         let forward_msg = PlumTreeMessage::Publish {
             topic: topic.to_string(),
@@ -1000,26 +1088,20 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         Ok(())
     }
 
-    async fn handle_ihave(&self, from: &Identity, topic: &str, msg_ids: Vec<MessageId>) {
-        let missing: Vec<MessageId> = {
-            let cache = self.message_cache.read().await;
-            msg_ids.into_iter()
-                .filter(|id| !cache.contains(id))
-                .collect()
-        };
+    async fn handle_ihave(&mut self, from: &Identity, topic: &str, msg_ids: Vec<MessageId>) {
+        let missing: Vec<MessageId> = msg_ids.into_iter()
+            .filter(|id| !self.message_cache.contains(id))
+            .collect();
 
         if missing.is_empty() {
             return;
         }
 
-        {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.get_mut(topic) {
-                state.promote_to_eager(*from);
-                
-                for msg_id in &missing {
-                    state.record_iwant(*msg_id, *from);
-                }
+        if let Some(state) = self.topics.get_mut(topic) {
+            state.promote_to_eager(*from);
+            
+            for msg_id in &missing {
+                state.record_iwant(*msg_id, *from);
             }
         }
 
@@ -1039,7 +1121,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         );
     }
 
-    async fn handle_iwant(&self, from: &Identity, msg_ids: Vec<MessageId>) {
+    async fn handle_iwant(&mut self, from: &Identity, msg_ids: Vec<MessageId>) {
         if msg_ids.len() > DEFAULT_MAX_IWANT_MESSAGES * 2 {
             warn!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
@@ -1050,19 +1132,17 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
 
         {
-            let mut rate_limits = self.rate_limits.write().await;
-            let limiter = rate_limits.entry(*from).or_default();
+            let limiter = self.rate_limits.entry(*from).or_default();
             if limiter.check_and_record_iwant(DEFAULT_IWANT_RATE_LIMIT) {
                 warn!(peer = %hex::encode(&from.as_bytes()[..8]), "IWant rate limited");
                 return;
             }
         }
 
-        let cache = self.message_cache.read().await;
         let mut bytes_sent = 0usize;
 
         for msg_id in msg_ids.into_iter().take(DEFAULT_MAX_IWANT_MESSAGES) {
-            if let Some(cached) = cache.peek(&msg_id) {
+            if let Some(cached) = self.message_cache.peek(&msg_id) {
                 if bytes_sent.saturating_add(cached.data.len()) > MAX_IWANT_RESPONSE_BYTES {
                     break;
                 }
@@ -1080,38 +1160,24 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    pub async fn run_heartbeat(&self) {
-        let mut interval = tokio::time::interval(self.config.heartbeat_interval);
-        
-        loop {
-            interval.tick().await;
-            self.heartbeat().await;
-        }
-    }
-
-    async fn heartbeat(&self) {
-        let subscribed_topics: Vec<String> = {
-            self.subscriptions.read().await.iter().cloned().collect()
-        };
+    async fn heartbeat(&mut self) {
+        let subscribed_topics: Vec<String> = self.subscriptions.iter().cloned().collect();
 
         for topic in subscribed_topics {
             self.lazy_push(&topic).await;
             self.check_timeouts(&topic).await;
         }
 
-        self.cleanup_stale_state().await;
+        self.cleanup_stale_state();
         self.flush_pending_queues().await;
     }
 
-    async fn flush_pending_queues(&self) {
-        let peers_with_pending: Vec<Identity> = {
-            let outbound = self.outbound.read().await;
-            outbound.keys().copied().collect()
-        };
+    async fn flush_pending_queues(&mut self) {
+        let peers_with_pending: Vec<Identity> = self.outbound.keys().copied().collect();
 
         for peer in peers_with_pending {
             if let Some(contact) = self.network.resolve_identity_to_contact(&peer).await {
-                let messages = self.take_pending_messages(&peer).await;
+                let messages = self.outbound.remove(&peer).unwrap_or_default();
                 for msg in messages {
                     if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg).await {
                         trace!(
@@ -1125,21 +1191,18 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    async fn lazy_push(&self, topic: &str) {
-        let (should_push, msg_ids, lazy_peers) = {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.get_mut(topic) {
-                if state.should_lazy_push(self.config.lazy_push_interval) {
-                    state.last_lazy_push = Instant::now();
-                    let ids: Vec<MessageId> = state.recent_messages.iter().copied().collect();
-                    let peers: Vec<Identity> = state.lazy_peers.iter().copied().collect();
-                    (true, ids, peers)
-                } else {
-                    (false, Vec::new(), Vec::new())
-                }
+    async fn lazy_push(&mut self, topic: &str) {
+        let (should_push, msg_ids, lazy_peers) = if let Some(state) = self.topics.get_mut(topic) {
+            if state.should_lazy_push(self.config.lazy_push_interval) {
+                state.last_lazy_push = Instant::now();
+                let ids: Vec<MessageId> = state.recent_messages.iter().copied().collect();
+                let peers: Vec<Identity> = state.lazy_peers.iter().copied().collect();
+                (true, ids, peers)
             } else {
                 (false, Vec::new(), Vec::new())
             }
+        } else {
+            (false, Vec::new(), Vec::new())
         };
 
         if should_push && !msg_ids.is_empty() && !lazy_peers.is_empty() {
@@ -1154,14 +1217,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    async fn check_timeouts(&self, topic: &str) {
-        let retries: Vec<(MessageId, Identity)> = {
-            let mut topics = self.topics.write().await;
-            if let Some(state) = topics.get_mut(topic) {
-                state.check_iwant_timeouts(self.config.ihave_timeout)
-            } else {
-                Vec::new()
-            }
+    async fn check_timeouts(&mut self, topic: &str) {
+        let retries: Vec<(MessageId, Identity)> = if let Some(state) = self.topics.get_mut(topic) {
+            state.check_iwant_timeouts(self.config.ihave_timeout)
+        } else {
+            Vec::new()
         };
 
         for (msg_id, peer) in retries {
@@ -1176,18 +1236,14 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    async fn cleanup_stale_state(&self) {
+    fn cleanup_stale_state(&mut self) {
         let now = Instant::now();
-        
-        let mut rate_limits = self.rate_limits.write().await;
-        rate_limits.retain(|_, limiter| !limiter.is_stale(now));
-        
-        let mut outbound = self.outbound.write().await;
-        outbound.retain(|_, msgs| !msgs.is_empty());
+        self.rate_limits.retain(|_, limiter| !limiter.is_stale(now));
+        self.outbound.retain(|_, msgs| !msgs.is_empty());
     }
 
 
-    async fn queue_message(&self, peer: &Identity, msg: PlumTreeMessage) {
+    async fn queue_message(&mut self, peer: &Identity, msg: PlumTreeMessage) {
         if let Some(contact) = self.network.resolve_identity_to_contact(peer).await {
             if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg.clone()).await {
                 trace!(
@@ -1196,34 +1252,33 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
                     "failed to send PlumTree message, queueing for later"
                 );
             } else {
-                return;            }
-        }
-        
-        let mut outbound = self.outbound.write().await;
-        
-        if !outbound.contains_key(peer) && outbound.len() >= MAX_OUTBOUND_PEERS {
-            let smallest = outbound.iter()
-                .min_by_key(|(_, msgs)| msgs.len())
-                .map(|(id, _)| *id);
-            if let Some(evict) = smallest {
-                outbound.remove(&evict);
+                return;
             }
         }
         
-        let total: usize = outbound.values().map(|v| v.len()).sum();
+        if !self.outbound.contains_key(peer) && self.outbound.len() >= MAX_OUTBOUND_PEERS {
+            let smallest = self.outbound.iter()
+                .min_by_key(|(_, msgs)| msgs.len())
+                .map(|(id, _)| *id);
+            if let Some(evict) = smallest {
+                self.outbound.remove(&evict);
+            }
+        }
+        
+        let total: usize = self.outbound.values().map(|v| v.len()).sum();
         if total >= MAX_TOTAL_OUTBOUND_MESSAGES {
-            if let Some(largest) = outbound.iter()
+            if let Some(largest) = self.outbound.iter()
                 .max_by_key(|(_, msgs)| msgs.len())
                 .map(|(id, _)| *id)
             {
-                if let Some(queue) = outbound.get_mut(&largest) {
+                if let Some(queue) = self.outbound.get_mut(&largest) {
                     let drain = (queue.len() / 2).max(1);
                     queue.drain(0..drain);
                 }
             }
         }
         
-        let queue = outbound.entry(*peer).or_default();
+        let queue = self.outbound.entry(*peer).or_default();
         
         if queue.len() >= MAX_OUTBOUND_PER_PEER {
             let drain = queue.len() / 2;
@@ -1231,57 +1286,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
         
         queue.push(msg);
-    }
-
-    pub async fn take_pending_messages(&self, peer: &Identity) -> Vec<PlumTreeMessage> {
-        let mut outbound = self.outbound.write().await;
-        outbound.remove(peer).unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub async fn peers_with_pending(&self) -> Vec<Identity> {
-        let outbound = self.outbound.read().await;
-        outbound.keys().copied().collect()
-    }
-
-    pub async fn subscriptions(&self) -> Vec<String> {
-        self.subscriptions.read().await.iter().cloned().collect()
-    }
-
-    #[allow(dead_code)]
-    pub async fn eager_peers(&self, topic: &str) -> Vec<Identity> {
-        let topics = self.topics.read().await;
-        topics.get(topic)
-            .map(|s| s.eager_peers.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub async fn lazy_peers(&self, topic: &str) -> Vec<Identity> {
-        let topics = self.topics.read().await;
-        topics.get(topic)
-            .map(|s| s.lazy_peers.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub async fn topic_peers(&self, topic: &str) -> Vec<Identity> {
-        let topics = self.topics.read().await;
-        topics.get(topic)
-            .map(|s| s.eager_peers.iter().chain(s.lazy_peers.iter()).copied().collect())
-            .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub fn local_identity(&self) -> Identity {
-        self.local_identity
-    }
-}
-
-#[async_trait::async_trait]
-impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeHandler for PlumTree<N> {
-    async fn handle_message(&self, from: &Identity, message: PlumTreeMessage) -> anyhow::Result<()> {
-        PlumTree::handle_message(self, from, message).await
     }
 }
 

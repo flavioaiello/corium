@@ -11,18 +11,18 @@ use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
-use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtRequest, DhtResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
+use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
 use crate::transport::{self, Contact, NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
-use crate::dht::{Dht, Key};
+use crate::dht::{DhtNode, Key};
 use crate::identity::{EndpointRecord, Identity};
 use crate::hyparview::{HyParView, HyParViewMessage};
 use crate::plumtree::PlumTreeHandler;
 
 
 #[async_trait]
-pub trait DhtRpc: Send + Sync + 'static {
+pub trait DhtNodeRpc: Send + Sync + 'static {
     async fn find_node(&self, to: &Contact, target: Identity) -> Result<Vec<Contact>>;
 
     async fn find_value(&self, to: &Contact, key: Key) -> Result<(Option<Vec<u8>>, Vec<Contact>)>;
@@ -325,12 +325,12 @@ impl RpcNode {
         }
     }
 
-    pub(crate) async fn rpc(&self, contact: &Contact, request: DhtRequest) -> Result<DhtResponse> {
-        let rpc_request = RpcRequest::Dht(request);
+    pub(crate) async fn rpc(&self, contact: &Contact, request: DhtNodeRequest) -> Result<DhtNodeResponse> {
+        let rpc_request = RpcRequest::DhtNode(request);
         let rpc_response = self.rpc_raw(contact, rpc_request).await?;
         
         match rpc_response {
-            RpcResponse::Dht(dht_response) => Ok(dht_response),
+            RpcResponse::DhtNode(dht_response) => Ok(dht_response),
             RpcResponse::Error { message } => anyhow::bail!("RPC error: {}", message),
             other => anyhow::bail!("unexpected response type for DHT request: {:?}", other),
         }
@@ -402,10 +402,10 @@ impl RpcNode {
     }
 
     pub async fn what_is_my_addr(&self, contact: &Contact) -> Result<SocketAddr> {
-        let response = self.rpc(contact, DhtRequest::WhatIsMyAddr).await?;
+        let response = self.rpc(contact, DhtNodeRequest::WhatIsMyAddr).await?;
         
         match response {
-            DhtResponse::YourAddr { addr } => {
+            DhtNodeResponse::YourAddr { addr } => {
                 addr.parse()
                     .with_context(|| format!("invalid address in response: {}", addr))
             }
@@ -687,14 +687,14 @@ impl RpcNode {
 }
 
 #[async_trait]
-impl DhtRpc for RpcNode {
+impl DhtNodeRpc for RpcNode {
     async fn find_node(&self, to: &Contact, target: Identity) -> Result<Vec<Contact>> {
-        let request = DhtRequest::FindNode {
+        let request = DhtNodeRequest::FindNode {
             from: self.self_contact.clone(),
             target,
         };
         match self.rpc(to, request).await? {
-            DhtResponse::Nodes(nodes) => {
+            DhtNodeResponse::Nodes(nodes) => {
                 if nodes.len() > MAX_CONTACTS_PER_RESPONSE {
                     warn!(
                         peer = %to.addr,
@@ -712,12 +712,12 @@ impl DhtRpc for RpcNode {
     }
 
     async fn find_value(&self, to: &Contact, key: Key) -> Result<(Option<Vec<u8>>, Vec<Contact>)> {
-        let request = DhtRequest::FindValue {
+        let request = DhtNodeRequest::FindValue {
             from: self.self_contact.clone(),
             key,
         };
         match self.rpc(to, request).await? {
-            DhtResponse::Value { value, closer } => {
+            DhtNodeResponse::Value { value, closer } => {
                 if let Some(ref v) = value {
                     if v.len() > MAX_VALUE_SIZE {
                         warn!(
@@ -749,23 +749,23 @@ impl DhtRpc for RpcNode {
     }
 
     async fn store(&self, to: &Contact, key: Key, value: Vec<u8>) -> Result<()> {
-        let request = DhtRequest::Store {
+        let request = DhtNodeRequest::Store {
             from: self.self_contact.clone(),
             key,
             value,
         };
         match self.rpc(to, request).await? {
-            DhtResponse::Ack => Ok(()),
+            DhtNodeResponse::Ack => Ok(()),
             other => anyhow::bail!("unexpected response to Store: {:?}", other),
         }
     }
 
     async fn ping(&self, to: &Contact) -> Result<()> {
-        let request = DhtRequest::Ping {
+        let request = DhtNodeRequest::Ping {
             from: self.self_contact.clone(),
         };
         match self.rpc(to, request).await? {
-            DhtResponse::Ack => Ok(()),
+            DhtNodeResponse::Ack => Ok(()),
             other => anyhow::bail!("unexpected response to Ping: {:?}", other),
         }
     }
@@ -823,14 +823,14 @@ const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
-    node: Dht<N>,
+pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync + 'static>(
+    node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
-    hyparview: Arc<HyParView<N>>,
+    hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
     debug!("handle_connection: accepting incoming connection");
@@ -896,15 +896,15 @@ pub async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
-    node: Dht<N>,
+async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
+    node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
     verified_identity: Identity,
-    hyparview: Arc<HyParView<N>>,
+    hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
     let mut len_buf = [0u8; 4];
@@ -920,7 +920,7 @@ async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 's
             max = MAX_REQUEST_SIZE,
             "rejecting oversized request"
         );
-        let error_response = DhtResponse::Error {
+        let error_response = DhtNodeResponse::Error {
             message: format!("request too large: {} bytes (max {})", len, MAX_REQUEST_SIZE),
         };
         let response_bytes = bincode::serialize(&error_response)?;
@@ -991,20 +991,20 @@ async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 's
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
-    node: Dht<N>,
+async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
+    node: DhtNode<N>,
     request: RpcRequest,
     remote_addr: SocketAddr,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
     udp_forwarder: Option<Arc<UdpRelayForwarder>>,
     udp_forwarder_addr: Option<SocketAddr>,
-    hyparview: Arc<HyParView<N>>,
+    hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
 ) -> RpcResponse {
     match request {
-        RpcRequest::Dht(dht_request) => {
+        RpcRequest::DhtNode(dht_request) => {
             let dht_response = handle_dht_rpc(&node, dht_request, remote_addr).await;
-            RpcResponse::Dht(dht_response)
+            RpcResponse::DhtNode(dht_response)
         }
         RpcRequest::Relay(relay_request) => {
             let relay_response = transport::handle_relay_request(
@@ -1031,20 +1031,20 @@ async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync
 }
 
 
-async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
-    node: &Dht<N>,
-    request: DhtRequest,
+async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
+    node: &DhtNode<N>,
+    request: DhtNodeRequest,
     remote_addr: SocketAddr,
-) -> DhtResponse {
+) -> DhtNodeResponse {
     match request {
-        DhtRequest::Ping { from } => {
+        DhtNodeRequest::Ping { from } => {
             trace!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
                 "handling PING request"
             );
-            DhtResponse::Ack
+            DhtNodeResponse::Ack
         }
-        DhtRequest::FindNode { from, target } => {
+        DhtNodeRequest::FindNode { from, target } => {
             trace!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
                 target = ?hex::encode(&target.as_bytes()[..8]),
@@ -1056,9 +1056,9 @@ async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
                 returned = nodes.len(),
                 "FIND_NODE response"
             );
-            DhtResponse::Nodes(nodes)
+            DhtNodeResponse::Nodes(nodes)
         }
-        DhtRequest::FindValue { from, key } => {
+        DhtNodeRequest::FindValue { from, key } => {
             trace!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
                 key = ?hex::encode(&key[..8]),
@@ -1072,9 +1072,9 @@ async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
                 closer_nodes = closer.len(),
                 "FIND_VALUE response"
             );
-            DhtResponse::Value { value, closer }
+            DhtNodeResponse::Value { value, closer }
         }
-        DhtRequest::Store { from, key, value } => {
+        DhtNodeRequest::Store { from, key, value } => {
             debug!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
                 key = ?hex::encode(&key[..8]),
@@ -1082,11 +1082,11 @@ async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
                 "handling STORE request"
             );
             node.handle_store_request(&from, key, value).await;
-            DhtResponse::Ack
+            DhtNodeResponse::Ack
         }
-        DhtRequest::WhatIsMyAddr => {
+        DhtNodeRequest::WhatIsMyAddr => {
             debug!("handling WHAT_IS_MY_ADDR request (STUN-like)");
-            DhtResponse::YourAddr {
+            DhtNodeResponse::YourAddr {
                 addr: remote_addr.to_string(),
             }
         }
@@ -1124,10 +1124,10 @@ async fn handle_plumtree_rpc(
     }
 }
 
-async fn handle_hyparview_rpc<N: HyParViewRpc + Send + Sync + 'static>(
+async fn handle_hyparview_rpc(
     from: Identity,
     message: HyParViewMessage,
-    hyparview: Arc<HyParView<N>>,
+    hyparview: HyParView,
 ) -> RpcResponse {
     trace!(
         from = ?hex::encode(&from.as_bytes()[..8]),

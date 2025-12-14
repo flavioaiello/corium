@@ -19,6 +19,18 @@ use crate::identity::Identity;
 use crate::messages::{RelayRequest, RelayResponse};
 
 
+/// Callback trait for path change notifications.
+/// Implementors receive notifications when SmartSock detects better paths to peers.
+#[async_trait::async_trait]
+pub trait PathEventHandler: Send + Sync {
+    /// Called when a better path to a peer is discovered and activated.
+    async fn on_path_improved(&self, peer: Identity, new_path: PathChoice);
+    
+    /// Called when a peer becomes unreachable (all paths failed).
+    async fn on_peer_unreachable(&self, peer: Identity);
+}
+
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Contact {
     pub identity: Identity,
@@ -58,7 +70,6 @@ impl Hash for Contact {
 
 pub const RELAY_MAGIC: [u8; 4] = *b"CRLY";
 pub const RELAY_HEADER_SIZE: usize = 20;
-pub const MAX_FRAME_SIZE: usize = 1500;
 pub const MAX_SESSIONS: usize = 10_000;
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -267,12 +278,14 @@ impl UdpRelayForwarder {
         })
     }
 
-    pub fn with_socket(socket: Arc<UdpSocket>) -> Self {
-        Self {
+    pub fn with_socket(socket: Arc<UdpSocket>) -> Arc<Self> {
+        let forwarder = Arc::new(Self {
             socket,
             sessions: RwLock::new(HashMap::new()),
             addr_to_session: RwLock::new(HashMap::new()),
-        }
+        });
+        forwarder.clone().spawn_cleanup();
+        forwarder
     }
 
     #[allow(dead_code)]
@@ -1205,6 +1218,9 @@ pub struct SmartSock {
     local_addr: SocketAddr,
 
     forwarder: StdRwLock<Option<Arc<UdpRelayForwarder>>>,
+    
+    /// Optional handler for path change events (uses tokio RwLock for async safety)
+    path_event_handler: RwLock<Option<Arc<dyn PathEventHandler>>>,
 }
 
 impl SmartSock {
@@ -1218,6 +1234,7 @@ impl SmartSock {
             reverse_map: RwLock::new(HashMap::new()),
             local_addr,
             forwarder: StdRwLock::new(None),
+            path_event_handler: RwLock::new(None),
         })
     }
 
@@ -1227,6 +1244,43 @@ impl SmartSock {
         }
     }
     
+    /// Set the path event handler to receive notifications when paths change.
+    pub async fn set_path_event_handler(&self, handler: Arc<dyn PathEventHandler>) {
+        let mut guard = self.path_event_handler.write().await;
+        *guard = Some(handler);
+    }
+    
+    /// Get the current path event handler, if set.
+    async fn get_path_event_handler(&self) -> Option<Arc<dyn PathEventHandler>> {
+        self.path_event_handler.read().await.clone()
+    }
+    
+    /// Cache a contact by parsing its addresses and registering as a peer.
+    /// This is a convenience method that handles address parsing.
+    pub async fn cache_contact(&self, contact: &Contact) {
+        // Parse all addresses from the contact
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        
+        // Parse primary address
+        if let Ok(addr) = contact.addr.parse::<SocketAddr>() {
+            addrs.push(addr);
+        }
+        
+        // Parse additional addresses
+        for addr_str in &contact.addrs {
+            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        }
+        
+        // Only register if we have at least one valid address
+        if !addrs.is_empty() {
+            self.register_peer(contact.identity, addrs).await;
+        }
+    }
+
     pub async fn register_peer(
         &self,
         identity: Identity,
@@ -1338,6 +1392,91 @@ impl SmartSock {
                 );
             }
         }
+    }
+    
+    /// Remove all relay tunnels for a peer. Called when a connection is closed.
+    pub async fn cleanup_peer_relay_tunnels(&self, identity: &Identity) -> Vec<[u8; 16]> {
+        let smart_addr = SmartAddr::from_identity(identity);
+        
+        // First pass: collect relay addresses and session IDs while holding the lock
+        let mut removed_sessions = Vec::new();
+        let mut relay_addrs_to_remove = Vec::new();
+        
+        {
+            let mut peers = self.peers.write().await;
+            if let Some(state) = peers.get_mut(&smart_addr) {
+                let session_ids: Vec<[u8; 16]> = state.relay_tunnels.keys().copied().collect();
+                for session_id in session_ids {
+                    if let Some(tunnel) = state.relay_tunnels.remove(&session_id) {
+                        removed_sessions.push(session_id);
+                        relay_addrs_to_remove.push(tunnel.relay_addr);
+                    }
+                }
+            }
+        } // Release peers lock before acquiring reverse_map lock
+        
+        // Second pass: clean up reverse map entries
+        if !relay_addrs_to_remove.is_empty() {
+            let mut reverse = self.reverse_map.write().await;
+            for relay_addr in relay_addrs_to_remove {
+                reverse.remove(&relay_addr);
+            }
+        }
+        
+        if !removed_sessions.is_empty() {
+            tracing::debug!(
+                peer = ?identity,
+                tunnels_removed = removed_sessions.len(),
+                "cleaned up all relay tunnels for peer"
+            );
+        }
+        
+        removed_sessions
+    }
+    
+    /// Get contact information for a peer from SmartSock's peer registry.
+    /// Uses try_read to avoid blocking if the lock is contended.
+    pub fn get_peer_contact_nonblocking(&self, identity: &Identity) -> Option<Contact> {
+        let smart_addr = SmartAddr::from_identity(identity);
+        let peers = self.peers.try_read().ok()?;
+        let state = peers.get(&smart_addr)?;
+        
+        // Build contact from peer state
+        let primary_addr = state.direct_addrs.first()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let addrs: Vec<String> = state.direct_addrs.iter()
+            .skip(1)
+            .map(|a| a.to_string())
+            .collect();
+        
+        Some(Contact {
+            identity: state.identity,
+            addr: primary_addr,
+            addrs,
+        })
+    }
+    
+    /// Get contact information for a peer from SmartSock's peer registry (async version).
+    pub async fn get_peer_contact(&self, identity: &Identity) -> Option<Contact> {
+        let smart_addr = SmartAddr::from_identity(identity);
+        let peers = self.peers.read().await;
+        let state = peers.get(&smart_addr)?;
+        
+        // Build contact from peer state
+        let primary_addr = state.direct_addrs.first()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let addrs: Vec<String> = state.direct_addrs.iter()
+            .skip(1)
+            .map(|a| a.to_string())
+            .collect();
+        
+        Some(Contact {
+            identity: state.identity,
+            addr: primary_addr,
+            addrs,
+        })
     }
     
     pub async fn use_relay_path(
@@ -1489,9 +1628,24 @@ impl SmartSock {
     }
     
     pub async fn switch_to_best_paths(&self) {
-        let mut peers = self.peers.write().await;
-        for (_, state) in peers.iter_mut() {
-            state.maybe_switch_path();
+        let switches: Vec<(Identity, PathChoice)> = {
+            let mut peers = self.peers.write().await;
+            let mut switches = Vec::new();
+            for (_, state) in peers.iter_mut() {
+                if let Some(new_path) = state.maybe_switch_path() {
+                    switches.push((state.identity, new_path));
+                }
+            }
+            switches
+        };
+        
+        // Notify handler of path switches (outside of lock)
+        if !switches.is_empty() {
+            if let Some(handler) = self.get_path_event_handler().await {
+                for (peer, new_path) in switches {
+                    handler.on_path_improved(peer, new_path).await;
+                }
+            }
         }
     }
     
@@ -1547,7 +1701,32 @@ impl SmartSock {
         server_config: quinn::ServerConfig,
     ) -> io::Result<(quinn::Endpoint, Arc<Self>)> {
         let smartsock = Self::bind(addr).await?;
-        smartsock.into_endpoint(server_config)
+        let (endpoint, smartsock) = smartsock.into_endpoint(server_config)?;
+        
+        // Spawn probe loop internally
+        let probe_smartsock = smartsock.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PATH_PROBE_INTERVAL);
+            loop {
+                interval.tick().await;
+                
+                probe_smartsock.expire_probes().await;
+                
+                match probe_smartsock.probe_all_paths().await {
+                    Ok(count) if count > 0 => {
+                        tracing::trace!(probes_sent = count, "path probing tick");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "path probing error");
+                    }
+                    _ => {}
+                }
+                
+                probe_smartsock.switch_to_best_paths().await;
+            }
+        });
+        
+        Ok((endpoint, smartsock))
     }
 }
 

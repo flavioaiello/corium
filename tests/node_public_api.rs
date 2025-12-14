@@ -100,14 +100,6 @@ async fn node_relay_capability() {
 }
 
 #[tokio::test]
-async fn node_plumtree_enabled() {
-    let node = Node::bind(&test_addr()).await.expect("bind failed");
-    
-    // PlumTree should be enabled by default
-    assert!(node.has_plumtree(), "plumtree should be enabled by default");
-}
-
-#[tokio::test]
 async fn node_dht_put_get() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     

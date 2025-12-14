@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use lru::LruCache;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -15,7 +15,7 @@ use crate::routing::{
     BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
 };
 use crate::transport::Contact;
-use crate::rpc::DhtRpc;
+use crate::rpc::DhtNodeRpc;
 
 
 pub type Key = [u8; 32];
@@ -949,44 +949,91 @@ fn nearest_center_scalar(value: f32, centers: &[f32]) -> usize {
 pub const DEFAULT_K: usize = 20;
 pub const DEFAULT_ALPHA: usize = 3;
 
-pub struct Dht<N: DhtRpc> {
-    pub(crate) id: Identity,
-    pub(crate) self_contact: Contact,
-    pub(crate) routing: Arc<Mutex<RoutingTable>>,
-    pub(crate) store: Arc<Mutex<LocalStore>>,
-    pub(crate) network: Arc<N>,
-    pub(crate) params: Arc<Mutex<AdaptiveParams>>,
-    pub(crate) tiering: Arc<Mutex<TieringManager>>,
-    pub(crate) routing_limiter: Arc<Mutex<RoutingInsertionLimiter>>,
+
+
+pub struct DhtNode<N: DhtNodeRpc> {
+    cmd_tx: mpsc::Sender<Command>,
+    id: Identity,
+    self_contact: Contact,
+    network: Arc<N>,
 }
 
-impl<N: DhtRpc> Clone for Dht<N> {
+impl<N: DhtNodeRpc> Clone for DhtNode<N> {
     fn clone(&self) -> Self {
         Self {
+            cmd_tx: self.cmd_tx.clone(),
             id: self.id,
             self_contact: self.self_contact.clone(),
-            routing: self.routing.clone(),
-            store: self.store.clone(),
             network: self.network.clone(),
-            params: self.params.clone(),
-            tiering: self.tiering.clone(),
-            routing_limiter: self.routing_limiter.clone(),
         }
     }
 }
 
-impl<N: DhtRpc> Dht<N> {
+struct DhtNodeActor<N: DhtNodeRpc> {
+    routing: RoutingTable,
+    store: LocalStore,
+    params: AdaptiveParams,
+    tiering: TieringManager,
+    routing_limiter: RoutingInsertionLimiter,
+    cmd_rx: mpsc::Receiver<Command>,
+    cmd_tx: mpsc::Sender<Command>,
+    network: Arc<N>,
+    id: Identity,
+}
+
+enum Command {
+    // State updates
+    ObserveContact(Contact),
+    ObserveContactFromPeer(Contact, Identity, oneshot::Sender<bool>),
+    RecordRtt(Contact, Duration),
+    AdjustK(bool),
+    
+    // Queries
+    GetLookupParams(Identity, Option<TieringLevel>, oneshot::Sender<(usize, usize, Vec<Contact>)>),
+    GetLocal(Key, oneshot::Sender<Option<Vec<u8>>>),
+    StoreLocal(Key, Vec<u8>, Identity, oneshot::Sender<Vec<(Key, Vec<u8>)>>),
+    GetTelemetry(oneshot::Sender<TelemetrySnapshot>),
+    GetSlowestLevel(oneshot::Sender<TieringLevel>),
+    
+    // RPC Handlers
+    HandleFindNode(Contact, Identity, oneshot::Sender<Vec<Contact>>),
+    HandleFindValue(Contact, Key, oneshot::Sender<(Option<Vec<u8>>, Vec<Contact>)>),
+    HandleStore(Contact, Key, Vec<u8>),
+    
+    // Maintenance
+    GetStaleBuckets(Duration, oneshot::Sender<Vec<usize>>),
+    MarkBucketRefreshed(usize),
+    ApplyPingResult(PendingBucketUpdate, bool),
+    
+    Quit,
+}
+
+impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     pub fn new(id: Identity, self_contact: Contact, network: N, k: usize, alpha: usize) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+        let network = Arc::new(network);
+        
+        let actor = DhtNodeActor {
+            routing: RoutingTable::new(id, k),
+            store: LocalStore::new(),
+            params: AdaptiveParams::new(k, alpha),
+            tiering: TieringManager::new(),
+            routing_limiter: RoutingInsertionLimiter::new(),
+            cmd_rx,
+            cmd_tx: cmd_tx.clone(),
+            network: network.clone(),
+            id,
+        };
+
+        tokio::spawn(actor.run());
+
         let node = Self {
+            cmd_tx,
             id,
             self_contact,
-            routing: Arc::new(Mutex::new(RoutingTable::new(id, k))),
-            store: Arc::new(Mutex::new(LocalStore::new())),
-            network: Arc::new(network),
-            params: Arc::new(Mutex::new(AdaptiveParams::new(k, alpha))),
-            tiering: Arc::new(Mutex::new(TieringManager::new())),
-            routing_limiter: Arc::new(Mutex::new(RoutingInsertionLimiter::new())),
+            network,
         };
+        
         node.spawn_periodic_bucket_refresh();
         node
     }
@@ -1002,84 +1049,15 @@ impl<N: DhtRpc> Dht<N> {
     }
 
     pub async fn observe_contact(&self, contact: Contact) {
-        if contact.identity == self.id {
-            return;
-        }
-
-        if !contact.identity.is_valid() {
-            trace!(
-                addr = %contact.addr,
-                identity = %hex::encode(&contact.identity.as_bytes()[..8]),
-                "rejecting contact with invalid identity"
-            );
-            return;
-        }
-
-        {
-            let mut tiering = self.tiering.lock().await;
-            tiering.register_contact(&contact.identity);
-        }
-        let k = {
-            let params = self.params.lock().await;
-            params.current_k()
-        };
-        let pending = {
-            let mut rt = self.routing.lock().await;
-            rt.set_k(k);
-            rt.update_with_pending(contact.clone())
-        };
-
-        info!(
-            addr = %contact.addr,
-            identity = %hex::encode(&contact.identity.as_bytes()[..16]),
-            "Contact observed"
-        );
-
-        if let Some(update) = pending {
-            self.spawn_bucket_refresh(update);
-        }
+        let _ = self.cmd_tx.send(Command::ObserveContact(contact)).await;
     }
 
     pub async fn observe_contact_from_peer(&self, contact: Contact, from_peer: &Identity) -> bool {
-        if contact.identity == *from_peer {
-            self.observe_contact(contact).await;
-            return true;
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::ObserveContactFromPeer(contact, *from_peer, tx)).await.is_err() {
+            return false;
         }
-
-        {
-            let mut limiter = self.routing_limiter.lock().await;
-            if !limiter.allow_insertion(from_peer) {
-                trace!(
-                    from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
-                    contact = %hex::encode(&contact.identity.as_bytes()[..8]),
-                    "rate-limited contact insertion from peer"
-                );
-                return false;
-            }
-        }
-
-        self.observe_contact(contact).await;
-        true
-    }
-
-    fn spawn_bucket_refresh(&self, pending: PendingBucketUpdate) {
-        let network = self.network.clone();
-        let routing = self.routing.clone();
-        tokio::spawn(async move {
-            let alive = match network.ping(&pending.oldest).await {
-                Ok(_) => true,
-                Err(err) => {
-                    debug!(
-                        peer = ?pending.oldest.identity,
-                        addr = %pending.oldest.addr,
-                        "ping failed: {err:?}"
-                    );
-                    false
-                }
-            };
-            let mut rt = routing.lock().await;
-            rt.apply_ping_result(pending, alive);
-        });
+        rx.await.unwrap_or(false)
     }
 
     fn spawn_periodic_bucket_refresh(&self) {
@@ -1090,9 +1068,14 @@ impl<N: DhtRpc> Dht<N> {
             loop {
                 interval.tick().await;
 
-                let stale_buckets: Vec<usize> = {
-                    let rt = node.routing.lock().await;
-                    rt.stale_bucket_indices(BUCKET_STALE_THRESHOLD)
+                let (tx, rx) = oneshot::channel();
+                if node.cmd_tx.send(Command::GetStaleBuckets(BUCKET_STALE_THRESHOLD, tx)).await.is_err() {
+                    break;
+                }
+                
+                let stale_buckets = match rx.await {
+                    Ok(buckets) => buckets,
+                    Err(_) => break,
                 };
 
                 if stale_buckets.is_empty() {
@@ -1105,32 +1088,24 @@ impl<N: DhtRpc> Dht<N> {
                 );
 
                 for bucket_idx in stale_buckets {
-                    let target = {
-                        let rt = node.routing.lock().await;
-                        random_id_for_bucket(&rt.self_id(), bucket_idx)
-                    };
+                    let target = random_id_for_bucket(&node.id, bucket_idx);
 
                     if let Err(e) = node.iterative_find_node(target).await {
                         debug!(bucket = bucket_idx, error = ?e, "bucket refresh lookup failed");
                     }
 
-                    {
-                        let mut rt = node.routing.lock().await;
-                        rt.mark_bucket_refreshed(bucket_idx);
-                    }
+                    let _ = node.cmd_tx.send(Command::MarkBucketRefreshed(bucket_idx)).await;
                 }
             }
         });
     }
 
     pub async fn handle_find_node_request(&self, from: &Contact, target: Identity) -> Vec<Contact> {
-        self.observe_contact(from.clone()).await;
-        let k = {
-            let params = self.params.lock().await;
-            params.current_k()
-        };
-        let rt = self.routing.lock().await;
-        rt.closest(&target, k)
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::HandleFindNode(from.clone(), target, tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn handle_find_value_request(
@@ -1138,80 +1113,24 @@ impl<N: DhtRpc> Dht<N> {
         from: &Contact,
         key: Key,
     ) -> (Option<Vec<u8>>, Vec<Contact>) {
-        self.observe_contact(from.clone()).await;
-        if let Some(v) = self.get_local(&key).await {
-            return (Some(v), Vec::new());
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::HandleFindValue(from.clone(), key, tx)).await.is_err() {
+            return (None, Vec::new());
         }
-        let target = Identity::from_bytes(key);
-        let k = {
-            let params = self.params.lock().await;
-            params.current_k()
-        };
-        let rt = self.routing.lock().await;
-        let closer = rt.closest(&target, k);
-        (None, closer)
+        rx.await.unwrap_or((None, Vec::new()))
     }
 
     pub async fn handle_store_request(&self, from: &Contact, key: Key, value: Vec<u8>) {
-        self.observe_contact(from.clone()).await;
-        self.store_local(key, value, from.identity).await;
-    }
-
-    async fn level_matches(&self, node: &Identity, level_filter: Option<TieringLevel>) -> bool {
-        if let Some(level) = level_filter {
-            let tiering = self.tiering.lock().await;
-            tiering.level_for(node) == level
-        } else {
-            true
-        }
-    }
-
-    async fn filter_contacts(
-        &self,
-        contacts: Vec<Contact>,
-        level_filter: Option<TieringLevel>,
-    ) -> Vec<Contact> {
-        if level_filter.is_none() {
-            return contacts;
-        }
-        let level = level_filter.unwrap();
-        let tiering = self.tiering.lock().await;
-        contacts
-            .into_iter()
-            .filter(|c| tiering.level_for(&c.identity) == level)
-            .collect()
+        // Fire and forget store request handling to avoid blocking
+        let _ = self.cmd_tx.send(Command::HandleStore(from.clone(), key, value)).await;
     }
 
     async fn record_rtt(&self, contact: &Contact, elapsed: Duration) {
-        if contact.identity == self.id {
-            return;
-        }
-        let rtt_ms = (elapsed.as_secs_f64() * 1000.0) as f32;
-        let mut tiering = self.tiering.lock().await;
-        tiering.record_sample(&contact.identity, rtt_ms);
+        let _ = self.cmd_tx.send(Command::RecordRtt(contact.clone(), elapsed)).await;
     }
 
     async fn adjust_k(&self, success: bool) {
-        let (changed, new_k) = {
-            let mut params = self.params.lock().await;
-            let changed = params.record_churn(success);
-            let current_k = params.current_k();
-            (changed, current_k)
-        };
-        if changed {
-            let mut rt = self.routing.lock().await;
-            rt.set_k(new_k);
-        }
-    }
-
-    async fn current_k(&self) -> usize {
-        let params = self.params.lock().await;
-        params.current_k()
-    }
-
-    async fn current_alpha(&self) -> usize {
-        let params = self.params.lock().await;
-        params.current_alpha()
+        let _ = self.cmd_tx.send(Command::AdjustK(success)).await;
     }
 
     pub async fn iterative_find_node(&self, target: Identity) -> Result<Vec<Contact>> {
@@ -1225,23 +1144,18 @@ impl<N: DhtRpc> Dht<N> {
     ) -> Result<Vec<Contact>> {
         const MAX_LOOKUP_ITERATIONS: usize = 20;
         
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetLookupParams(target, level_filter, tx)).await.is_err() {
+            return Err(anyhow!("Actor closed"));
+        }
+        let (k_initial, alpha, mut shortlist) = rx.await.map_err(|_| anyhow!("Actor closed"))?;
+
         let mut seen: HashSet<Identity> = HashSet::new();
         let mut seen_addrs: HashSet<String> = HashSet::new();
         let mut queried: HashSet<Identity> = HashSet::new();
         let mut rpc_success = false;
         let mut rpc_failure = false;
         let mut iteration = 0;
-        let k_initial = self.current_k().await;
-        let mut shortlist = {
-            let rt = self.routing.lock().await;
-            rt.closest(&target, k_initial)
-        };
-        shortlist = self.filter_contacts(shortlist, level_filter).await;
-        shortlist.sort_by(|a, b| {
-            let da = xor_distance(&a.identity, &target);
-            let db = xor_distance(&b.identity, &target);
-            distance_cmp(&da, &db)
-        });
 
         for c in &shortlist {
             seen.insert(c.identity);
@@ -1264,7 +1178,6 @@ impl<N: DhtRpc> Dht<N> {
                 break;
             }
             
-            let alpha = self.current_alpha().await;
             let candidates: Vec<Contact> = shortlist
                 .iter()
                 .filter(|c| !queried.contains(&c.identity) && c.identity != self.id)
@@ -1308,10 +1221,16 @@ impl<N: DhtRpc> Dht<N> {
                             self.observe_contact_from_peer(n.clone(), &from_peer).await;
                         }
 
-                        for n in nodes {
+                        let valid_nodes = nodes;
+                        // if level_filter.is_none() {
+                        //     valid_nodes = nodes;
+                        // } else {
+                        //      valid_nodes = nodes; 
+                        // }
+
+                        for n in valid_nodes {
                             if seen.insert(n.identity)
                                 && seen_addrs.insert(n.addr.clone())
-                                && self.level_matches(&n.identity, level_filter).await
                             {
                                 shortlist.push(n);
                             }
@@ -1329,9 +1248,8 @@ impl<N: DhtRpc> Dht<N> {
                 distance_cmp(&da, &db)
             });
 
-            let k = self.current_k().await;
-            if shortlist.len() > k {
-                shortlist.truncate(k);
+            if shortlist.len() > k_initial {
+                shortlist.truncate(k_initial);
             }
 
             if let Some(first) = shortlist.first() {
@@ -1373,24 +1291,23 @@ impl<N: DhtRpc> Dht<N> {
             );
             return;
         }
-        let spilled = {
-            let mut store = self.store.lock().await;
-            store.record_request();
-            store.store(key, &value, stored_by)
-        };
-        if !spilled.is_empty() {
-            self.offload_spilled(spilled).await;
+        
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::StoreLocal(key, value, stored_by, tx)).await.is_ok() {
+            if let Ok(spilled) = rx.await {
+                if !spilled.is_empty() {
+                    self.offload_spilled(spilled).await;
+                }
+            }
         }
     }
 
     async fn get_local(&self, key: &Key) -> Option<Vec<u8>> {
-        let mut store = self.store.lock().await;
-        store.record_request();
-        let result = store.get(key);
-        if result.is_none() {
-            trace!(key = hex::encode(&key[..8]), "local store miss");
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetLocal(*key, tx)).await.is_err() {
+            return None;
         }
-        result
+        rx.await.unwrap_or(None)
     }
 
     async fn offload_spilled(&self, spilled: Vec<(Key, Vec<u8>)>) {
@@ -1398,11 +1315,15 @@ impl<N: DhtRpc> Dht<N> {
             return;
         }
 
+        // Get the slowest tier for cold storage offload
         let target_level = {
-            let tiering = self.tiering.lock().await;
-            tiering.slowest_level()
+            let (tx, rx) = oneshot::channel();
+            if self.cmd_tx.send(Command::GetSlowestLevel(tx)).await.is_err() {
+                return;
+            }
+            rx.await.unwrap_or(TieringLevel::new(0))
         };
-
+        
         for (key, value) in spilled {
             let mut attempt = 0;
             loop {
@@ -1413,22 +1334,11 @@ impl<N: DhtRpc> Dht<N> {
                 
                 attempt += 1;
                 if attempt >= OFFLOAD_MAX_RETRIES {
-                    warn!(
-                        key = hex::encode(&key[..8]),
-                        attempts = attempt,
-                        "failed to offload spilled data after max retries"
-                    );
                     break;
                 }
                 
                 let delay_ms = OFFLOAD_BASE_DELAY_MS * (1 << (attempt - 1));
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                trace!(
-                    key = hex::encode(&key[..8]),
-                    attempt = attempt,
-                    delay_ms = delay_ms,
-                    "retrying offload after backoff"
-                );
             }
         }
     }
@@ -1440,26 +1350,14 @@ impl<N: DhtRpc> Dht<N> {
             .await
         {
             Ok(c) => c,
-            Err(e) => {
-                trace!(
-                    key = hex::encode(&key[..8]),
-                    error = %e,
-                    "failed to find nodes for replication"
-                );
-                return false;
-            }
+            Err(_) => return false,
         };
         
         if contacts.is_empty() {
-            trace!(
-                key = hex::encode(&key[..8]),
-                level = ?level,
-                "no contacts found for replication level"
-            );
             return false;
         }
         
-        let k = self.current_k().await;
+        let k = DEFAULT_K; 
         let mut any_success = false;
         for contact in contacts.into_iter().take(k) {
             if self.send_store_with_result(&contact, key, value.clone()).await {
@@ -1488,19 +1386,7 @@ impl<N: DhtRpc> Dht<N> {
     }
 
     async fn send_store(&self, contact: &Contact, key: Key, value: Vec<u8>) {
-        let start = Instant::now();
-        let result = self.network.store(contact, key, value).await;
-        match result {
-            Ok(_) => {
-                let elapsed = start.elapsed();
-                self.record_rtt(contact, elapsed).await;
-                self.adjust_k(true).await;
-                self.observe_contact(contact.clone()).await;
-            }
-            Err(_) => {
-                self.adjust_k(false).await;
-            }
-        }
+        let _ = self.send_store_with_result(contact, key, value).await;
     }
 
     pub async fn put(&self, value: Vec<u8>) -> Result<Key> {
@@ -1510,7 +1396,7 @@ impl<N: DhtRpc> Dht<N> {
 
         let target = Identity::from_bytes(key);
         let closest = self.iterative_find_node_with_level(target, None).await?;
-        let k = self.current_k().await;
+        let k = DEFAULT_K; 
 
         for contact in closest.into_iter().take(k) {
             self.send_store(&contact, key, value.clone()).await;
@@ -1520,30 +1406,18 @@ impl<N: DhtRpc> Dht<N> {
     }
 
     pub async fn telemetry_snapshot(&self) -> TelemetrySnapshot {
-        let tiering_stats = {
-            let tiering = self.tiering.lock().await;
-            tiering.stats()
-        };
-        let (pressure, stored_keys) = {
-            let store = self.store.lock().await;
-            (store.current_pressure(), store.len())
-        };
-        let params = self.params.lock().await;
-        TelemetrySnapshot {
-            tier_centroids: tiering_stats.centroids,
-            tier_counts: tiering_stats.counts,
-            pressure,
-            stored_keys,
-            replication_factor: params.current_k(),
-            concurrency: params.current_alpha(),
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::GetTelemetry(tx)).await.is_err() {
+            return TelemetrySnapshot::default();
         }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn put_at(&self, key: Key, value: Vec<u8>) -> Result<()> {
         self.store_local(key, value.clone(), self.id).await;
 
         let closest = self.iterative_find_node(Identity::from_bytes(key)).await?;
-        let k = self.current_k().await;
+        let k = DEFAULT_K;
 
         for contact in closest.into_iter().take(k) {
             self.send_store(&contact, key, value.clone()).await;
@@ -1627,6 +1501,157 @@ impl<N: DhtRpc> Dht<N> {
         let key: Key = *record.identity.as_bytes();
         self.put_at(key, serialized).await
     }
+    
+    pub async fn quit(&self) {
+        let _ = self.cmd_tx.send(Command::Quit).await;
+    }
+}
+
+impl<N: DhtNodeRpc> DhtNodeActor<N> {
+    async fn run(mut self) {
+        while let Some(cmd) = self.cmd_rx.recv().await {
+            match cmd {
+                Command::ObserveContact(contact) => {
+                    self.handle_observe_contact(contact);
+                }
+                Command::ObserveContactFromPeer(contact, from_peer, reply) => {
+                    let allowed = self.handle_observe_contact_from_peer(contact, &from_peer);
+                    let _ = reply.send(allowed);
+                }
+                Command::RecordRtt(contact, elapsed) => {
+                    self.handle_record_rtt(contact, elapsed);
+                }
+                Command::AdjustK(success) => {
+                    self.handle_adjust_k(success);
+                }
+                Command::GetLookupParams(target, level_filter, reply) => {
+                    let k = self.params.current_k();
+                    let alpha = self.params.current_alpha();
+                    let mut closest = self.routing.closest(&target, k);
+                    
+                    if let Some(level) = level_filter {
+                        closest.retain(|c| self.tiering.level_for(&c.identity) == level);
+                    }
+                    
+                    let _ = reply.send((k, alpha, closest));
+                }
+                Command::GetLocal(key, reply) => {
+                    self.store.record_request();
+                    let val = self.store.get(&key);
+                    let _ = reply.send(val);
+                }
+                Command::StoreLocal(key, value, stored_by, reply) => {
+                    self.store.record_request();
+                    let spilled = self.store.store(key, &value, stored_by);
+                    let _ = reply.send(spilled);
+                }
+                Command::GetTelemetry(reply) => {
+                    let tiering_stats = self.tiering.stats();
+                    let snapshot = TelemetrySnapshot {
+                        tier_centroids: tiering_stats.centroids,
+                        tier_counts: tiering_stats.counts,
+                        pressure: self.store.current_pressure(),
+                        stored_keys: self.store.len(),
+                        replication_factor: self.params.current_k(),
+                        concurrency: self.params.current_alpha(),
+                    };
+                    let _ = reply.send(snapshot);
+                }
+                Command::GetSlowestLevel(reply) => {
+                    let level = self.tiering.slowest_level();
+                    let _ = reply.send(level);
+                }
+                Command::HandleFindNode(from, target, reply) => {
+                    self.handle_observe_contact(from);
+                    let k = self.params.current_k();
+                    let closest = self.routing.closest(&target, k);
+                    let _ = reply.send(closest);
+                }
+                Command::HandleFindValue(from, key, reply) => {
+                    self.handle_observe_contact(from);
+                    if let Some(v) = self.store.get(&key) {
+                        let _ = reply.send((Some(v), Vec::new()));
+                    } else {
+                        let target = Identity::from_bytes(key);
+                        let k = self.params.current_k();
+                        let closest = self.routing.closest(&target, k);
+                        let _ = reply.send((None, closest));
+                    }
+                }
+                Command::HandleStore(from, key, value) => {
+                    self.handle_observe_contact(from.clone());
+                    self.store.record_request();
+                    self.store.store(key, &value, from.identity);
+                }
+                Command::GetStaleBuckets(threshold, reply) => {
+                    let buckets = self.routing.stale_bucket_indices(threshold);
+                    let _ = reply.send(buckets);
+                }
+                Command::MarkBucketRefreshed(idx) => {
+                    self.routing.mark_bucket_refreshed(idx);
+                }
+                Command::ApplyPingResult(pending, alive) => {
+                    self.routing.apply_ping_result(pending, alive);
+                }
+                Command::Quit => {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_observe_contact(&mut self, contact: Contact) {
+        if contact.identity == self.id {
+            return;
+        }
+        if !contact.identity.is_valid() {
+            return;
+        }
+
+        self.tiering.register_contact(&contact.identity);
+        let k = self.params.current_k();
+        self.routing.set_k(k);
+        
+        if let Some(update) = self.routing.update_with_pending(contact.clone()) {
+            let network = self.network.clone();
+            let tx = self.cmd_tx.clone();
+            tokio::spawn(async move {
+                let alive = match network.ping(&update.oldest).await {
+                    Ok(_) => true,
+                    Err(_) => false,
+                };
+                let _ = tx.send(Command::ApplyPingResult(update, alive)).await;
+            });
+        }
+    }
+
+    fn handle_observe_contact_from_peer(&mut self, contact: Contact, from_peer: &Identity) -> bool {
+        if contact.identity == *from_peer {
+            self.handle_observe_contact(contact);
+            return true;
+        }
+
+        if !self.routing_limiter.allow_insertion(from_peer) {
+            return false;
+        }
+
+        self.handle_observe_contact(contact);
+        true
+    }
+
+    fn handle_record_rtt(&mut self, contact: Contact, elapsed: Duration) {
+        if contact.identity == self.id {
+            return;
+        }
+        let rtt_ms = (elapsed.as_secs_f64() * 1000.0) as f32;
+        self.tiering.record_sample(&contact.identity, rtt_ms);
+    }
+
+    fn handle_adjust_k(&mut self, success: bool) {
+        if self.params.record_churn(success) {
+            self.routing.set_k(self.params.current_k());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1691,21 +1716,21 @@ mod tests {
 
     #[derive(Default)]
     struct NetworkRegistry {
-        peers: RwLock<HashMap<Identity, Dht<TestNetwork>>>,
+        peers: RwLock<HashMap<Identity, DhtNode<TestNetwork>>>,
     }
 
     impl NetworkRegistry {
-        async fn register(&self, node: &Dht<TestNetwork>) {
+        async fn register(&self, node: &DhtNode<TestNetwork>) {
             self.peers.write().await.insert(node.contact().identity, node.clone());
         }
 
-        async fn get(&self, id: &Identity) -> Option<Dht<TestNetwork>> {
+        async fn get(&self, id: &Identity) -> Option<DhtNode<TestNetwork>> {
             self.peers.read().await.get(id).cloned()
         }
     }
 
     #[async_trait::async_trait]
-    impl DhtRpc for TestNetwork {
+    impl DhtNodeRpc for TestNetwork {
         async fn find_node(&self, to: &Contact, target: Identity) -> anyhow::Result<Vec<Contact>> {
             if self.should_fail(&to.identity).await {
                 return Err(anyhow!("injected network failure"));
@@ -1757,7 +1782,7 @@ mod tests {
     }
 
     struct TestNode {
-        node: Dht<TestNetwork>,
+        node: DhtNode<TestNetwork>,
         network: TestNetwork,
     }
 
@@ -1765,7 +1790,7 @@ mod tests {
         async fn new(registry: Arc<NetworkRegistry>, index: u32, k: usize, alpha: usize) -> Self {
             let contact = make_contact(index);
             let network = TestNetwork::new(registry.clone(), contact.clone());
-            let node = Dht::new(contact.identity, contact.clone(), network.clone(), k, alpha);
+            let node = DhtNode::new(contact.identity, contact.clone(), network.clone(), k, alpha);
             registry.register(&node).await;
             Self { node, network }
         }

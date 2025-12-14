@@ -6,7 +6,7 @@ use quinn::{Connection, Endpoint};
 use tracing::{debug, info, warn};
 
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
-use crate::dht::{Dht, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
+use crate::dht::{DhtNode, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;
@@ -21,30 +21,28 @@ pub struct Node {
     endpoint: Endpoint,
     smartsock: Arc<SmartSock>,
     contact: Contact,
-    dht: Dht<RpcNode>,
-    network: RpcNode,
+    dhtnode: DhtNode<RpcNode>,
+    rpcnode: RpcNode,
     rate_limiter: Arc<ConnectionRateLimiter>,
     udp_forwarder_addr: SocketAddr,
-    hyparview: Arc<HyParView<RpcNode>>,
-    plumtree: Option<Arc<PlumTree<RpcNode>>>,
-    plumtree_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
+    hyparview: HyParView,
+    plumtree: PlumTree<RpcNode>,
+    plumtree_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>,
     direct_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(Identity, Vec<u8>)>>>,
     server_handle: tokio::task::JoinHandle<Result<()>>,
-    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
-    probe_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Node {
     pub async fn bind(addr: &str) -> Result<Self> {
         let keypair = Keypair::generate();
-        Self::create(addr, keypair, true).await
+        Self::create(addr, keypair).await
     }
 
     pub async fn bind_with_keypair(addr: &str, keypair: Keypair) -> Result<Self> {
-        Self::create(addr, keypair, true).await
+        Self::create(addr, keypair).await
     }
 
-    async fn create(addr: &str, keypair: Keypair, enable_plumtree: bool) -> Result<Self> {
+    async fn create(addr: &str, keypair: Keypair) -> Result<Self> {
         let addr: SocketAddr = addr.parse()
             .context("invalid socket address")?;
         
@@ -61,87 +59,54 @@ impl Node {
             .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
-        let probe_handle = smartsock.spawn_probe_loop();
-        debug!("SmartSock probe loop started");
-        
         let contact = Contact {
             identity,
             addr: local_addr.to_string(),
             addrs: vec![],
         };
         
-        let network = RpcNode::with_identity(
+        let rpcnode = RpcNode::with_identity(
             endpoint.clone(),
             contact.clone(),
             client_config,
             identity,
         ).with_smartsock(smartsock.clone());
         
-        let dht = Dht::new(
+        let dhtnode = DhtNode::new(
             identity,
             contact.clone(),
-            network.clone(),
+            rpcnode.clone(),
             DEFAULT_K,
             DEFAULT_ALPHA,
         );
         
         let rate_limiter = Arc::new(ConnectionRateLimiter::new());
         
-        let udp_forwarder = Arc::new(UdpRelayForwarder::with_socket(smartsock.inner_socket().clone()));
+        let udp_forwarder = UdpRelayForwarder::with_socket(smartsock.inner_socket().clone());
         smartsock.set_forwarder(udp_forwarder.clone());
         let udp_forwarder_addr = local_addr;
         info!("UDP relay forwarder sharing port {}", local_addr);
         
-        let hyparview = Arc::new(
-            HyParView::new(identity, HyParViewConfig::default(), Arc::new(network.clone()))
-        );
+        let hyparview = HyParView::spawn(identity, HyParViewConfig::default(), Arc::new(rpcnode.clone()));
         
-        let (plumtree, plumtree_receiver) = if enable_plumtree {
-            let mut plumtree = PlumTree::new(Arc::new(network.clone()), keypair.clone(), PlumTreeConfig::default());
-            let receiver = plumtree.take_message_receiver();
-            let plumtree = Arc::new(plumtree);
-            
-            hyparview.set_neighbor_callback(plumtree.clone()).await;
-            
-            (
-                Some(plumtree),
-                Some(tokio::sync::Mutex::new(receiver)),
-            )
-        } else {
-            (None, None)
-        };
+        let (plumtree, plumtree_rx) = PlumTree::spawn(Arc::new(rpcnode.clone()), keypair.clone(), PlumTreeConfig::default());
+        let plumtree_receiver = tokio::sync::Mutex::new(Some(plumtree_rx));
         
-        hyparview.spawn_shuffle_loop();
-        
-        let heartbeat_handle = if let Some(ref pt) = plumtree {
-            let pt_clone = pt.clone();
-            Some(tokio::spawn(async move {
-                pt_clone.run_heartbeat().await;
-            }))
-        } else {
-            None
-        };
+        hyparview.set_neighbor_callback(Arc::new(plumtree.clone())).await;
         
         let server_handle = {
             let endpoint = endpoint.clone();
-            let dht = dht.clone();
+            let dhtnode = dhtnode.clone();
             let rate_limiter = rate_limiter.clone();
             let udp_forwarder = udp_forwarder.clone();
             let smartsock_for_server = Some(smartsock.clone());
-            let plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>> = 
-                plumtree.clone().map(|p| p as Arc<dyn PlumTreeHandler + Send + Sync>);
+            let plumtree_handler: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
             let hyparview_for_server = hyparview.clone();
             
             let (direct_tx, direct_rx) = tokio::sync::mpsc::channel::<(Identity, Vec<u8>)>(256);
             let direct_receiver = tokio::sync::Mutex::new(Some(direct_rx));
             
             let server_task = tokio::spawn(async move {
-                info!(
-                    addr = ?udp_forwarder_addr,
-                    "starting UDP relay forwarder cleanup task"
-                );
-                udp_forwarder.clone().spawn_cleanup();
-
                 while let Some(incoming) = endpoint.accept().await {
                     let remote_addr = incoming.remote_address();
                     if !rate_limiter.allow(remote_addr.ip()).await {
@@ -149,8 +114,8 @@ impl Node {
                         continue;
                     }
 
-                    let node = dht.clone();
-                    let plumtree = plumtree_handler.clone();
+                    let node = dhtnode.clone();
+                    let plumtree = Some(plumtree_handler.clone());
                     let forwarder = Some(udp_forwarder.clone());
                     let forwarder_addr = Some(udp_forwarder_addr);
                     let ss = smartsock_for_server.clone();
@@ -177,8 +142,8 @@ impl Node {
             endpoint,
             smartsock,
             contact,
-            dht,
-            network,
+            dhtnode,
+            rpcnode,
             rate_limiter,
             udp_forwarder_addr,
             hyparview,
@@ -186,8 +151,6 @@ impl Node {
             plumtree_receiver,
             direct_receiver: server_handle.1,
             server_handle: server_handle.0,
-            heartbeat_handle,
-            probe_handle,
         })
     }
     
@@ -220,19 +183,19 @@ impl Node {
 
     
     pub async fn put(&self, value: Vec<u8>) -> Result<Key> {
-        self.dht.put(value).await
+        self.dhtnode.put(value).await
     }
     
     pub async fn put_at(&self, key: Key, value: Vec<u8>) -> Result<()> {
-        self.dht.put_at(key, value).await
+        self.dhtnode.put_at(key, value).await
     }
     
     pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>> {
-        self.dht.get(key).await
+        self.dhtnode.get(key).await
     }
     
     pub async fn publish_address(&self, addresses: Vec<String>) -> Result<()> {
-        self.dht.publish_address(&self.keypair, addresses).await
+        self.dhtnode.publish_address(&self.keypair, addresses).await
     }
     
     pub async fn publish_address_with_relays(
@@ -240,7 +203,7 @@ impl Node {
         addresses: Vec<String>,
         relays: Vec<Contact>,
     ) -> Result<()> {
-        self.dht
+        self.dhtnode
             .republish_on_network_change(&self.keypair, addresses, relays)
             .await
     }
@@ -252,7 +215,7 @@ impl Node {
         let forwarder_addr = self.udp_forwarder_addr;
         let local_addr = self.endpoint.local_addr().ok()?;
         
-        let relay_addr = self.network.public_addr().await
+        let relay_addr = self.rpcnode.public_addr().await
             .map(|public| SocketAddr::new(public.ip(), forwarder_addr.port()))
             .unwrap_or(forwarder_addr);
         
@@ -264,16 +227,16 @@ impl Node {
     }
     
     pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {
-        self.dht.resolve_peer(peer_id).await
+        self.dhtnode.resolve_peer(peer_id).await
     }
     
     pub async fn find_peers(&self, target: Identity) -> Result<Vec<Contact>> {
-        self.dht.iterative_find_node(target).await
+        self.dhtnode.iterative_find_node(target).await
     }
     
     pub async fn add_peer(&self, endpoint: Contact) {
-        self.network.cache_contact(&endpoint).await;
-        self.dht.observe_contact(endpoint).await
+        self.rpcnode.cache_contact(&endpoint).await;
+        self.dhtnode.observe_contact(endpoint).await
     }
     
     pub async fn bootstrap(&self, identity: &str, addr: &str) -> Result<()> {
@@ -290,15 +253,15 @@ impl Node {
             addrs: vec![],
         };
         
-        self.network.cache_contact(&contact).await;
-        self.dht.observe_contact(contact.clone()).await;
+        self.rpcnode.cache_contact(&contact).await;
+        self.dhtnode.observe_contact(contact.clone()).await;
         
         self.hyparview.request_join(peer_identity).await;
         
-        self.network.detect_nat(&[contact]).await;
+        self.rpcnode.detect_nat(&[contact]).await;
         
         let self_identity = self.keypair.identity();
-        self.dht.iterative_find_node(self_identity).await?;
+        self.dhtnode.iterative_find_node(self_identity).await?;
         
         Ok(())
     }
@@ -319,7 +282,7 @@ impl Node {
             timestamp: crate::identity::now_ms(),
             signature: vec![],        };
         
-        let conn = self.network.smartconnect(&record).await?;
+        let conn = self.rpcnode.smartconnect(&record).await?;
         Ok(conn)
     }
     
@@ -331,7 +294,7 @@ impl Node {
         }
         let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        let record = self.dht.resolve_peer(&peer_identity).await?
+        let record = self.dhtnode.resolve_peer(&peer_identity).await?
             .context("peer not found in DHT")?;
         
         debug!(
@@ -341,7 +304,7 @@ impl Node {
             "resolved peer endpoint, attempting smartconnect"
         );
         
-        let conn = self.network.smartconnect(&record).await?;
+        let conn = self.rpcnode.smartconnect(&record).await?;
         Ok(conn)
     }
     
@@ -353,7 +316,7 @@ impl Node {
         }
         let peer_identity = Identity::from_bytes(identity_bytes.try_into().unwrap());
         
-        let record = self.dht.resolve_peer(&peer_identity).await?
+        let record = self.dhtnode.resolve_peer(&peer_identity).await?
             .context("peer not found in DHT")?;
         
         let contact = Contact {
@@ -362,7 +325,7 @@ impl Node {
             addrs: record.addrs.clone(),
         };
         
-        self.network.send_direct(&contact, self.keypair.identity(), data).await
+        self.rpcnode.send_direct(&contact, self.keypair.identity(), data).await
     }
     
     pub async fn direct_messages(&self) -> Result<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
@@ -384,40 +347,30 @@ impl Node {
     }
     
     pub async fn public_addr(&self) -> Option<SocketAddr> {
-        self.network.public_addr().await
+        self.rpcnode.public_addr().await
     }
     
     
     pub async fn subscribe(&self, topic: &str) -> Result<()> {
-        let plumtree = self.plumtree.as_ref()
-            .context("plumtree not enabled")?;
-        plumtree.subscribe(topic).await
+        self.plumtree.subscribe(topic).await
     }
     
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
-        let plumtree = self.plumtree.as_ref()
-            .context("plumtree not enabled")?;
-        plumtree.publish(topic, data).await?;
+        self.plumtree.publish(topic, data).await?;
         Ok(())
     }
     
     pub async fn unsubscribe(&self, topic: &str) -> Result<()> {
-        let plumtree = self.plumtree.as_ref()
-            .context("plumtree not enabled")?;
-        plumtree.unsubscribe(topic).await?;
+        self.plumtree.unsubscribe(topic).await?;
         Ok(())
     }
     
     pub async fn subscriptions(&self) -> Result<Vec<String>> {
-        let plumtree = self.plumtree.as_ref()
-            .context("plumtree not enabled")?;
-        Ok(plumtree.subscriptions().await)
+        Ok(self.plumtree.subscriptions().await)
     }
     
     pub async fn messages(&self) -> Result<tokio::sync::mpsc::Receiver<Message>> {
-        let receiver_mutex = self.plumtree_receiver.as_ref()
-            .context("plumtree not enabled")?;
-        let mut guard = receiver_mutex.lock().await;
+        let mut guard = self.plumtree_receiver.lock().await;
         let internal_rx = guard.take().context("message receiver already taken")?;
         
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -438,23 +391,14 @@ impl Node {
         Ok(rx)
     }
     
-    pub fn has_plumtree(&self) -> bool {
-        self.plumtree.is_some()
-    }
-    
     pub fn is_running(&self) -> bool {
         !self.server_handle.is_finished()
     }
     
     pub async fn shutdown(&self) {
         self.hyparview.quit().await;
-        
-        if let Some(ref handle) = self.heartbeat_handle {
-            handle.abort();
-        }
-        
-        self.probe_handle.abort();
-        
+        self.plumtree.quit().await;
+        self.dhtnode.quit().await;
         self.server_handle.abort();
     }
     
@@ -464,6 +408,6 @@ impl Node {
     
     
     pub async fn telemetry(&self) -> TelemetrySnapshot {
-        self.dht.telemetry_snapshot().await
+        self.dhtnode.telemetry_snapshot().await
     }
 }
