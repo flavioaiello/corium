@@ -16,6 +16,21 @@ use crate::transport::{Contact, SmartSock, UdpRelay};
 use crate::rpc::{self, RpcNode};
 
 
+/// Notification of an incoming connection request via relay signaling.
+/// 
+/// When a NAT-bound node receives this, it should initiate a relay connection
+/// using the provided session_id to complete the relay handshake.
+#[derive(Debug, Clone)]
+pub struct IncomingConnection {
+    /// Hex-encoded identity of the peer that wants to connect.
+    pub from_peer: String,
+    /// Session ID to use when completing the relay connection.
+    pub session_id: [u8; 16],
+    /// Address to send relay data packets to.
+    pub relay_data_addr: String,
+}
+
+
 pub struct Node {
     keypair: Keypair,
     endpoint: Endpoint,
@@ -203,6 +218,72 @@ impl Node {
             addr: local_addr.to_string(),
             addrs: vec![],
         })
+    }
+    
+    /// Register with a relay node for incoming connection notifications.
+    /// 
+    /// NAT-bound nodes should call this to maintain a signaling channel with
+    /// their relay. When other peers want to connect via the relay, the node
+    /// receives `IncomingConnection` notifications through the returned receiver.
+    /// 
+    /// # Arguments
+    /// * `relay_identity` - Hex-encoded identity of the relay node
+    /// * `relay_addr` - Address of the relay node
+    /// 
+    /// # Returns
+    /// A receiver that yields incoming connection notifications. Each notification
+    /// contains the connecting peer's identity and a session_id to use when
+    /// completing the relay connection.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let mut rx = node.register_with_relay("abc123...", "1.2.3.4:5000").await?;
+    /// while let Some(notification) = rx.recv().await {
+    ///     match notification {
+    ///         IncomingConnection { from_peer, session_id, relay_data_addr } => {
+    ///             // Complete the relay connection...
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn register_with_relay(
+        &self,
+        relay_identity: &str,
+        relay_addr: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<IncomingConnection>> {
+        let relay_id = Identity::from_hex(relay_identity)
+            .context("invalid relay identity: must be 64 hex characters")?;
+        
+        let relay_contact = Contact {
+            identity: relay_id,
+            addr: relay_addr.to_string(),
+            addrs: vec![],
+        };
+        
+        let response_rx = self.rpcnode
+            .register_for_signaling(&relay_contact, self.keypair.identity())
+            .await?;
+        
+        // Transform RelayResponse into IncomingConnection
+        let (tx, rx) = tokio::sync::mpsc::channel::<IncomingConnection>(16);
+        
+        tokio::spawn(async move {
+            let mut response_rx = response_rx;
+            while let Some(response) = response_rx.recv().await {
+                if let crate::messages::RelayResponse::Incoming { from_peer, session_id, relay_data_addr } = response {
+                    let incoming = IncomingConnection {
+                        from_peer: hex::encode(from_peer.as_bytes()),
+                        session_id,
+                        relay_data_addr,
+                    };
+                    if tx.send(incoming).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(rx)
     }
     
     pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {

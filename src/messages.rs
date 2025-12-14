@@ -78,10 +78,16 @@ pub enum DhtNodeResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RelayRequest {
+    /// Request to initiate or complete a relay session between two peers.
     Connect {
         from_peer: Identity,
         target_peer: Identity,
         session_id: [u8; 16],
+    },
+    /// Register this NAT-bound node for incoming connection notifications.
+    /// The connection must be kept open to receive `Incoming` push notifications.
+    Register {
+        from_peer: Identity,
     },
 }
 
@@ -89,22 +95,35 @@ impl RelayRequest {
     pub fn sender_identity(&self) -> Identity {
         match self {
             RelayRequest::Connect { from_peer, .. } => *from_peer,
+            RelayRequest::Register { from_peer } => *from_peer,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RelayResponse {
+    /// Session initiated, waiting for peer B to connect.
     Accepted {
         session_id: [u8; 16],
         relay_data_addr: String,
     },
+    /// Session established, both peers connected.
     Connected {
         session_id: [u8; 16],
         relay_data_addr: String,
     },
+    /// Request rejected with reason.
     Rejected {
         reason: String,
+    },
+    /// Registration acknowledged. Keep connection open for Incoming notifications.
+    Registered,
+    /// Push notification: another peer wants to connect via relay.
+    /// NAT-bound node should initiate Connect with the provided session_id.
+    Incoming {
+        from_peer: Identity,
+        session_id: [u8; 16],
+        relay_data_addr: String,
     },
 }
 

@@ -188,11 +188,22 @@ impl RelaySession {
     }
 }
 
+/// Sender for pushing signaling notifications to registered NAT nodes.
+pub type SignalingSender = tokio::sync::mpsc::Sender<RelayResponse>;
+
+/// Maximum number of pending signaling notifications per channel.
+pub const SIGNALING_CHANNEL_CAPACITY: usize = 16;
+
+/// Maximum number of registered signaling channels.
+pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
+
 #[derive(Debug)]
 pub struct UdpRelay {
     socket: Arc<UdpSocket>,
     sessions: RwLock<HashMap<[u8; 16], RelaySession>>,
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
+    /// Signaling channels for NAT-bound nodes. Maps peer identity to channel sender.
+    signaling_channels: RwLock<HashMap<Identity, SignalingSender>>,
 }
 
 impl UdpRelay {
@@ -205,6 +216,7 @@ impl UdpRelay {
             socket: Arc::new(socket),
             sessions: RwLock::new(HashMap::new()),
             addr_to_session: RwLock::new(HashMap::new()),
+            signaling_channels: RwLock::new(HashMap::new()),
         })
     }
 
@@ -213,6 +225,7 @@ impl UdpRelay {
             socket,
             sessions: RwLock::new(HashMap::new()),
             addr_to_session: RwLock::new(HashMap::new()),
+            signaling_channels: RwLock::new(HashMap::new()),
         });
         server.clone().spawn_cleanup();
         server
@@ -319,6 +332,105 @@ impl UdpRelay {
 
     pub async fn session_count(&self) -> usize {
         self.sessions.read().await.len()
+    }
+
+    /// Register a signaling channel for a NAT-bound peer.
+    /// Returns the receiver end of the channel for the caller to listen on.
+    pub async fn register_signaling(
+        &self,
+        peer_identity: Identity,
+    ) -> Result<tokio::sync::mpsc::Receiver<RelayResponse>, &'static str> {
+        let mut channels = self.signaling_channels.write().await;
+        
+        if channels.len() >= MAX_SIGNALING_CHANNELS {
+            return Err("max signaling channels reached");
+        }
+        
+        // Remove stale channel if exists (peer reconnecting)
+        channels.remove(&peer_identity);
+        
+        let (tx, rx) = tokio::sync::mpsc::channel(SIGNALING_CHANNEL_CAPACITY);
+        channels.insert(peer_identity, tx);
+        
+        debug!(
+            peer = ?peer_identity,
+            "registered signaling channel"
+        );
+        
+        Ok(rx)
+    }
+
+    /// Remove a signaling channel (called when connection closes).
+    pub async fn unregister_signaling(&self, peer_identity: &Identity) {
+        let mut channels = self.signaling_channels.write().await;
+        if channels.remove(peer_identity).is_some() {
+            debug!(
+                peer = ?peer_identity,
+                "unregistered signaling channel"
+            );
+        }
+    }
+
+    /// Notify a registered NAT peer about an incoming connection request.
+    /// Returns true if notification was sent, false if peer not registered.
+    pub async fn notify_incoming(
+        &self,
+        target_peer: Identity,
+        from_peer: Identity,
+        session_id: [u8; 16],
+        relay_data_addr: String,
+    ) -> bool {
+        let channels = self.signaling_channels.read().await;
+        
+        if let Some(tx) = channels.get(&target_peer) {
+            let notification = RelayResponse::Incoming {
+                from_peer,
+                session_id,
+                relay_data_addr,
+            };
+            
+            match tx.try_send(notification) {
+                Ok(()) => {
+                    debug!(
+                        target = ?target_peer,
+                        from = ?from_peer,
+                        session = hex::encode(session_id),
+                        "sent incoming connection notification"
+                    );
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        target = ?target_peer,
+                        "signaling channel full, dropping notification"
+                    );
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(
+                        target = ?target_peer,
+                        "signaling channel closed"
+                    );
+                    false
+                }
+            }
+        } else {
+            debug!(
+                target = ?target_peer,
+                "no signaling channel registered"
+            );
+            false
+        }
+    }
+
+    /// Check if a peer has a registered signaling channel.
+    pub async fn has_signaling_channel(&self, peer_identity: &Identity) -> bool {
+        self.signaling_channels.read().await.contains_key(peer_identity)
+    }
+
+    /// Count of registered signaling channels.
+    pub async fn signaling_channel_count(&self) -> usize {
+        self.signaling_channels.read().await.len()
     }
 
     pub async fn cleanup_expired(&self) -> usize {
@@ -506,6 +618,15 @@ pub async fn handle_relay_request(
                         peer = %remote_addr,
                         "relay session pending (waiting for peer B)"
                     );
+                    
+                    // Notify target peer via signaling channel if registered
+                    udprelay.notify_incoming(
+                        target_peer,
+                        from_peer,
+                        session_id,
+                        relay_data_addr.clone(),
+                    ).await;
+                    
                     RelayResponse::Accepted {
                         session_id,
                         relay_data_addr,
@@ -550,6 +671,18 @@ pub async fn handle_relay_request(
                     }
                 }
             }
+        }
+        
+        RelayRequest::Register { from_peer } => {
+            debug!(
+                from = ?from_peer,
+                "handling RELAY_REGISTER request"
+            );
+
+            // Note: Actual registration happens in handle_stream, not here.
+            // This response is just the initial acknowledgment.
+            // The stream handler will call register_signaling() and keep the stream open.
+            RelayResponse::Registered
         }
     }
 }

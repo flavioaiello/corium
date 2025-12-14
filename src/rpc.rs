@@ -582,6 +582,18 @@ impl RpcNode {
                         last_error = Some(anyhow::anyhow!("relay rejected: {}", reason));
                         continue;
                     }
+                    RelayResponse::Registered => {
+                        // Unexpected: we sent Connect, not Register
+                        debug!(relay = ?relay_peer_id, "unexpected Registered response, trying next");
+                        last_error = Some(anyhow::anyhow!("unexpected Registered response"));
+                        continue;
+                    }
+                    RelayResponse::Incoming { .. } => {
+                        // Unexpected: Incoming is a push notification, not a response to Connect
+                        debug!(relay = ?relay_peer_id, "unexpected Incoming response, trying next");
+                        last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
+                        continue;
+                    }
                 };
 
                 if let Err(e) = self.configure_relay_path_for_peer(
@@ -827,6 +839,113 @@ impl RpcNode {
             other => anyhow::bail!("unexpected response to Direct: {:?}", other),
         }
     }
+    
+    /// Register with a relay for incoming connection notifications.
+    /// Returns a receiver that yields `RelayResponse::Incoming` messages when
+    /// other peers want to connect via this relay.
+    /// 
+    /// The returned receiver must be polled continuously to receive notifications.
+    /// When the receiver is dropped, the signaling connection is closed.
+    pub async fn register_for_signaling(
+        &self,
+        relay: &Contact,
+        our_identity: Identity,
+    ) -> Result<tokio::sync::mpsc::Receiver<RelayResponse>> {
+        let conn = self.get_or_connect(relay).await
+            .context("failed to connect to relay")?;
+        
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .context("failed to open bidirectional stream for signaling")?;
+        
+        // Send Register request
+        let request = RpcRequest::Relay(RelayRequest::Register { from_peer: our_identity });
+        let request_bytes = messages::serialize_request(&request)
+            .context("failed to serialize Register request")?;
+        let len = request_bytes.len() as u32;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&request_bytes).await?;
+        // Note: NOT calling send.finish() - keep stream open
+        
+        // Read initial response (should be Registered)
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut len_buf))
+            .await
+            .context("timeout waiting for Registered response")??;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        if len > MAX_RESPONSE_SIZE {
+            anyhow::bail!("response too large: {} bytes", len);
+        }
+        
+        let mut response_bytes = vec![0u8; len];
+        recv.read_exact(&mut response_bytes).await?;
+        
+        let rpc_response: RpcResponse = bincode::deserialize(&response_bytes)
+            .context("failed to deserialize response")?;
+        
+        match rpc_response {
+            RpcResponse::Relay(RelayResponse::Registered) => {
+                debug!(relay = ?relay.identity, "successfully registered for signaling");
+            }
+            RpcResponse::Relay(RelayResponse::Rejected { reason }) => {
+                anyhow::bail!("relay rejected registration: {}", reason);
+            }
+            other => {
+                anyhow::bail!("unexpected response to Register: {:?}", other);
+            }
+        }
+        
+        // Create channel to forward incoming notifications
+        let (tx, rx) = tokio::sync::mpsc::channel::<RelayResponse>(16);
+        
+        // Spawn task to read notifications and forward them
+        tokio::spawn(async move {
+            loop {
+                let mut len_buf = [0u8; 4];
+                match recv.read_exact(&mut len_buf).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        debug!(error = %e, "signaling stream closed");
+                        break;
+                    }
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                
+                if len > MAX_RESPONSE_SIZE {
+                    warn!(len = len, "oversized notification, dropping");
+                    break;
+                }
+                
+                let mut response_bytes = vec![0u8; len];
+                if let Err(e) = recv.read_exact(&mut response_bytes).await {
+                    debug!(error = %e, "failed to read notification body");
+                    break;
+                }
+                
+                let rpc_response: RpcResponse = match bincode::deserialize(&response_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "failed to deserialize notification");
+                        continue;
+                    }
+                };
+                
+                if let RpcResponse::Relay(relay_response) = rpc_response {
+                    if tx.send(relay_response).await.is_err() {
+                        debug!("signaling receiver dropped, closing connection");
+                        break;
+                    }
+                }
+            }
+            
+            // Cleanup: close the stream
+            let _ = send.finish();
+        });
+        
+        Ok(rx)
+    }
 }
 
 
@@ -969,6 +1088,112 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
             send.finish()?;
             return Ok(());
         }
+    }
+
+    // Special handling for signaling registration - keep stream open
+    if let RpcRequest::Relay(RelayRequest::Register { from_peer }) = &request {
+        debug!(
+            from = ?from_peer,
+            remote = %remote_addr,
+            "handling signaling registration"
+        );
+        
+        let udprelay = match &udprelay {
+            Some(s) => s,
+            None => {
+                let response = RpcResponse::Relay(RelayResponse::Rejected {
+                    reason: "relay not available".to_string(),
+                });
+                let response_bytes = bincode::serialize(&response)?;
+                let len = response_bytes.len() as u32;
+                send.write_all(&len.to_be_bytes()).await?;
+                send.write_all(&response_bytes).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+        
+        // Register signaling channel
+        let mut notification_rx = match udprelay.register_signaling(verified_identity).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let response = RpcResponse::Relay(RelayResponse::Rejected {
+                    reason: e.to_string(),
+                });
+                let response_bytes = bincode::serialize(&response)?;
+                let len = response_bytes.len() as u32;
+                send.write_all(&len.to_be_bytes()).await?;
+                send.write_all(&response_bytes).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
+        
+        // Send Registered acknowledgment
+        let response = RpcResponse::Relay(RelayResponse::Registered);
+        let response_bytes = bincode::serialize(&response)?;
+        let len = response_bytes.len() as u32;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&response_bytes).await?;
+        // Note: NOT calling send.finish() - keep stream open
+        
+        debug!(
+            peer = ?verified_identity,
+            "signaling channel registered, listening for notifications"
+        );
+        
+        // Buffer for detecting connection close
+        let mut close_detect_buf = [0u8; 1];
+        
+        // Forward notifications until channel closes or connection drops
+        loop {
+            tokio::select! {
+                notification = notification_rx.recv() => {
+                    match notification {
+                        Some(relay_response) => {
+                            let response = RpcResponse::Relay(relay_response);
+                            let response_bytes = match bincode::serialize(&response) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to serialize notification");
+                                    continue;
+                                }
+                            };
+                            let len = response_bytes.len() as u32;
+                            
+                            if let Err(e) = send.write_all(&len.to_be_bytes()).await {
+                                debug!(error = %e, "signaling stream write failed");
+                                break;
+                            }
+                            if let Err(e) = send.write_all(&response_bytes).await {
+                                debug!(error = %e, "signaling stream write failed");
+                                break;
+                            }
+                            
+                            debug!(
+                                peer = ?verified_identity,
+                                "forwarded incoming notification"
+                            );
+                        }
+                        None => {
+                            debug!(peer = ?verified_identity, "notification channel closed");
+                            break;
+                        }
+                    }
+                }
+                _ = recv.read(&mut close_detect_buf) => {
+                    // Connection closed by peer
+                    debug!(peer = ?verified_identity, "signaling connection closed by peer");
+                    break;
+                }
+            }
+        }
+        
+        // Cleanup
+        udprelay.unregister_signaling(&verified_identity).await;
+        let _ = send.finish();
+        
+        return Ok(());
     }
 
     let response = match tokio::time::timeout(
