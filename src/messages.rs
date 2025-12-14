@@ -49,7 +49,6 @@ pub enum DhtNodeRequest {
         key: Key,
         value: Vec<u8>,
     },
-    WhatIsMyAddr,
 }
 
 impl DhtNodeRequest {
@@ -59,7 +58,6 @@ impl DhtNodeRequest {
             DhtNodeRequest::FindNode { from, .. } => Some(from.identity),
             DhtNodeRequest::FindValue { from, .. } => Some(from.identity),
             DhtNodeRequest::Store { from, .. } => Some(from.identity),
-            DhtNodeRequest::WhatIsMyAddr => None,
         }
     }
 }
@@ -71,9 +69,6 @@ pub enum DhtNodeResponse {
     Value {
         value: Option<Vec<u8>>,
         closer: Vec<Contact>,
-    },
-    YourAddr {
-        addr: String,
     },
     Error {
         message: String,
@@ -355,7 +350,6 @@ mod tests {
                 key: [0u8; 32],
                 value: b"test".to_vec(),
             },
-            DhtNodeRequest::WhatIsMyAddr,
         ];
 
         for req in requests {
@@ -386,9 +380,6 @@ mod tests {
             target: make_identity(1),
         };
         assert_eq!(find_node.sender_identity(), Some(make_identity(42)));
-
-        let what_is_my_addr = DhtNodeRequest::WhatIsMyAddr;
-        assert_eq!(what_is_my_addr.sender_identity(), None);
     }
 
     #[test]

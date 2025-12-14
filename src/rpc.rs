@@ -14,7 +14,7 @@ use tracing::{debug, info, trace, warn};
 use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
-use crate::transport::{self, Contact, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
+use crate::transport::{self, Contact, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelay};
 use crate::dht::DhtNode;
 use crate::storage::Key;
 use crate::identity::{EndpointRecord, Identity};
@@ -115,7 +115,6 @@ pub struct RpcNode {
     pub self_contact: Contact,
     client_config: ClientConfig,
     our_peer_id: Option<Identity>,
-    public_addr: Arc<RwLock<Option<SocketAddr>>>,
     connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
     contact_cache: Arc<RwLock<LruCache<Identity, Contact>>>,
     in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Identity>>>,
@@ -134,7 +133,6 @@ impl RpcNode {
             self_contact,
             client_config,
             our_peer_id: Some(our_peer_id),
-            public_addr: Arc::new(RwLock::new(None)),
             connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
                 NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
             ))),
@@ -159,25 +157,6 @@ impl RpcNode {
     pub async fn cache_contact(&self, contact: &Contact) {
         let mut cache = self.contact_cache.write().await;
         cache.put(contact.identity, contact.clone());
-    }
-
-    pub async fn public_addr(&self) -> Option<SocketAddr> {
-        *self.public_addr.read().await
-    }
-
-    /// Discover our public address by asking a peer what address they see us as.
-    /// This is used to populate our externally-visible address for relay endpoints.
-    pub async fn discover_public_addr(&self, contact: &Contact) {
-        match self.what_is_my_addr(contact).await {
-            Ok(addr) => {
-                let mut public_addr = self.public_addr.write().await;
-                *public_addr = Some(addr);
-                info!(public_addr = %addr, "discovered public address");
-            }
-            Err(e) => {
-                debug!(contact = %contact.addr, error = %e, "failed to discover public address");
-            }
-        }
     }
 
     fn parse_addr(&self, contact: &Contact) -> Result<SocketAddr> {
@@ -366,18 +345,6 @@ impl RpcNode {
         })
         .await
         .context("RPC timed out")?
-    }
-
-    pub async fn what_is_my_addr(&self, contact: &Contact) -> Result<SocketAddr> {
-        let response = self.rpc(contact, DhtNodeRequest::WhatIsMyAddr).await?;
-        
-        match response {
-            DhtNodeResponse::YourAddr { addr } => {
-                addr.parse()
-                    .with_context(|| format!("invalid address in response: {}", addr))
-            }
-            other => anyhow::bail!("unexpected response to WhatIsMyAddr: {:?}", other),
-        }
     }
 
     pub async fn connect_to_peer(
@@ -871,8 +838,8 @@ const MAX_REQUEST_SIZE: usize = 64 * 1024;
 pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync + 'static>(
     node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
+    udprelay: Option<Arc<UdpRelay>>,
+    udprelay_addr: Option<SocketAddr>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
     hyparview: HyParView,
@@ -922,15 +889,15 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
 
         let node = node.clone();
         let plumtree_h = plumtree_handler.clone();
-        let forwarder = udp_forwarder.clone();
-        let forwarder_addr = udp_forwarder_addr;
+        let udprelay = udprelay.clone();
+        let udprelay_addr = udprelay_addr;
         let remote_addr = remote;
         let verified_id = verified_identity;
         let hv = hyparview.clone();
         let direct_sender = direct_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(node, plumtree_h, forwarder, forwarder_addr, stream, remote_addr, verified_id, hv, direct_sender).await
+                handle_stream(node, plumtree_h, udprelay, udprelay_addr, stream, remote_addr, verified_id, hv, direct_sender).await
             {
                 debug!(error = ?e, "stream error");
             }
@@ -944,8 +911,8 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
 async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
+    udprelay: Option<Arc<UdpRelay>>,
+    udprelay_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
     verified_identity: Identity,
@@ -1011,8 +978,8 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
             request,
             remote_addr,
             plumtree_handler,
-            udp_forwarder,
-            udp_forwarder_addr,
+            udprelay,
+            udprelay_addr,
             hyparview,
             direct_tx,
         )
@@ -1041,8 +1008,8 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
     request: RpcRequest,
     remote_addr: SocketAddr,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
+    udprelay: Option<Arc<UdpRelay>>,
+    udprelay_addr: Option<SocketAddr>,
     hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
 ) -> RpcResponse {
@@ -1055,8 +1022,8 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
             let relay_response = transport::handle_relay_request(
                 relay_request,
                 remote_addr,
-                udp_forwarder.as_deref(),
-                udp_forwarder_addr,
+                udprelay.as_deref(),
+                udprelay_addr,
             ).await;
             RpcResponse::Relay(relay_response)
         }
@@ -1079,7 +1046,7 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
 async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
     node: &DhtNode<N>,
     request: DhtNodeRequest,
-    remote_addr: SocketAddr,
+    _remote_addr: SocketAddr,
 ) -> DhtNodeResponse {
     match request {
         DhtNodeRequest::Ping { from } => {
@@ -1128,12 +1095,6 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             );
             node.handle_store_request(&from, key, value).await;
             DhtNodeResponse::Ack
-        }
-        DhtNodeRequest::WhatIsMyAddr => {
-            debug!("handling WHAT_IS_MY_ADDR request (STUN-like)");
-            DhtNodeResponse::YourAddr {
-                addr: remote_addr.to_string(),
-            }
         }
     }
 }

@@ -118,7 +118,7 @@ let record = node.resolve_peer(&peer_identity).await?;
 │         │                 │                 │                    │
 │  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐           │
 │  │   SmartSock  │  │    QUIC      │  │  UdpRelay    │           │
-│  │ (Path Mgmt)  │  │  (Endpoint)  │  │  Forwarder   │           │
+│  │ (Path Mgmt)  │  │  (Endpoint)  │  │   Server     │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘

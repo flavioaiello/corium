@@ -1,6 +1,6 @@
 //! Integration tests for the relay infrastructure.
 //!
-//! These tests validate the UDP relay forwarder, relay session management,
+//! These tests validate the UDP relay server, relay session management,
 //! and relay-assisted connectivity at an integration level.
 
 use std::net::SocketAddr;
@@ -200,11 +200,11 @@ async fn relay_telemetry_visibility() {
 }
 
 // ============================================================================
-// UDP Relay Forwarder Port Binding
+// UDP Relay Server Port Binding
 // ============================================================================
 
 #[tokio::test]
-async fn relay_forwarder_port_availability() {
+async fn relay_server_port_availability() {
     // Bind a node
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
@@ -219,8 +219,8 @@ async fn relay_forwarder_port_availability() {
 }
 
 #[tokio::test]
-async fn relay_forwarder_shares_socket() {
-    // With socket multiplexing, the relay forwarder shares the QUIC socket
+async fn relay_server_shares_socket() {
+    // With socket multiplexing, the relay server shares the QUIC socket
     let node = Node::bind(&test_addr()).await.expect("node bind failed");
     
     // Verify the relay endpoint uses the same port as QUIC

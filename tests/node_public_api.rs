@@ -10,7 +10,7 @@ use corium::Node;
 use tokio::time::timeout;
 
 /// Atomic port counter for unique port allocation across parallel tests.
-/// Nodes use port N, relay forwarder uses N+1, so we increment by 2.
+/// Nodes use port N, relay server uses N+1, so we increment by 2.
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(30000);
 
 fn next_port() -> u16 {
@@ -260,16 +260,6 @@ async fn node_add_peer() {
     // Should be able to find the peer now
     let peers = node2.find_peers(node1.keypair().identity()).await;
     assert!(peers.is_ok());
-}
-
-#[tokio::test]
-async fn node_public_addr() {
-    let node = Node::bind(&test_addr()).await.expect("bind failed");
-    
-    // Without external STUN, public_addr may be None
-    let public = node.public_addr().await;
-    // Just verify it doesn't panic
-    let _ = public;
 }
 
 #[tokio::test]

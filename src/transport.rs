@@ -124,7 +124,7 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct ForwarderSession {
+pub struct RelaySession {
     pub session_id: [u8; 16],
     pub peer_a_identity: Identity,
     pub peer_b_identity: Identity,
@@ -132,12 +132,12 @@ pub struct ForwarderSession {
     pub peer_b_addr: Option<SocketAddr>,
     pub created_at: Instant,
     pub last_activity: Instant,
-    pub bytes_forwarded: u64,
-    pub packets_forwarded: u64,
+    pub bytes_relayed: u64,
+    pub packets_relayed: u64,
     pub completion_locked: bool,
 }
 
-impl ForwarderSession {
+impl RelaySession {
     pub fn new_pending(
         session_id: [u8; 16],
         peer_a_identity: Identity,
@@ -153,8 +153,8 @@ impl ForwarderSession {
             peer_b_addr: None,
             created_at: now,
             last_activity: now,
-            bytes_forwarded: 0,
-            packets_forwarded: 0,
+            bytes_relayed: 0,
+            packets_relayed: 0,
             completion_locked: false,
         }
     }
@@ -181,25 +181,25 @@ impl ForwarderSession {
         }
     }
 
-    pub fn record_forward(&mut self, bytes: usize) {
+    pub fn record_activity(&mut self, bytes: usize) {
         self.last_activity = Instant::now();
-        self.bytes_forwarded += bytes as u64;
-        self.packets_forwarded += 1;
+        self.bytes_relayed += bytes as u64;
+        self.packets_relayed += 1;
     }
 }
 
 #[derive(Debug)]
-pub struct UdpRelayForwarder {
+pub struct UdpRelay {
     socket: Arc<UdpSocket>,
-    sessions: RwLock<HashMap<[u8; 16], ForwarderSession>>,
+    sessions: RwLock<HashMap<[u8; 16], RelaySession>>,
     addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
 }
 
-impl UdpRelayForwarder {
+impl UdpRelay {
     #[allow(dead_code)]
     pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        info!(addr = %socket.local_addr()?, "UDP relay forwarder started");
+        info!(addr = %socket.local_addr()?, "UDP relay server started");
         
         Ok(Self {
             socket: Arc::new(socket),
@@ -209,13 +209,13 @@ impl UdpRelayForwarder {
     }
 
     pub fn with_socket(socket: Arc<UdpSocket>) -> Arc<Self> {
-        let forwarder = Arc::new(Self {
+        let server = Arc::new(Self {
             socket,
             sessions: RwLock::new(HashMap::new()),
             addr_to_session: RwLock::new(HashMap::new()),
         });
-        forwarder.clone().spawn_cleanup();
-        forwarder
+        server.clone().spawn_cleanup();
+        server
     }
 
     #[allow(dead_code)]
@@ -240,7 +240,7 @@ impl UdpRelayForwarder {
             return Err("session already exists");
         }
         
-        let session = ForwarderSession::new_pending(
+        let session = RelaySession::new_pending(
             session_id,
             peer_a_identity,
             peer_b_identity,
@@ -310,8 +310,8 @@ impl UdpRelayForwarder {
             
             debug!(
                 session = hex::encode(session_id),
-                packets = session.packets_forwarded,
-                bytes = session.bytes_forwarded,
+                packets = session.packets_relayed,
+                bytes = session.bytes_relayed,
                 "removed relay session"
             );
         }
@@ -389,13 +389,13 @@ impl UdpRelayForwarder {
 
                 let dest = session.get_destination(from);
                 if dest.is_some() {
-                    session.record_forward(data.len());
+                    session.record_activity(data.len());
                 }
                 dest
             } else {
                 let dest = session.get_destination(from);
                 if dest.is_some() {
-                    session.record_forward(data.len());
+                    session.record_activity(data.len());
                 }
                 dest
             }
@@ -455,8 +455,8 @@ impl UdpRelayForwarder {
 pub async fn handle_relay_request(
     request: RelayRequest,
     remote_addr: SocketAddr,
-    forwarder: Option<&UdpRelayForwarder>,
-    forwarder_addr: Option<SocketAddr>,
+    udprelay: Option<&UdpRelay>,
+    udprelay_addr: Option<SocketAddr>,
 ) -> RelayResponse {
     match request {
         RelayRequest::Connect {
@@ -471,8 +471,8 @@ pub async fn handle_relay_request(
                 "handling RELAY_CONNECT request"
             );
 
-            let forwarder = match forwarder {
-                Some(f) => f,
+            let udprelay = match udprelay {
+                Some(s) => s,
                 None => {
                     return RelayResponse::Rejected {
                         reason: "relay not available".to_string(),
@@ -480,7 +480,7 @@ pub async fn handle_relay_request(
                 }
             };
 
-            let relay_data_addr = match forwarder_addr {
+            let relay_data_addr = match udprelay_addr {
                 Some(addr) => addr.to_string(),
                 None => {
                     return RelayResponse::Rejected {
@@ -489,14 +489,14 @@ pub async fn handle_relay_request(
                 }
             };
 
-            let session_count = forwarder.session_count().await;
+            let session_count = udprelay.session_count().await;
             if session_count >= MAX_SESSIONS {
                 return RelayResponse::Rejected {
                     reason: "relay server at capacity".to_string(),
                 };
             }
 
-            match forwarder
+            match udprelay
                 .register_session(session_id, remote_addr, from_peer, target_peer)
                 .await
             {
@@ -512,7 +512,7 @@ pub async fn handle_relay_request(
                     }
                 }
                 Err("session already exists") => {
-                    match forwarder
+                    match udprelay
                         .complete_session(session_id, remote_addr, from_peer, target_peer)
                         .await
                     {
@@ -559,23 +559,21 @@ pub async fn handle_relay_request(
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
+    /// The identity of the peer at the other end of this tunnel. Used for logging/debugging.
     #[allow(dead_code)]
     pub peer_identity: Identity,
+    /// When this tunnel was established. Used for diagnostics.
     #[allow(dead_code)]
     pub established_at: Instant,
-    #[allow(dead_code)]
-    pub last_activity: Instant,
 }
 
 impl RelayTunnel {
     pub fn new(session_id: [u8; 16], relay_addr: SocketAddr, peer_identity: Identity) -> Self {
-        let now = Instant::now();
         Self {
             session_id,
             relay_addr,
             peer_identity,
-            established_at: now,
-            last_activity: now,
+            established_at: Instant::now(),
         }
     }
     
@@ -888,8 +886,7 @@ pub struct PeerPathState {
     pub direct_addrs: Vec<SocketAddr>,
     pub relay_tunnels: HashMap<[u8; 16], RelayTunnel>,
     pub active_path: Option<PathChoice>,
-    #[allow(dead_code)]
-    pub last_send: Option<Instant>,
+    /// Last time we received data from this peer. Used for LRU eviction.
     pub last_recv: Option<Instant>,
     pub candidates: HashMap<SocketAddr, PathCandidateInfo>,
     pub pending_probes: HashMap<u64, (SocketAddr, Instant)>,
@@ -912,7 +909,6 @@ impl PeerPathState {
             direct_addrs: Vec::new(),
             relay_tunnels: HashMap::new(),
             active_path: None,
-            last_send: None,
             last_recv: None,
             candidates: HashMap::new(),
             pending_probes: HashMap::new(),
@@ -1146,7 +1142,7 @@ pub struct SmartSock {
     
     local_addr: SocketAddr,
 
-    forwarder: StdRwLock<Option<Arc<UdpRelayForwarder>>>,
+    udprelay: StdRwLock<Option<Arc<UdpRelay>>>,
     
     /// Optional handler for path change events (uses tokio RwLock for async safety)
     path_event_handler: RwLock<Option<Arc<dyn PathEventHandler>>>,
@@ -1162,14 +1158,14 @@ impl SmartSock {
             peers: RwLock::new(HashMap::new()),
             reverse_map: RwLock::new(HashMap::new()),
             local_addr,
-            forwarder: StdRwLock::new(None),
+            udprelay: StdRwLock::new(None),
             path_event_handler: RwLock::new(None),
         })
     }
 
-    pub fn set_forwarder(&self, forwarder: Arc<UdpRelayForwarder>) {
-        if let Ok(mut guard) = self.forwarder.write() {
-            *guard = Some(forwarder);
+    pub fn set_udprelay(&self, udprelay: Arc<UdpRelay>) {
+        if let Ok(mut guard) = self.udprelay.write() {
+            *guard = Some(udprelay);
         }
     }
     
@@ -1783,17 +1779,17 @@ impl AsyncUdpSocket for SmartSock {
             Poll::Ready(Ok(src_addr)) => {
                 let received = read_buf.filled();
                 
-                // Dispatch relay packets to forwarder (multiplexing)
+                // Dispatch relay packets to relay server (multiplexing)
                 if received.len() >= 4 && received[0..4] == RELAY_MAGIC {
-                    if let Ok(guard) = self.forwarder.read() {
-                        if let Some(forwarder) = guard.as_ref() {
-                            let forwarder = forwarder.clone();
+                    if let Ok(guard) = self.udprelay.read() {
+                        if let Some(udprelay) = guard.as_ref() {
+                            let udprelay = udprelay.clone();
                             let data = received.to_vec();
                             tokio::spawn(async move {
-                                forwarder.process_packet(&data, src_addr).await;
+                                udprelay.process_packet(&data, src_addr).await;
                             });
                             
-                            // Packet handled by forwarder, skip for Quinn
+                            // Packet handled by relay server, skip for Quinn
                             cx.waker().wake_by_ref();
                             return Poll::Pending;
                         }
@@ -1824,7 +1820,7 @@ impl AsyncUdpSocket for SmartSock {
                     return Poll::Pending;
                 }
                 
-                let (payload, translated_addr) = if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
+                let (payload, translated_addr, smart_addr_for_recv) = if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
                     let smart_addr = match self.reverse_map.try_read() {
                         Ok(guard) => {
                             guard.get(&src_addr).copied()
@@ -1842,21 +1838,34 @@ impl AsyncUdpSocket for SmartSock {
                                 }
                                 None
                             }
-                            Err(_) => Some(sa),                        }
+                            Err(_) => Some(sa),
+                        }
                     });
                     
                     let addr = verified_smart_addr
                         .map(|sa| sa.0)
                         .unwrap_or(src_addr);
                     
-                    (payload, addr)
+                    (payload, addr, verified_smart_addr)
                 } else {
-                    let translated = match self.reverse_map.try_read() {
-                        Ok(guard) => guard.get(&src_addr).map(|sa| sa.0).unwrap_or(src_addr),
-                        Err(_) => src_addr,
+                    let (translated, sa) = match self.reverse_map.try_read() {
+                        Ok(guard) => {
+                            let sa = guard.get(&src_addr).copied();
+                            (sa.map(|s| s.0).unwrap_or(src_addr), sa)
+                        }
+                        Err(_) => (src_addr, None),
                     };
-                    (received, translated)
+                    (received, translated, sa)
                 };
+                
+                // Update last_recv for LRU eviction tracking
+                if let Some(sa) = smart_addr_for_recv {
+                    if let Ok(mut peers) = self.peers.try_write() {
+                        if let Some(state) = peers.get_mut(&sa) {
+                            state.last_recv = Some(Instant::now());
+                        }
+                    }
+                }
                 
                 let copy_len = payload.len().min(bufs[0].len());
                 bufs[0][..copy_len].copy_from_slice(&payload[..copy_len]);
@@ -1907,9 +1916,9 @@ mod tests {
     }
 
     #[test]
-    fn test_forwarder_session_pending() {
+    fn test_relay_session_pending() {
         let session_id = [0xAB; 16];
-        let session = ForwarderSession::new_pending(
+        let session = RelaySession::new_pending(
             session_id,
             test_identity(1),
             test_identity(2),
@@ -1922,9 +1931,9 @@ mod tests {
     }
 
     #[test]
-    fn test_forwarder_session_destination() {
+    fn test_relay_session_destination() {
         let session_id = [0xAB; 16];
-        let mut session = ForwarderSession::new_pending(
+        let mut session = RelaySession::new_pending(
             session_id,
             test_identity(1),
             test_identity(2),
@@ -1944,7 +1953,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_complete_session() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let forwarder = UdpRelayForwarder::with_socket(Arc::new(socket));
+        let udprelay = UdpRelay::with_socket(Arc::new(socket));
         
         let session_id = [0xCD; 16];
         let peer_a = test_addr(3000);
@@ -1953,18 +1962,18 @@ mod tests {
         let peer_a_id = test_identity(10);
         let peer_b_id = test_identity(20);
         
-        forwarder
+        udprelay
             .register_session(session_id, peer_a, peer_a_id, peer_b_id)
             .await
             .unwrap();
-        assert_eq!(forwarder.session_count().await, 1);
+        assert_eq!(udprelay.session_count().await, 1);
         
-        forwarder
+        udprelay
             .complete_session(session_id, peer_b, peer_b_id, peer_a_id)
             .await
             .unwrap();
         
-        let sessions = forwarder.sessions.read().await;
+        let sessions = udprelay.sessions.read().await;
         let session = sessions.get(&session_id).unwrap();
         assert!(session.is_complete());
         assert_eq!(session.peer_b_addr, Some(peer_b));
@@ -1973,17 +1982,17 @@ mod tests {
     #[tokio::test]
     async fn test_remove_session() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let forwarder = UdpRelayForwarder::with_socket(Arc::new(socket));
+        let udprelay = UdpRelay::with_socket(Arc::new(socket));
         
         let session_id = [0xEF; 16];
-        forwarder
+        udprelay
             .register_session(session_id, test_addr(5000), test_identity(10), test_identity(20))
             .await
             .unwrap();
-        assert_eq!(forwarder.session_count().await, 1);
+        assert_eq!(udprelay.session_count().await, 1);
         
-        forwarder.remove_session(&session_id).await;
-        assert_eq!(forwarder.session_count().await, 0);
+        udprelay.remove_session(&session_id).await;
+        assert_eq!(udprelay.session_count().await, 0);
     }
 
     #[test]
@@ -2214,9 +2223,9 @@ mod tests {
     }
 
     #[test]
-    fn forwarder_session_fields() {
+    fn relay_session_fields() {
         let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let session = ForwarderSession::new_pending(
+        let session = RelaySession::new_pending(
             [0u8; 16],
             Identity::from_bytes([1u8; 32]),
             Identity::from_bytes([2u8; 32]),
@@ -2230,8 +2239,8 @@ mod tests {
         assert!(session.peer_b_addr.is_none());
         let _ = session.created_at;
         let _ = session.last_activity;
-        assert_eq!(session.bytes_forwarded, 0);
-        assert_eq!(session.packets_forwarded, 0);
+        assert_eq!(session.bytes_relayed, 0);
+        assert_eq!(session.packets_relayed, 0);
         assert!(!session.completion_locked);
         
         let cloned = session.clone();
@@ -2247,7 +2256,6 @@ mod tests {
         assert!(state.direct_addrs.is_empty());
         assert!(state.relay_tunnels.is_empty());
         assert!(state.active_path.is_none());
-        assert!(state.last_send.is_none());
         assert!(state.last_recv.is_none());
         assert!(state.candidates.is_empty());
         assert!(state.pending_probes.is_empty());

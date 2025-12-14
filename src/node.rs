@@ -12,7 +12,7 @@ use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
-use crate::transport::{Contact, SmartSock, UdpRelayForwarder};
+use crate::transport::{Contact, SmartSock, UdpRelay};
 use crate::rpc::{self, RpcNode};
 
 
@@ -23,7 +23,6 @@ pub struct Node {
     contact: Contact,
     dhtnode: DhtNode<RpcNode>,
     rpcnode: RpcNode,
-    udp_forwarder_addr: SocketAddr,
     hyparview: HyParView,
     plumtree: PlumTree<RpcNode>,
     plumtree_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>,
@@ -79,10 +78,10 @@ impl Node {
             DEFAULT_ALPHA,
         );
         
-        let udp_forwarder = UdpRelayForwarder::with_socket(smartsock.inner_socket().clone());
-        smartsock.set_forwarder(udp_forwarder.clone());
-        let udp_forwarder_addr = local_addr;
-        info!("UDP relay forwarder sharing port {}", local_addr);
+        let udprelay = UdpRelay::with_socket(smartsock.inner_socket().clone());
+        smartsock.set_udprelay(udprelay.clone());
+        let udprelay_addr = local_addr;
+        info!("UDP relay server sharing port {}", local_addr);
         
         let hyparview = HyParView::spawn(identity, HyParViewConfig::default(), Arc::new(rpcnode.clone()));
         
@@ -94,7 +93,7 @@ impl Node {
         let server_handle = {
             let endpoint = endpoint.clone();
             let dhtnode = dhtnode.clone();
-            let udp_forwarder = udp_forwarder.clone();
+            let udprelay = udprelay.clone();
             let smartsock_for_server = Some(smartsock.clone());
             let plumtree_handler: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
             let hyparview_for_server = hyparview.clone();
@@ -106,14 +105,14 @@ impl Node {
                 while let Some(incoming) = endpoint.accept().await {
                     let node = dhtnode.clone();
                     let plumtree = Some(plumtree_handler.clone());
-                    let forwarder = Some(udp_forwarder.clone());
-                    let forwarder_addr = Some(udp_forwarder_addr);
+                    let udprelay = Some(udprelay.clone());
+                    let udprelay_addr = Some(udprelay_addr);
                     let ss = smartsock_for_server.clone();
                     let hv = hyparview_for_server.clone();
                     let direct_sender = Some(direct_tx.clone());
                     tokio::spawn(async move {
                         if let Err(e) =
-                            rpc::handle_connection(node, plumtree, forwarder, forwarder_addr, ss, incoming, hv, direct_sender).await
+                            rpc::handle_connection(node, plumtree, udprelay, udprelay_addr, ss, incoming, hv, direct_sender).await
                         {
                             warn!("connection error: {:?}", e);
                         }
@@ -134,7 +133,6 @@ impl Node {
             contact,
             dhtnode,
             rpcnode,
-            udp_forwarder_addr,
             hyparview,
             plumtree,
             plumtree_receiver,
@@ -198,17 +196,12 @@ impl Node {
     }
     
     pub async fn relay_endpoint(&self) -> Option<Contact> {
-        let forwarder_addr = self.udp_forwarder_addr;
         let local_addr = self.endpoint.local_addr().ok()?;
-        
-        let relay_addr = self.rpcnode.public_addr().await
-            .map(|public| SocketAddr::new(public.ip(), forwarder_addr.port()))
-            .unwrap_or(forwarder_addr);
         
         Some(Contact {
             identity: self.keypair.identity(),
-            addr: relay_addr.to_string(),
-            addrs: vec![local_addr.to_string()],
+            addr: local_addr.to_string(),
+            addrs: vec![],
         })
     }
     
@@ -239,8 +232,6 @@ impl Node {
         self.dhtnode.observe_contact(contact.clone()).await;
         
         self.hyparview.request_join(peer_identity).await;
-        
-        self.rpcnode.discover_public_addr(&contact).await;
         
         let self_identity = self.keypair.identity();
         self.dhtnode.iterative_find_node(self_identity).await?;
@@ -307,10 +298,6 @@ impl Node {
         });
         
         Ok(rx)
-    }
-    
-    pub async fn public_addr(&self) -> Option<SocketAddr> {
-        self.rpcnode.public_addr().await
     }
     
     
