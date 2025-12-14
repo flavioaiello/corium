@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -407,7 +407,7 @@ impl UdpRelayForwarder {
         removed
     }
 
-    async fn process_packet(&self, data: &[u8], from: SocketAddr) -> usize {
+    pub async fn process_packet(&self, data: &[u8], from: SocketAddr) -> usize {
         if data.len() < RELAY_HEADER_SIZE {
             trace!(from = %from, len = data.len(), "dropping undersized packet");
             return 0;
@@ -494,32 +494,18 @@ impl UdpRelayForwarder {
         }
     }
 
-    pub async fn run(&self) {
-        let mut buf = [0u8; MAX_FRAME_SIZE];
+    pub async fn run_cleanup(&self) {
         let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
         
         loop {
-            tokio::select! {
-                result = self.socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, from)) => {
-                            self.process_packet(&buf[..len], from).await;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "relay socket recv error");
-                        }
-                    }
-                }
-                _ = cleanup_interval.tick() => {
-                    self.cleanup_expired().await;
-                }
-            }
+            cleanup_interval.tick().await;
+            self.cleanup_expired().await;
         }
     }
 
-    pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_cleanup(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            self.run().await;
+            self.run_cleanup().await;
         })
     }
 }
@@ -1217,6 +1203,8 @@ pub struct SmartSock {
     reverse_map: RwLock<HashMap<SocketAddr, SmartAddr>>,
     
     local_addr: SocketAddr,
+
+    forwarder: StdRwLock<Option<Arc<UdpRelayForwarder>>>,
 }
 
 impl SmartSock {
@@ -1229,7 +1217,14 @@ impl SmartSock {
             peers: RwLock::new(HashMap::new()),
             reverse_map: RwLock::new(HashMap::new()),
             local_addr,
+            forwarder: StdRwLock::new(None),
         })
+    }
+
+    pub fn set_forwarder(&self, forwarder: Arc<UdpRelayForwarder>) {
+        if let Ok(mut guard) = self.forwarder.write() {
+            *guard = Some(forwarder);
+        }
     }
     
     pub async fn register_peer(
@@ -1679,6 +1674,23 @@ impl AsyncUdpSocket for SmartSock {
         match self.inner.poll_recv_from(cx, &mut read_buf) {
             Poll::Ready(Ok(src_addr)) => {
                 let received = read_buf.filled();
+                
+                // Dispatch relay packets to forwarder (multiplexing)
+                if received.len() >= 4 && received[0..4] == RELAY_MAGIC {
+                    if let Ok(guard) = self.forwarder.read() {
+                        if let Some(forwarder) = guard.as_ref() {
+                            let forwarder = forwarder.clone();
+                            let data = received.to_vec();
+                            tokio::spawn(async move {
+                                forwarder.process_packet(&data, src_addr).await;
+                            });
+                            
+                            // Packet handled by forwarder, skip for Quinn
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
+                }
                 
                 if PathProbeRequest::is_probe_request(received) {
                     if let Some(response_bytes) = self.handle_probe_request(received, src_addr) {

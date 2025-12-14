@@ -24,8 +24,6 @@ pub struct Node {
     dht: Dht<RpcNode>,
     network: RpcNode,
     rate_limiter: Arc<ConnectionRateLimiter>,
-    #[allow(dead_code)]
-    udp_forwarder: Arc<UdpRelayForwarder>,
     udp_forwarder_addr: SocketAddr,
     hyparview: Arc<HyParView<RpcNode>>,
     plumtree: Option<Arc<PlumTree<RpcNode>>>,
@@ -90,6 +88,7 @@ impl Node {
         let rate_limiter = Arc::new(ConnectionRateLimiter::new());
         
         let udp_forwarder = Arc::new(UdpRelayForwarder::with_socket(smartsock.inner_socket().clone()));
+        smartsock.set_forwarder(udp_forwarder.clone());
         let udp_forwarder_addr = local_addr;
         info!("UDP relay forwarder sharing port {}", local_addr);
         
@@ -139,9 +138,9 @@ impl Node {
             let server_task = tokio::spawn(async move {
                 info!(
                     addr = ?udp_forwarder_addr,
-                    "starting UDP relay forwarder"
+                    "starting UDP relay forwarder cleanup task"
                 );
-                udp_forwarder.clone().spawn();
+                udp_forwarder.clone().spawn_cleanup();
 
                 while let Some(incoming) = endpoint.accept().await {
                     let remote_addr = incoming.remote_address();
@@ -181,7 +180,6 @@ impl Node {
             dht,
             network,
             rate_limiter,
-            udp_forwarder,
             udp_forwarder_addr,
             hyparview,
             plumtree,
