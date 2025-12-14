@@ -11,4 +11,3 @@ mod rpc;
 mod transport;
 
 pub use node::Node;
-

@@ -8,11 +8,10 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use corium::Node;
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 /// Atomic port counter for unique port allocation across parallel tests.
-/// Nodes use port N, relay forwarder uses N+1, so we increment by 2.
+/// Nodes use socket multiplexing, so relay shares the same port as QUIC.
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(40000);
 
 fn next_port() -> u16 {
@@ -229,24 +228,21 @@ async fn relay_forwarder_port_availability() {
 }
 
 #[tokio::test]
-async fn relay_forwarder_port_conflict() {
-    // Get a port for the node
-    let node_port = next_port();
-    let forwarder_port = node_port + 1;
+async fn relay_forwarder_shares_socket() {
+    // With socket multiplexing, the relay forwarder shares the QUIC socket
+    // so no separate port is needed and relay is always capable
+    let node = Node::bind(&test_addr()).await.expect("node bind failed");
     
-    // Pre-occupy the forwarder port
-    let blocker = UdpSocket::bind(format!("127.0.0.1:{}", forwarder_port)).await;
+    // Relay should always be capable since it shares the socket
+    assert!(node.is_relay_capable(), "relay should be capable with socket multiplexing");
     
-    if blocker.is_ok() {
-        // Now try to bind a node that would want forwarder_port
-        let node = Node::bind(&format!("127.0.0.1:{}", node_port)).await.expect("node bind failed");
-        
-        // Relay should not be capable due to port conflict
-        assert!(!node.is_relay_capable(), "relay should fail when forwarder port blocked");
-        
-        // But node itself should work fine
-        let _ = node.put(b"still works".to_vec()).await.expect("DHT should work");
-    }
+    // Verify the relay endpoint uses the same port as QUIC
+    let relay = node.relay_endpoint().await.expect("relay endpoint should exist");
+    let quic_addr = node.quic_endpoint().local_addr().expect("quic addr");
+    
+    // The advertised relay address should use the same port
+    let relay_addr: std::net::SocketAddr = relay.addr.parse().expect("parse relay addr");
+    assert_eq!(relay_addr.port(), quic_addr.port(), "relay and QUIC should share port");
 }
 
 // ============================================================================

@@ -1006,7 +1006,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    #[allow(dead_code)] // Heartbeat infrastructure - to be wired
     pub async fn run_heartbeat(&self) {
         let mut interval = tokio::time::interval(self.config.heartbeat_interval);
         
@@ -1016,7 +1015,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
         }
     }
 
-    #[allow(dead_code)] // Heartbeat infrastructure - called by run_heartbeat
     async fn heartbeat(&self) {
         let subscribed_topics: Vec<String> = {
             self.subscriptions.read().await.iter().cloned().collect()

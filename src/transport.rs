@@ -178,6 +178,7 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay infrastructure - session_id, created_at reserved for session management
 pub struct ForwarderSession {
     pub session_id: [u8; 16],
     pub peer_a_identity: Identity,

@@ -7,17 +7,18 @@ use lru::LruCache;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
 use crate::messages::{self as messages, DhtRequest, DhtResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
-use crate::crypto::identity_to_sni;
-use crate::transport::{Contact, NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT};
-use crate::dht::Key;
+use crate::crypto::{extract_verified_identity, identity_to_sni};
+use crate::transport::{self, Contact, NatType, detect_nat_type, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelayForwarder};
+use crate::dht::{Dht, Key};
 use crate::identity::{EndpointRecord, Identity};
-use crate::hyparview::HyParViewMessage;
+use crate::hyparview::{HyParView, HyParViewMessage};
+use crate::plumtree::PlumTreeHandler;
 
 
 #[async_trait]
@@ -799,4 +800,328 @@ impl HyParViewRpc for RpcNode {
             other => anyhow::bail!("unexpected response to HyParView: {:?}", other),
         }
     }
+}
+
+
+// ============================================================================
+// Server-side RPC handling (inbound connections)
+// ============================================================================
+
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REQUEST_SIZE: usize = 64 * 1024;
+
+/// Handle an incoming QUIC connection, extracting the verified identity
+/// and dispatching streams to appropriate protocol handlers.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
+    node: Dht<N>,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<SocketAddr>,
+    smartsock: Option<Arc<SmartSock>>,
+    incoming: Incoming,
+    hyparview: Arc<HyParView<N>>,
+) -> Result<()> {
+    debug!("handle_connection: accepting incoming connection");
+    let connection = incoming.await.context("failed to accept connection")?;
+    let remote = connection.remote_address();
+
+    let verified_identity = extract_verified_identity(&connection);
+    if verified_identity.is_none() {
+        warn!(remote = %remote, "rejecting connection: could not verify peer identity");
+        return Err(anyhow::anyhow!("could not verify peer identity from certificate"));
+    }
+    let verified_identity = verified_identity.unwrap();
+
+    if let Some(ss) = &smartsock {
+        ss.register_peer(verified_identity, vec![remote]).await;
+        debug!(
+            peer = hex::encode(verified_identity),
+            addr = %remote,
+            "registered inbound peer with SmartSock"
+        );
+    }
+
+    info!("Peer {}/{}", remote, hex::encode(verified_identity));
+
+    debug!(
+        peer = hex::encode(verified_identity),
+        addr = %remote,
+        "New peer connected"
+    );
+
+    let result = loop {
+        let stream = match connection.accept_bi().await {
+            Ok(s) => s,
+            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                debug!(remote = %remote, "connection closed");
+                hyparview.handle_peer_disconnected(verified_identity).await;
+                break Ok(());
+            }
+            Err(e) => {
+                hyparview.handle_peer_disconnected(verified_identity).await;
+                break Err(e.into());
+            }
+        };
+
+        let node = node.clone();
+        let plumtree_h = plumtree_handler.clone();
+        let forwarder = udp_forwarder.clone();
+        let forwarder_addr = udp_forwarder_addr;
+        let remote_addr = remote;
+        let verified_id = verified_identity;
+        let hv = hyparview.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_stream(node, plumtree_h, forwarder, forwarder_addr, stream, remote_addr, verified_id, hv).await
+            {
+                debug!(error = ?e, "stream error");
+            }
+        });
+    };
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
+    node: Dht<N>,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<SocketAddr>,
+    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    remote_addr: SocketAddr,
+    verified_identity: Identity,
+    hyparview: Arc<HyParView<N>>,
+) -> Result<()> {
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("request header read timed out"))??;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > MAX_REQUEST_SIZE {
+        warn!(
+            remote = %remote_addr,
+            size = len,
+            max = MAX_REQUEST_SIZE,
+            "rejecting oversized request"
+        );
+        let error_response = DhtResponse::Error {
+            message: format!("request too large: {} bytes (max {})", len, MAX_REQUEST_SIZE),
+        };
+        let response_bytes = bincode::serialize(&error_response)?;
+        let response_len = response_bytes.len() as u32;
+        send.write_all(&response_len.to_be_bytes()).await?;
+        send.write_all(&response_bytes).await?;
+        send.finish()?;
+        return Ok(());
+    }
+
+    let mut request_bytes = vec![0u8; len];
+    tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut request_bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("request body read timed out"))??;
+
+    let request: RpcRequest =
+        crate::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
+
+    if let Some(claimed_id) = request.sender_identity() {
+        if claimed_id != verified_identity {
+            warn!(
+                remote = %remote_addr,
+                claimed = ?hex::encode(&claimed_id.as_bytes()[..8]),
+                verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
+                "rejecting request: identity mismatch (possible Sybil attack)"
+            );
+            let error_response = RpcResponse::Error {
+                message: "Identity does not match connection identity".to_string(),
+            };
+            let response_bytes = bincode::serialize(&error_response)?;
+            let len = response_bytes.len() as u32;
+            send.write_all(&len.to_be_bytes()).await?;
+            send.write_all(&response_bytes).await?;
+            send.finish()?;
+            return Ok(());
+        }
+    }
+
+    let response = match tokio::time::timeout(
+        REQUEST_PROCESS_TIMEOUT,
+        handle_rpc_request(
+            node,
+            request,
+            remote_addr,
+            plumtree_handler,
+            udp_forwarder,
+            udp_forwarder_addr,
+            hyparview,
+        )
+    ).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            warn!(remote = %remote_addr, "request processing timed out");
+            RpcResponse::Error {
+                message: "request processing timeout".to_string(),
+            }
+        }
+    };
+
+    let response_bytes = bincode::serialize(&response).context("failed to serialize response")?;
+    let len = response_bytes.len() as u32;
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(&response_bytes).await?;
+    send.finish()?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
+    node: Dht<N>,
+    request: RpcRequest,
+    remote_addr: SocketAddr,
+    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
+    udp_forwarder_addr: Option<SocketAddr>,
+    hyparview: Arc<HyParView<N>>,
+) -> RpcResponse {
+    match request {
+        RpcRequest::Dht(dht_request) => {
+            let dht_response = handle_dht_rpc(&node, dht_request, remote_addr).await;
+            RpcResponse::Dht(dht_response)
+        }
+        RpcRequest::Relay(relay_request) => {
+            let relay_response = transport::handle_relay_request(
+                relay_request,
+                remote_addr,
+                udp_forwarder.as_deref(),
+                udp_forwarder_addr,
+            ).await;
+            RpcResponse::Relay(relay_response)
+        }
+        RpcRequest::PlumTree(req) => {
+            handle_plumtree_rpc(req.from, req.message, plumtree_handler).await
+        }
+        RpcRequest::HyParView(req) => {
+            handle_hyparview_rpc(req.from, req.message, hyparview).await
+        }
+    }
+}
+
+// ============================================================================
+// Protocol-specific RPC handlers
+// ============================================================================
+
+/// Handle an incoming DHT RPC request and return the appropriate response.
+async fn handle_dht_rpc<N: DhtRpc + Send + Sync + 'static>(
+    node: &Dht<N>,
+    request: DhtRequest,
+    remote_addr: SocketAddr,
+) -> DhtResponse {
+    match request {
+        DhtRequest::Ping { from } => {
+            trace!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                "handling PING request"
+            );
+            DhtResponse::Ack
+        }
+        DhtRequest::FindNode { from, target } => {
+            trace!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                target = ?hex::encode(&target.as_bytes()[..8]),
+                "handling FIND_NODE request"
+            );
+            let nodes = node.handle_find_node_request(&from, target).await;
+            debug!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                returned = nodes.len(),
+                "FIND_NODE response"
+            );
+            DhtResponse::Nodes(nodes)
+        }
+        DhtRequest::FindValue { from, key } => {
+            trace!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                key = ?hex::encode(&key[..8]),
+                "handling FIND_VALUE request"
+            );
+            let (value, closer) = node.handle_find_value_request(&from, key).await;
+            let found = value.is_some();
+            debug!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                found = found,
+                closer_nodes = closer.len(),
+                "FIND_VALUE response"
+            );
+            DhtResponse::Value { value, closer }
+        }
+        DhtRequest::Store { from, key, value } => {
+            debug!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                key = ?hex::encode(&key[..8]),
+                value_len = value.len(),
+                "handling STORE request"
+            );
+            node.handle_store_request(&from, key, value).await;
+            DhtResponse::Ack
+        }
+        DhtRequest::WhatIsMyAddr => {
+            debug!("handling WHAT_IS_MY_ADDR request (STUN-like)");
+            DhtResponse::YourAddr {
+                addr: remote_addr.to_string(),
+            }
+        }
+    }
+}
+
+/// Handle an incoming PlumTree RPC request and return the appropriate response.
+async fn handle_plumtree_rpc(
+    from: Identity,
+    message: PlumTreeMessage,
+    handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+) -> RpcResponse {
+    if let Some(h) = handler {
+        trace!(
+            from = ?hex::encode(&from.as_bytes()[..8]),
+            message = ?message,
+            "dispatching PLUMTREE request to handler"
+        );
+        if let Err(e) = h.handle_message(&from, message).await {
+            warn!(from = ?hex::encode(&from.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
+            RpcResponse::Error {
+                message: format!("PlumTree error: {}", e),
+            }
+        } else {
+            RpcResponse::PlumTreeAck
+        }
+    } else {
+        warn!(
+            from = ?hex::encode(&from.as_bytes()[..8]),
+            message = ?message,
+            "received PLUMTREE request but no handler registered"
+        );
+        RpcResponse::Error {
+            message: "PlumTree not enabled on this node".to_string(),
+        }
+    }
+}
+
+/// Handle an incoming HyParView RPC request and return the appropriate response.
+async fn handle_hyparview_rpc<N: HyParViewRpc + Send + Sync + 'static>(
+    from: Identity,
+    message: HyParViewMessage,
+    hyparview: Arc<HyParView<N>>,
+) -> RpcResponse {
+    trace!(
+        from = ?hex::encode(&from.as_bytes()[..8]),
+        message = ?message,
+        "handling HyParView request"
+    );
+    
+    hyparview.handle_message(from, message).await;
+    
+    RpcResponse::HyParViewAck
 }

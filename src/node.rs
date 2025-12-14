@@ -1,340 +1,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use quinn::{Connection, Endpoint, Incoming};
-use tracing::{debug, info, trace, warn};
+use quinn::{Connection, Endpoint};
+use tracing::{debug, info, warn};
 
-use crate::crypto::{extract_verified_identity, generate_ed25519_cert, create_server_config, create_client_config};
+use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
 use crate::dht::{Dht, Key, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
-use crate::hyparview::{HyParView, HyParViewConfig, HyParViewMessage};
+use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
-use crate::messages::{DhtRequest, DhtResponse, Message, PlumTreeMessage, RpcRequest, RpcResponse};
+use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
 use crate::ratelimit::ConnectionRateLimiter;
-use crate::transport::{self, Contact, SmartSock, UdpRelayForwarder};
-use crate::rpc::{DhtRpc, HyParViewRpc, PlumTreeRpc, RpcNode};
+use crate::transport::{Contact, SmartSock, UdpRelayForwarder};
+use crate::rpc::{self, RpcNode};
 
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_REQUEST_SIZE: usize = 64 * 1024;
-
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_connection<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
-    node: Dht<N>,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
-    smartsock: Option<Arc<SmartSock>>,
-    incoming: Incoming,
-    hyparview: Arc<HyParView<N>>,
-    plumtree: Option<Arc<PlumTree<N>>>,
-    _network: N,
-    _local_identity: Identity,
-) -> Result<()> {
-    debug!("handle_connection: accepting incoming connection");
-    let connection = incoming.await.context("failed to accept connection")?;
-    let remote = connection.remote_address();
-
-    let verified_identity = extract_verified_identity(&connection);
-    if verified_identity.is_none() {
-        warn!(remote = %remote, "rejecting connection: could not verify peer identity");
-        return Err(anyhow::anyhow!("could not verify peer identity from certificate"));
-    }
-    let verified_identity = verified_identity.unwrap();
-
-    if let Some(ss) = &smartsock {
-        ss.register_peer(verified_identity, vec![remote]).await;
-        debug!(
-            peer = hex::encode(verified_identity),
-            addr = %remote,
-            "registered inbound peer with SmartSock"
-        );
-    }
-
-    info!("Peer {}/{}", remote, hex::encode(verified_identity));
-
-    debug!(
-        peer = hex::encode(verified_identity),
-        addr = %remote,
-        "New peer connected"
-    );
-
-    let result = loop {
-        let stream = match connection.accept_bi().await {
-            Ok(s) => s,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                debug!(remote = %remote, "connection closed");
-                break Ok(());
-            }
-            Err(e) => {
-                break Err(e.into());
-            }
-        };
-
-        let node = node.clone();
-        let plumtree_h = plumtree_handler.clone();
-        let forwarder = udp_forwarder.clone();
-        let forwarder_addr = udp_forwarder_addr;
-        let remote_addr = remote;
-        let verified_id = verified_identity;
-        let hv = hyparview.clone();
-        let ps = plumtree.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_stream(node, plumtree_h, forwarder, forwarder_addr, stream, remote_addr, verified_id, hv, ps).await
-            {
-                debug!(error = ?e, "stream error");
-            }
-        });
-    };
-
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
-    node: Dht<N>,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
-    remote_addr: SocketAddr,
-    verified_identity: Identity,
-    hyparview: Arc<HyParView<N>>,
-    plumtree: Option<Arc<PlumTree<N>>>,
-) -> Result<()> {
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("request header read timed out"))??;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > MAX_REQUEST_SIZE {
-        warn!(
-            remote = %remote_addr,
-            size = len,
-            max = MAX_REQUEST_SIZE,
-            "rejecting oversized request"
-        );
-        let error_response = DhtResponse::Error {
-            message: format!("request too large: {} bytes (max {})", len, MAX_REQUEST_SIZE),
-        };
-        let response_bytes = bincode::serialize(&error_response)?;
-        let response_len = response_bytes.len() as u32;
-        send.write_all(&response_len.to_be_bytes()).await?;
-        send.write_all(&response_bytes).await?;
-        send.finish()?;
-        return Ok(());
-    }
-
-    let mut request_bytes = vec![0u8; len];
-    tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut request_bytes))
-        .await
-        .map_err(|_| anyhow::anyhow!("request body read timed out"))??;
-
-    let request: RpcRequest =
-        crate::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
-
-    if let Some(claimed_id) = request.sender_identity() {
-        if claimed_id != verified_identity {
-            warn!(
-                remote = %remote_addr,
-                claimed = ?hex::encode(&claimed_id.as_bytes()[..8]),
-                verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
-                "rejecting request: identity mismatch (possible Sybil attack)"
-            );
-            let error_response = RpcResponse::Error {
-                message: "Identity does not match connection identity".to_string(),
-            };
-            let response_bytes = bincode::serialize(&error_response)?;
-            let len = response_bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await?;
-            send.write_all(&response_bytes).await?;
-            send.finish()?;
-            return Ok(());
-        }
-    }
-
-    let response = match tokio::time::timeout(
-        REQUEST_PROCESS_TIMEOUT,
-        handle_rpc_request(
-            node,
-            request,
-            remote_addr,
-            verified_identity,
-            plumtree_handler,
-            udp_forwarder,
-            udp_forwarder_addr,
-            hyparview,
-            plumtree,
-        )
-    ).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            warn!(remote = %remote_addr, "request processing timed out");
-            RpcResponse::Error {
-                message: "request processing timeout".to_string(),
-            }
-        }
-    };
-
-    let response_bytes = bincode::serialize(&response).context("failed to serialize response")?;
-    let len = response_bytes.len() as u32;
-    send.write_all(&len.to_be_bytes()).await?;
-    send.write_all(&response_bytes).await?;
-    send.finish()?;
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
-    node: Dht<N>,
-    request: RpcRequest,
-    remote_addr: SocketAddr,
-    _verified_identity: Identity,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
-    hyparview: Arc<HyParView<N>>,
-    _plumtree: Option<Arc<PlumTree<N>>>,
-) -> RpcResponse {
-    match request {
-        RpcRequest::Dht(dht_request) => {
-            let dht_response = handle_dht_request(node, dht_request, remote_addr).await;
-            RpcResponse::Dht(dht_response)
-        }
-        RpcRequest::Relay(relay_request) => {
-            let relay_response = transport::handle_relay_request(
-                relay_request,
-                remote_addr,
-                udp_forwarder.as_deref(),
-                udp_forwarder_addr,
-            ).await;
-            RpcResponse::Relay(relay_response)
-        }
-        RpcRequest::PlumTree(req) => {
-            handle_plumtree_request(req.from, req.message, plumtree_handler).await
-        }
-        RpcRequest::HyParView(req) => {
-            handle_hyparview_request(req.from, req.message, hyparview).await
-        }
-    }
-}
-
-
-async fn handle_dht_request<N: DhtRpc>(
-    node: Dht<N>,
-    request: DhtRequest,
-    remote_addr: SocketAddr,
-) -> DhtResponse {
-    match request {
-        DhtRequest::Ping { from } => {
-            trace!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                "handling PING request"
-            );
-            DhtResponse::Ack
-        }
-        DhtRequest::FindNode { from, target } => {
-            trace!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                target = ?hex::encode(&target.as_bytes()[..8]),
-                "handling FIND_NODE request"
-            );
-            let nodes = node.handle_find_node_request(&from, target).await;
-            debug!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                returned = nodes.len(),
-                "FIND_NODE response"
-            );
-            DhtResponse::Nodes(nodes)
-        }
-        DhtRequest::FindValue { from, key } => {
-            trace!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                key = ?hex::encode(&key[..8]),
-                "handling FIND_VALUE request"
-            );
-            let (value, closer) = node.handle_find_value_request(&from, key).await;
-            let found = value.is_some();
-            debug!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                found = found,
-                closer_nodes = closer.len(),
-                "FIND_VALUE response"
-            );
-            DhtResponse::Value { value, closer }
-        }
-        DhtRequest::Store { from, key, value } => {
-            debug!(
-                from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                key = ?hex::encode(&key[..8]),
-                value_len = value.len(),
-                "handling STORE request"
-            );
-            node.handle_store_request(&from, key, value).await;
-            DhtResponse::Ack
-        }
-        DhtRequest::WhatIsMyAddr => {
-            debug!("handling WHAT_IS_MY_ADDR request (STUN-like)");
-            DhtResponse::YourAddr {
-                addr: remote_addr.to_string(),
-            }
-        }
-    }
-}
-
-
-async fn handle_plumtree_request(
-    from: Identity,
-    message: PlumTreeMessage,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-) -> RpcResponse {
-    if let Some(handler) = plumtree_handler {
-        trace!(
-            from = ?hex::encode(&from.as_bytes()[..8]),
-            message = ?message,
-            "dispatching PLUMTREE request to handler"
-        );
-        if let Err(e) = handler.handle_message(&from, message).await {
-            warn!(from = ?hex::encode(&from.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
-            RpcResponse::Error {
-                message: format!("PlumTree error: {}", e),
-            }
-        } else {
-            RpcResponse::PlumTreeAck
-        }
-    } else {
-        warn!(
-            from = ?hex::encode(&from.as_bytes()[..8]),
-            message = ?message,
-            "received PLUMTREE request but no handler registered"
-        );
-        RpcResponse::Error {
-            message: "PlumTree not enabled on this node".to_string(),
-        }
-    }
-}
-
-async fn handle_hyparview_request<N: HyParViewRpc + Send + Sync + 'static>(
-    from: Identity,
-    message: HyParViewMessage,
-    hyparview: Arc<HyParView<N>>,
-) -> RpcResponse {
-    trace!(
-        from = ?hex::encode(&from.as_bytes()[..8]),
-        message = ?message,
-        "handling HyParView request"
-    );
-    
-    hyparview.handle_message(from, message).await;
-    
-    RpcResponse::HyParViewAck
-}
 
 pub struct Node {
     keypair: Keypair,
@@ -343,13 +23,16 @@ pub struct Node {
     contact: Contact,
     dht: Dht<RpcNode>,
     network: RpcNode,
-    _rate_limiter: Arc<ConnectionRateLimiter>,
-    udp_forwarder: Option<Arc<UdpRelayForwarder>>,
-    udp_forwarder_addr: Option<SocketAddr>,
-    _hyparview: Arc<HyParView<RpcNode>>,
+    rate_limiter: Arc<ConnectionRateLimiter>,
+    #[allow(dead_code)] // Held to keep Arc alive for spawned task
+    udp_forwarder: Arc<UdpRelayForwarder>,
+    udp_forwarder_addr: SocketAddr,
+    hyparview: Arc<HyParView<RpcNode>>,
     plumtree: Option<Arc<PlumTree<RpcNode>>>,
     plumtree_receiver: Option<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>>,
-    _server_handle: tokio::task::JoinHandle<Result<()>>,
+    server_handle: tokio::task::JoinHandle<Result<()>>,
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+    probe_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Node {
@@ -379,7 +62,7 @@ impl Node {
             .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
-        let _probe_handle = smartsock.spawn_probe_loop();
+        let probe_handle = smartsock.spawn_probe_loop();
         debug!("SmartSock probe loop started");
         
         let contact = Contact {
@@ -405,19 +88,10 @@ impl Node {
         
         let rate_limiter = Arc::new(ConnectionRateLimiter::new());
         
-        let forwarder_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
-        let (udp_forwarder, udp_forwarder_addr) = match UdpRelayForwarder::bind(forwarder_addr).await {
-            Ok(forwarder) => {
-                let forwarder = Arc::new(forwarder);
-                let actual_addr = forwarder.local_addr().unwrap_or(forwarder_addr);
-                info!("UDP relay forwarder on {}", actual_addr);
-                (Some(forwarder), Some(actual_addr))
-            }
-            Err(e) => {
-                warn!("failed to bind UDP relay forwarder on {}: {}", forwarder_addr, e);
-                (None, None)
-            }
-        };
+        // Share the same UDP socket for both QUIC and relay forwarding (port multiplexing)
+        let udp_forwarder = Arc::new(UdpRelayForwarder::with_socket(smartsock.inner_socket().clone()));
+        let udp_forwarder_addr = local_addr;
+        info!("UDP relay forwarder sharing port {}", local_addr);
         
         let hyparview = Arc::new(
             HyParView::new(identity, HyParViewConfig::default(), Arc::new(network.clone()))
@@ -440,6 +114,15 @@ impl Node {
         
         hyparview.spawn_shuffle_loop();
         
+        let heartbeat_handle = if let Some(ref pt) = plumtree {
+            let pt_clone = pt.clone();
+            Some(tokio::spawn(async move {
+                pt_clone.run_heartbeat().await;
+            }))
+        } else {
+            None
+        };
+        
         let server_handle = {
             let endpoint = endpoint.clone();
             let dht = dht.clone();
@@ -449,18 +132,13 @@ impl Node {
             let plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>> = 
                 plumtree.clone().map(|p| p as Arc<dyn PlumTreeHandler + Send + Sync>);
             let hyparview_for_server = hyparview.clone();
-            let plumtree_for_server = plumtree.clone();
-            let network_for_server = network.clone();
-            let identity_for_server = identity;
             
             tokio::spawn(async move {
-                if let Some(forwarder) = &udp_forwarder {
-                    info!(
-                        addr = ?udp_forwarder_addr,
-                        "starting UDP relay forwarder"
-                    );
-                    forwarder.clone().spawn();
-                }
+                info!(
+                    addr = ?udp_forwarder_addr,
+                    "starting UDP relay forwarder"
+                );
+                udp_forwarder.clone().spawn();
 
                 while let Some(incoming) = endpoint.accept().await {
                     let remote_addr = incoming.remote_address();
@@ -471,16 +149,13 @@ impl Node {
 
                     let node = dht.clone();
                     let plumtree = plumtree_handler.clone();
-                    let forwarder = udp_forwarder.clone();
-                    let forwarder_addr = udp_forwarder_addr;
+                    let forwarder = Some(udp_forwarder.clone());
+                    let forwarder_addr = Some(udp_forwarder_addr);
                     let ss = smartsock_for_server.clone();
                     let hv = hyparview_for_server.clone();
-                    let ps = plumtree_for_server.clone();
-                    let net = network_for_server.clone();
-                    let me = identity_for_server;
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_connection(node, plumtree, forwarder, forwarder_addr, ss, incoming, hv, ps, net, me).await
+                            rpc::handle_connection(node, plumtree, forwarder, forwarder_addr, ss, incoming, hv).await
                         {
                             warn!("connection error: {:?}", e);
                         }
@@ -499,13 +174,15 @@ impl Node {
             contact,
             dht,
             network,
-            _rate_limiter: rate_limiter,
+            rate_limiter,
             udp_forwarder,
             udp_forwarder_addr,
-            _hyparview: hyparview,
+            hyparview,
             plumtree,
             plumtree_receiver,
-            _server_handle: server_handle,
+            server_handle,
+            heartbeat_handle,
+            probe_handle,
         })
     }
     
@@ -564,11 +241,11 @@ impl Node {
     }
     
     pub fn is_relay_capable(&self) -> bool {
-        self.udp_forwarder.is_some()
+        true // Always capable - relay forwarder shares the QUIC socket
     }
     
     pub async fn relay_endpoint(&self) -> Option<Contact> {
-        let forwarder_addr = self.udp_forwarder_addr?;
+        let forwarder_addr = self.udp_forwarder_addr;
         let local_addr = self.endpoint.local_addr().ok()?;
         
         let relay_addr = self.network.public_addr().await
@@ -611,6 +288,9 @@ impl Node {
         
         self.network.cache_contact(&contact).await;
         self.dht.observe_contact(contact.clone()).await;
+        
+        // Join the HyParView overlay via the bootstrap peer
+        self.hyparview.request_join(peer_identity).await;
         
         self.network.detect_nat(&[contact]).await;
         
@@ -714,6 +394,33 @@ impl Node {
     
     pub fn has_plumtree(&self) -> bool {
         self.plumtree.is_some()
+    }
+    
+    /// Returns true if the server is still running.
+    pub fn is_running(&self) -> bool {
+        !self.server_handle.is_finished()
+    }
+    
+    /// Gracefully shuts down the node, notifying peers of departure.
+    pub async fn shutdown(&self) {
+        // Notify HyParView peers we're leaving
+        self.hyparview.quit().await;
+        
+        // Abort the heartbeat task if running
+        if let Some(ref handle) = self.heartbeat_handle {
+            handle.abort();
+        }
+        
+        // Abort the probe loop
+        self.probe_handle.abort();
+        
+        // Abort the server task
+        self.server_handle.abort();
+    }
+    
+    /// Returns connection rate limiter statistics.
+    pub async fn connection_stats(&self) -> crate::ratelimit::RateLimitStats {
+        self.rate_limiter.stats().await
     }
     
     

@@ -140,7 +140,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         self.passive_view.read().await.clone()
     }
 
-    #[allow(dead_code)] // Protocol entry point - to be wired in bootstrap
     pub async fn request_join(&self, bootstrap: Identity) {
         if bootstrap == self.me {
             return;
@@ -178,7 +177,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         }
     }
 
-    #[allow(dead_code)] // Connection lifecycle - to be wired
     pub async fn handle_peer_disconnected(&self, peer: Identity) {
         let removed = {
             let mut active = self.active_view.write().await;
@@ -265,7 +263,6 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
         }
     }
 
-    #[allow(dead_code)] // Graceful shutdown - to be wired
     pub async fn quit(&self) {
         let peers: Vec<Identity> = {
             let active = self.active_view.read().await;
