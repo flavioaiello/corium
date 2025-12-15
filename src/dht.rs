@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -819,30 +820,34 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             const PER_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
             
             let network = self.network.clone();
-            let futures: Vec<_> = candidates
-                .into_iter()
-                .map(|contact| {
-                    let net = network.clone();
-                    async move {
-                        let start = Instant::now();
-                        let result = tokio::time::timeout(
-                            PER_QUERY_TIMEOUT,
-                            net.find_node(&contact, target)
-                        ).await;
-                        let result = match result {
-                            Ok(r) => r,
-                            Err(_) => Err(anyhow!("query timeout")),
-                        };
-                        (contact, start.elapsed(), result)
-                    }
-                })
-                .collect();
+            let mut join_set = JoinSet::new();
+            let candidates_len = candidates.len();
+            for (idx, contact) in candidates.into_iter().enumerate() {
+                let net = network.clone();
+                join_set.spawn(async move {
+                    let start = Instant::now();
+                    let result = tokio::time::timeout(PER_QUERY_TIMEOUT, net.find_node(&contact, target)).await;
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!("query timeout")),
+                    };
+                    (idx, contact, start.elapsed(), result)
+                });
+            }
 
-            let results = futures::future::join_all(futures).await;
+            type FindNodeQueryResult = (Contact, Duration, Result<Vec<Contact>>);
+
+            let mut results: Vec<Option<FindNodeQueryResult>> = Vec::with_capacity(candidates_len);
+            results.resize_with(candidates_len, || None);
+            while let Some(joined) = join_set.join_next().await {
+                if let Ok((idx, contact, elapsed, result)) = joined {
+                    results[idx] = Some((contact, elapsed, result));
+                }
+            }
 
             let mut any_closer = false;
 
-            for (contact, elapsed, result) in results {
+            for (contact, elapsed, result) in results.into_iter().flatten() {
                 match result {
                     Ok(nodes) => {
                         rpc_success = true;
@@ -856,6 +861,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                         let valid_nodes = nodes;
 
                         for n in valid_nodes {
+                            if n.identity == self.id {
+                                continue;
+                            }
                             if seen.insert(n.identity)
                                 && seen_addrs.insert(n.addr.clone())
                             {
@@ -1032,18 +1040,18 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let k = DEFAULT_K; 
 
         // Parallelize stores for faster completion
-        let store_futures: Vec<_> = closest
-            .into_iter()
-            .take(k)
-            .map(|contact| {
-                let value = value.clone();
-                async move {
-                    self.send_store(&contact, key, value).await
-                }
-            })
-            .collect();
-        
-        futures::future::join_all(store_futures).await;
+        let mut join_set = JoinSet::new();
+        for contact in closest.into_iter().take(k) {
+            let this = self.clone();
+            let value = value.clone();
+            join_set.spawn(async move {
+                this.send_store(&contact, key, value).await;
+            });
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            let _ = joined;
+        }
 
         Ok(key)
     }
@@ -1063,18 +1071,18 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let k = DEFAULT_K;
 
         // Parallelize stores for faster completion
-        let store_futures: Vec<_> = closest
-            .into_iter()
-            .take(k)
-            .map(|contact| {
-                let value = value.clone();
-                async move {
-                    self.send_store(&contact, key, value).await
-                }
-            })
-            .collect();
-        
-        futures::future::join_all(store_futures).await;
+        let mut join_set = JoinSet::new();
+        for contact in closest.into_iter().take(k) {
+            let this = self.clone();
+            let value = value.clone();
+            join_set.spawn(async move {
+                this.send_store(&contact, key, value).await;
+            });
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            let _ = joined;
+        }
 
         Ok(())
     }
@@ -1089,33 +1097,30 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         // Query contacts in parallel with early return on first success
         const FIND_VALUE_TIMEOUT: Duration = Duration::from_secs(3);
         
-        // Use select_ok pattern: query all in parallel, return first success
+        // Query all in parallel and return on the first successful value.
         let network = self.network.clone();
         let key_copy = *key;
-        let futures: Vec<_> = closest
-            .into_iter()
-            .map(|contact| {
-                let net = network.clone();
-                async move {
-                    let result = tokio::time::timeout(
-                        FIND_VALUE_TIMEOUT,
-                        net.find_value(&contact, key_copy)
-                    ).await;
-                    
-                    match result {
-                        Ok(Ok((Some(value), _))) => Ok(value),
-                        Ok(Ok((None, _))) => Err(()),
-                        Ok(Err(_)) => Err(()),
-                        Err(_) => Err(()), // timeout
-                    }
+        let mut join_set = JoinSet::new();
+        for contact in closest.into_iter() {
+            let net = network.clone();
+            join_set.spawn(async move {
+                let result = tokio::time::timeout(FIND_VALUE_TIMEOUT, net.find_value(&contact, key_copy)).await;
+
+                match result {
+                    Ok(Ok((Some(value), _))) => Some(value),
+                    Ok(Ok((None, _))) => None,
+                    Ok(Err(_)) => None,
+                    Err(_) => None, // timeout
                 }
-            })
-            .collect();
-        
-        // Wait for all futures, return first success
-        let results = futures::future::join_all(futures).await;
-        if let Some(value) = results.into_iter().flatten().next() {
-            return Ok(Some(value));
+            });
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            if let Ok(Some(value)) = joined {
+                // Cancel any remaining lookups once we have a value.
+                join_set.abort_all();
+                return Ok(Some(value));
+            }
         }
 
         Ok(None)
@@ -1976,11 +1981,19 @@ mod tests {
     #[tokio::test]
     async fn lookup_converges_to_closest() {
         let registry = Arc::new(NetworkRegistry::default());
-        let nodes: Vec<_> = futures::future::join_all((0..10).map(|i| {
+        let mut join_set = JoinSet::new();
+        for i in 0..10u32 {
             let reg = registry.clone();
-            async move { TestNode::new(reg, 0x10 + i, 20, 3).await }
-        }))
-        .await;
+            join_set.spawn(async move { (i as usize, TestNode::new(reg, 0x10 + i, 20, 3).await) });
+        }
+
+        let mut nodes: Vec<Option<TestNode>> = Vec::with_capacity(10);
+        nodes.resize_with(10, || None);
+        while let Some(joined) = join_set.join_next().await {
+            let (idx, node) = joined.expect("test node join");
+            nodes[idx] = Some(node);
+        }
+        let nodes: Vec<TestNode> = nodes.into_iter().map(|n| n.expect("test node")) .collect();
 
         for i in 0..nodes.len() {
             for j in 0..nodes.len() {
@@ -2178,5 +2191,97 @@ mod tests {
         
         let expected_id = make_identity(0x42);
         assert_eq!(node.node.identity(), expected_id);
+    }
+
+    #[tokio::test]
+    async fn get_returns_early_on_first_value_and_cancels_others() {
+        let value = b"fastest-wins".to_vec();
+        let key = hash_content(&value);
+        let target = Identity::from_bytes(key);
+
+        // `alpha` is clamped to at least 2, so iterative lookups will query the first two
+        // closest contacts. We therefore pick three identities:
+        // - `fast`: closest (queried during lookup)
+        // - `dummy`: second-closest (queried during lookup)
+        // - `slow`: farthest (NOT queried during lookup, but included in the shortlist)
+        let mut candidates: Vec<(u32, [u8; 32])> = Vec::new();
+        for idx in 1u32..=8192 {
+            let id = make_identity(idx);
+            let dist = xor_distance(&id, &target);
+            candidates.push((idx, dist));
+        }
+        candidates.sort_by(|a, b| distance_cmp(&a.1, &b.1));
+        assert!(candidates.len() >= 3);
+
+        let fast_idx = candidates[0].0;
+        let dummy_idx = candidates[1].0;
+        let slow_idx = candidates.last().expect("last idx").0;
+        let mut main_idx = 0xDEAD_BEEFu32;
+        if main_idx == fast_idx || main_idx == dummy_idx || main_idx == slow_idx {
+            main_idx = 0xDEAD_BEEEu32;
+        }
+
+        let registry = Arc::new(NetworkRegistry::default());
+        let main = TestNode::new(registry.clone(), main_idx, 20, 2).await;
+        let fast = TestNode::new(registry.clone(), fast_idx, 20, 2).await;
+        let dummy = TestNode::new(registry.clone(), dummy_idx, 20, 2).await;
+        let slow = TestNode::new(registry.clone(), slow_idx, 20, 2).await;
+
+        main.node.observe_contact(fast.contact()).await;
+        main.node.observe_contact(dummy.contact()).await;
+        main.node.observe_contact(slow.contact()).await;
+
+        // Sanity-check the lookup ordering before introducing latency.
+        // With `alpha >= 2`, we rely on the first two contacts being fast+dummy so that
+        // iterative_find_node does not block on the slow peer.
+        let closest_pre = tokio::time::timeout(Duration::from_secs(1), main.node.iterative_find_node(target))
+            .await
+            .expect("iterative_find_node should complete quickly")
+            .expect("iterative_find_node should succeed");
+        let closest_without_self: Vec<Contact> = closest_pre
+            .into_iter()
+            .filter(|c| c.identity != main.contact().identity)
+            .collect();
+        assert!(closest_without_self.len() >= 3, "expected at least 3 non-self contacts");
+        assert_eq!(closest_without_self[0].identity, fast.contact().identity);
+        assert_eq!(closest_without_self[1].identity, dummy.contact().identity);
+        assert!(closest_without_self.iter().any(|c| c.identity == slow.contact().identity));
+
+        // Ensure the slow peer will not respond within FIND_VALUE_TIMEOUT.
+        main.network
+            .set_latency(slow.contact().identity, Duration::from_secs(60))
+            .await;
+
+        // Store the value at both peers so either could satisfy the get.
+        fast.node
+            .handle_store_request(&main.contact(), key, value.clone())
+            .await;
+        slow.node
+            .handle_store_request(&main.contact(), key, value.clone())
+            .await;
+
+        // Ensure the store requests were processed before we call `get`.
+        // These requests are ordered on the actor channel, so the store must have been applied
+        // before the subsequent find_value handler runs.
+        let (fast_value, _) = fast
+            .node
+            .handle_find_value_request(&main.contact(), key)
+            .await;
+        assert_eq!(fast_value, Some(value.clone()));
+
+        let (slow_value, _) = slow
+            .node
+            .handle_find_value_request(&main.contact(), key)
+            .await;
+        assert_eq!(slow_value, Some(value.clone()));
+
+        // If `get` waits for all lookups, the slow task will be bounded by FIND_VALUE_TIMEOUT
+        // (currently 3s). So this should time out. With early-return + abort, it completes fast.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), main.node.get(&key))
+            .await
+            .expect("get should return before timeout")
+            .expect("get should succeed");
+
+        assert_eq!(outcome, Some(value));
     }
 }
