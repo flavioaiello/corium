@@ -539,7 +539,7 @@ impl RpcNode {
             let mut response_bytes = vec![0u8; len];
             recv.read_exact(&mut response_bytes).await?;
 
-            let response: RpcResponse = bincode::deserialize(&response_bytes)
+            let response: RpcResponse = messages::deserialize_bounded(&response_bytes)
                 .context("failed to deserialize response")?;
             Ok(response)
         })
@@ -971,7 +971,7 @@ impl RpcNode {
             let mut response_bytes = vec![0u8; len];
             recv.read_exact(&mut response_bytes).await?;
 
-            let rpc_response: RpcResponse = bincode::deserialize(&response_bytes)
+            let rpc_response: RpcResponse = messages::deserialize_bounded(&response_bytes)
                 .context("failed to deserialize response")?;
             
             match rpc_response {
