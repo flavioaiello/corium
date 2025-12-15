@@ -171,15 +171,25 @@ impl Identity {
         Ok(Self(arr))
     }
 
+    /// Check if this identity is valid.
+    /// 
+    /// Validates that the identity:
+    /// 1. Is not all zeros or all 0xFF (trivially invalid)
+    /// 2. Represents a valid Ed25519 public key point
+    /// 
+    /// This ensures the identity can be used for cryptographic operations
+    /// such as signature verification.
     #[inline]
     pub fn is_valid(&self) -> bool {
+        // Fast-path rejection for trivially invalid identities
         if self.0.iter().all(|&b| b == 0) {
             return false;
         }
         if self.0.iter().all(|&b| b == 0xFF) {
             return false;
         }
-        true
+        // Validate it's a valid Ed25519 public key point
+        VerifyingKey::try_from(self.0.as_slice()).is_ok()
     }
 }
 
@@ -904,5 +914,31 @@ mod tests {
             *all_ones.as_bytes(), keypair.public_key_bytes(),
             "All-ones Identity should not match any real keypair"
         );
+    }
+
+    #[test]
+    fn is_valid_rejects_invalid_ed25519_points() {
+        // All zeros - trivially invalid
+        let all_zeros = Identity::from_bytes([0u8; 32]);
+        assert!(!all_zeros.is_valid());
+
+        // All 0xFF - trivially invalid
+        let all_ones = Identity::from_bytes([0xFF; 32]);
+        assert!(!all_ones.is_valid());
+
+        // Random bytes that aren't valid Ed25519 curve points
+        // Most random 32-byte arrays won't be valid curve points
+        let invalid_point = Identity::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        ]);
+        assert!(!invalid_point.is_valid(), "should fail Ed25519 point validation");
+
+        // Valid keypair identity should pass
+        let keypair = Keypair::generate();
+        let valid_identity = keypair.identity();
+        assert!(valid_identity.is_valid());
     }
 }

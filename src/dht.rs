@@ -1342,6 +1342,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use anyhow::anyhow;
+    use ed25519_dalek::SigningKey;
     use tokio::sync::{Mutex, RwLock};
     use tokio::time::sleep;
 
@@ -1491,9 +1492,12 @@ mod tests {
     }
 
     fn make_identity(index: u32) -> Identity {
-        let mut id = [0u8; 32];
-        id[..4].copy_from_slice(&index.to_be_bytes());
-        Identity::from_bytes(id)
+        // Generate a deterministic but valid Ed25519 public key from the index.
+        // We use the index as a seed to create a signing key, then extract its public key.
+        let mut seed = [0u8; 32];
+        seed[..4].copy_from_slice(&index.to_be_bytes());
+        let signing_key = SigningKey::from_bytes(&seed);
+        Identity::from_bytes(signing_key.verifying_key().to_bytes())
     }
 
     fn make_contact(index: u32) -> Contact {
@@ -1502,6 +1506,24 @@ mod tests {
             addr: format!("node-{index}"),
             addrs: vec![],
         }
+    }
+
+    /// Find three indices whose generated identities have peers 2 and 3 in the same bucket
+    /// relative to peer 1. This is needed for bucket eviction tests.
+    fn find_same_bucket_indices() -> (u32, u32, u32) {
+        use crate::routing::bucket_index;
+        let main_id = make_identity(0);
+        for incumbent_idx in 1u32..1000 {
+            let incumbent_id = make_identity(incumbent_idx);
+            let bucket = bucket_index(&main_id, &incumbent_id);
+            for challenger_idx in (incumbent_idx + 1)..1000 {
+                let challenger_id = make_identity(challenger_idx);
+                if bucket_index(&main_id, &challenger_id) == bucket {
+                    return (0, incumbent_idx, challenger_idx);
+                }
+            }
+        }
+        panic!("Could not find same-bucket indices");
     }
 
     #[tokio::test]
@@ -1622,10 +1644,11 @@ mod tests {
 
     #[tokio::test]
     async fn responsive_contacts_survive_bucket_eviction() {
+        let (main_idx, responsive_idx, challenger_idx) = find_same_bucket_indices();
         let registry = Arc::new(NetworkRegistry::default());
-        let main = TestNode::new(registry.clone(), 0x00, 1, 2).await;
-        let responsive = TestNode::new(registry.clone(), 0x80, 1, 2).await;
-        let challenger = TestNode::new(registry.clone(), 0xC0, 1, 2).await;
+        let main = TestNode::new(registry.clone(), main_idx, 1, 2).await;
+        let responsive = TestNode::new(registry.clone(), responsive_idx, 1, 2).await;
+        let challenger = TestNode::new(registry.clone(), challenger_idx, 1, 2).await;
 
         main.node.observe_contact(responsive.contact()).await;
         main.node.observe_contact(challenger.contact()).await;
@@ -1642,10 +1665,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_pings_trigger_bucket_replacement() {
+        let (main_idx, stale_idx, newcomer_idx) = find_same_bucket_indices();
         let registry = Arc::new(NetworkRegistry::default());
-        let main = TestNode::new(registry.clone(), 0x00, 1, 2).await;
-        let stale = TestNode::new(registry.clone(), 0x80, 1, 2).await;
-        let newcomer = TestNode::new(registry.clone(), 0xC0, 1, 2).await;
+        let main = TestNode::new(registry.clone(), main_idx, 1, 2).await;
+        let stale = TestNode::new(registry.clone(), stale_idx, 1, 2).await;
+        let newcomer = TestNode::new(registry.clone(), newcomer_idx, 1, 2).await;
 
         main.node.observe_contact(stale.contact()).await;
         main.network
@@ -1665,10 +1689,11 @@ mod tests {
 
     #[tokio::test]
     async fn bucket_refreshes_issue_pings_before_eviction() {
+        let (main_idx, incumbent_idx, challenger_idx) = find_same_bucket_indices();
         let registry = Arc::new(NetworkRegistry::default());
-        let main = TestNode::new(registry.clone(), 0x00, 1, 2).await;
-        let incumbent = TestNode::new(registry.clone(), 0x80, 1, 2).await;
-        let challenger = TestNode::new(registry.clone(), 0xC0, 1, 2).await;
+        let main = TestNode::new(registry.clone(), main_idx, 1, 2).await;
+        let incumbent = TestNode::new(registry.clone(), incumbent_idx, 1, 2).await;
+        let challenger = TestNode::new(registry.clone(), challenger_idx, 1, 2).await;
 
         main.node.observe_contact(incumbent.contact()).await;
         main.node.observe_contact(challenger.contact()).await;
