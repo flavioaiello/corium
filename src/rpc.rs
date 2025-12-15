@@ -652,13 +652,18 @@ impl RpcNode {
         expected_peer_id: &Identity,
     ) -> Result<Connection> {
         let sni = identity_to_sni(expected_peer_id);
-        let conn = self
+        debug!(addr = %addr, sni = %sni, "initiating connection");
+        let connecting = self
             .endpoint
             .connect_with(self.client_config.clone(), addr, &sni)
-            .with_context(|| format!("failed to initiate connection to {}", addr))?
+            .with_context(|| format!("failed to initiate connection to {}", addr))?;
+        
+        debug!(addr = %addr, "awaiting connection establishment");
+        let conn = connecting
             .await
             .with_context(|| format!("failed to establish connection to {}", addr))?;
         
+        debug!(addr = %addr, "connection established");
         Ok(conn)
     }
 

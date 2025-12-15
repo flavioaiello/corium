@@ -1502,14 +1502,15 @@ impl AsyncUdpSocket for SmartSock {
                     
                     (payload, addr, verified_smart_addr)
                 } else {
-                    let (translated, sa) = match self.reverse_map.try_read() {
-                        Ok(guard) => {
-                            let sa = guard.get(&src_addr).copied();
-                            (sa.map(|s| s.0).unwrap_or(src_addr), sa)
-                        }
-                        Err(_) => (src_addr, None),
+                    // For non-relay packets, do NOT rewrite the observed source address.
+                    // QUIC connection tracking is keyed on the real remote SocketAddr;
+                    // rewriting this to a synthetic SmartAddr can cause handshakes and
+                    // existing connections to stall or be dropped.
+                    let sa = match self.reverse_map.try_read() {
+                        Ok(guard) => guard.get(&src_addr).copied(),
+                        Err(_) => None,
                     };
-                    (received, translated, sa)
+                    (received, src_addr, sa)
                 };
                 
                 // Update last_recv for LRU eviction tracking

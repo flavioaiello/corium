@@ -20,13 +20,17 @@ static INIT: Once = Once::new();
 /// Use RUST_LOG=debug or RUST_LOG=trace for verbose output.
 fn init_tracing() {
     INIT.call_once(|| {
-        if std::env::var("RUST_LOG").is_ok() {
-            tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-                .with_test_writer()
-                .try_init()
-                .ok();
-        }
+        let filter = if std::env::var("RUST_LOG").is_ok() {
+            tracing_subscriber::EnvFilter::from_default_env()
+        } else {
+            tracing_subscriber::EnvFilter::new("debug")
+        };
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init()
+            .ok();
     });
 }
 
