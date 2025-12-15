@@ -730,12 +730,6 @@ impl RelayTunnel {
         }
     }
     
-    /// Get the identity of the peer at the other end of this tunnel.
-    #[allow(dead_code)]
-    pub fn peer_identity(&self) -> &Identity {
-        &self.peer_identity
-    }
-    
     /// Get how long this tunnel has been established.
     /// Used for diagnostics, telemetry logging, and by `is_older_than()`.
     pub fn age(&self) -> Duration {
