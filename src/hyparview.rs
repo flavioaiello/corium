@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use rand::seq::IteratorRandom;
 use rand::SeedableRng;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::identity::Identity;
@@ -57,10 +59,10 @@ enum Command {
     HandleMessage { from: Identity, message: HyParViewMessage },
     HandlePeerDisconnected(Identity),
     Quit,
-    // Queries with response channels (useful for debugging/monitoring)
-    #[allow(dead_code)]
+    // Test-only queries with response channels
+    #[cfg(test)]
     GetActiveView(oneshot::Sender<HashSet<Identity>>),
-    #[allow(dead_code)]
+    #[cfg(test)]
     GetPassiveView(oneshot::Sender<HashSet<Identity>>),
 }
 
@@ -110,7 +112,8 @@ impl HyParView {
         let _ = self.cmd_tx.send(Command::Quit).await;
     }
 
-    #[allow(dead_code)]
+    /// Query the active view (connected peers). Test-only.
+    #[cfg(test)]
     pub async fn active_view(&self) -> HashSet<Identity> {
         let (tx, rx) = oneshot::channel();
         if self.cmd_tx.send(Command::GetActiveView(tx)).await.is_err() {
@@ -119,7 +122,8 @@ impl HyParView {
         rx.await.unwrap_or_default()
     }
 
-    #[allow(dead_code)]
+    /// Query the passive view (known but not connected peers). Test-only.
+    #[cfg(test)]
     pub async fn passive_view(&self) -> HashSet<Identity> {
         let (tx, rx) = oneshot::channel();
         if self.cmd_tx.send(Command::GetPassiveView(tx)).await.is_err() {
@@ -184,9 +188,11 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
                             self.quit().await;
                             break;
                         }
+                        #[cfg(test)]
                         Some(Command::GetActiveView(tx)) => {
                             let _ = tx.send(self.active_view.clone());
                         }
+                        #[cfg(test)]
                         Some(Command::GetPassiveView(tx)) => {
                             let _ = tx.send(self.passive_view.clone());
                         }
@@ -618,14 +624,24 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
     }
 
     async fn emit_neighbor_up(&self, peer: Identity) {
-        debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "neighbor up");
+        debug!(
+            peer = %hex::encode(&peer.as_bytes()[..8]),
+            active_view_size = self.active_view.len(),
+            passive_view_size = self.passive_view.len(),
+            "neighbor up"
+        );
         if let Some(ref callback) = self.neighbor_callback {
             callback.neighbor_up(peer).await;
         }
     }
 
     async fn emit_neighbor_down(&self, peer: &Identity) {
-        debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "neighbor down");
+        debug!(
+            peer = %hex::encode(&peer.as_bytes()[..8]),
+            active_view_size = self.active_view.len(),
+            passive_view_size = self.passive_view.len(),
+            "neighbor down"
+        );
         if let Some(ref callback) = self.neighbor_callback {
             callback.neighbor_down(peer).await;
         }
