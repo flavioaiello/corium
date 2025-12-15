@@ -11,17 +11,15 @@ Corium is a high-performance, secure, and adaptive mesh networking library writt
 
 ## Why Corium?
 
-| Feature | Description |
-|---------|-------------|
-| **Zero-Config NAT Traversal** | SmartSock automatically punches holes through NATs and relays traffic when necessary |
-| **Adaptive DHT** | Kademlia-based DHT with adaptive `k` and `α` parameters that adjust to network churn |
-| **Efficient PubSub** | PlumTree protocol for scalable message propagation with automatic tree repair |
-| **Secure by Default** | Ed25519 identities + QUIC/TLS 1.3 encryption with mutual authentication |
-| **Simple API** | High-level async API for bootstrapping, messaging, and peer discovery |
+- **Zero Configuration** — Self-organizing mesh with automatic peer discovery
+- **NAT Traversal** — Built-in relay infrastructure and path probing via SmartSock
+- **Secure by Default** — Ed25519 identities with mutual TLS on every connection
+- **Adaptive Performance** — Latency-tiered DHT with automatic path optimization
+- **Complete Stack** — DHT storage, PubSub messaging, direct messaging, and membership management
 
 ## Quick Start
 
-Add `corium` to your `Cargo.toml`:
+Add Corium to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -33,20 +31,17 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use corium::Node;
-use anyhow::Result;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
+    // Bind to any available port
     let node = Node::bind("0.0.0.0:0").await?;
     
-    println!("Listening on {}", node.local_addr()?);
-    println!("Identity: {}", node.identity());
+    println!("Node identity: {}", node.identity());
+    println!("Listening on: {}", node.local_addr()?);
     
     // Bootstrap from an existing peer
-    node.bootstrap(
-        "abc123...",                    // peer identity (64 hex chars)
-        "192.168.1.100:4433"            // peer address
-    ).await?;
+    node.bootstrap("peer_identity_hex", "192.168.1.100:4433").await?;
     
     Ok(())
 }
@@ -56,54 +51,58 @@ async fn main() -> Result<()> {
 
 ```rust
 // Subscribe to a topic
-node.subscribe("chat/general").await?;
+node.subscribe("events/alerts").await?;
 
-// Publish a message
-node.publish("chat/general", b"Hello, world!".to_vec()).await?;
+// Publish messages (signed with your identity)
+node.publish("events/alerts", b"System update available".to_vec()).await?;
 
 // Receive messages
-let mut messages = node.messages().await?;
-while let Some(msg) = messages.recv().await {
-    println!("[{}] {}: {}", msg.topic, msg.from, String::from_utf8_lossy(&msg.data));
+let mut rx = node.messages().await?;
+while let Some(msg) = rx.recv().await {
+    println!("[{}] from {}: {:?}", msg.topic, &msg.from[..16], msg.data);
 }
 ```
 
 ### Direct Messaging
 
 ```rust
-// Send a direct message to a peer by identity
-node.send_direct("abc123...", b"Secret message".to_vec()).await?;
+// Send direct message to a peer (resolved via DHT)
+node.send_direct("peer_identity_hex", b"Hello!".to_vec()).await?;
 
 // Receive direct messages
-let mut dms = node.direct_messages().await?;
-while let Some((from, data)) = dms.recv().await {
-    println!("DM from {}: {}", from, String::from_utf8_lossy(&data));
+let mut dm_rx = node.direct_messages().await?;
+while let Some((from, data)) = dm_rx.recv().await {
+    println!("DM from {}: {:?}", &from[..16], data);
 }
 ```
 
-### Peer Discovery
+### DHT Storage
 
 ```rust
-// Connect to a peer by identity (DHT lookup + SmartConnect)
-let conn = node.connect_peer("abc123...").await?;
+// Store content-addressed data (key = blake3 hash)
+let key = node.put(b"my data".to_vec()).await?;
 
-// Find peers close to a target identity
-let peers = node.find_peers(target_identity).await?;
+// Store at a specific key
+node.put_at(key, b"updated data".to_vec()).await?;
 
-// Resolve a peer's endpoint record from DHT
-let record = node.resolve_peer(&peer_identity).await?;
+// Retrieve data
+if let Some(data) = node.get(&key).await? {
+    println!("Retrieved: {:?}", data);
+}
 ```
 
 ### NAT Traversal
 
 ```rust
-// Automatically detect NAT and configure relay if needed
-let (is_public, relay, incoming_rx) = node
-    .configure_nat(&helper_contact, vec![local_addr.to_string()])
-    .await?;
+// Automatic NAT configuration
+let (is_public, relay, incoming_rx) = node.configure_nat(&helper_peer, addresses).await?;
 
-if !is_public {
-    // NAT-bound: handle incoming relay connections
+if is_public {
+    println!("Publicly reachable - can serve as relay");
+} else {
+    println!("Behind NAT - using relay: {:?}", relay);
+    
+    // Handle incoming relay connections
     if let Some(mut rx) = incoming_rx {
         while let Some(incoming) = rx.recv().await {
             node.accept_incoming(&incoming).await?;
@@ -115,205 +114,230 @@ if !is_public {
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                           Node                                   │
-│  (Public API: bind, bootstrap, publish, subscribe, connect)     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │   PlumTree   │  │  HyParView   │  │       DhtNode        │   │
-│  │   (PubSub)   │  │  (Overlay)   │  │   (Peer Discovery)   │   │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘   │
-│         │                 │                      │               │
-│         └─────────────────┼──────────────────────┘               │
-│                           │                                      │
-│                    ┌──────▼───────┐                              │
-│                    │   RpcNode    │                              │
-│                    │  (RPC Layer) │                              │
-│                    └──────┬───────┘                              │
-│                           │                                      │
-│         ┌─────────────────┼─────────────────┐                    │
-│         │                 │                 │                    │
-│  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐           │
-│  │   SmartSock  │  │    QUIC      │  │ RelayServer  │           │
-│  │ (Path Mgmt)  │  │  (Endpoint)  │  │(Actor-based) │           │
-│  └──────────────┘  └──────────────┘  └──────────────┘           │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                              Node                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐ │
+│  │   PlumTree  │  │  HyParView  │  │     DHT     │  │   Relay    │ │
+│  │   (PubSub)  │  │ (Membership)│  │  (Storage)  │  │  (Client)  │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────┬──────┘ │
+│         │                │                │                │        │
+│  ┌──────┴────────────────┴────────────────┴────────────────┴──────┐ │
+│  │                          RpcNode                               │ │
+│  │            (Connection pooling, request routing)               │ │
+│  └────────────────────────────┬───────────────────────────────────┘ │
+│  ┌────────────────────────────┴───────────────────────────────────┐ │
+│  │                         SmartSock                              │ │
+│  │  (Path probing, relay tunnels, virtual addressing, QUIC mux)   │ │
+│  └────────────────────────────┬───────────────────────────────────┘ │
+│  ┌────────────────────────────┴───────────────────────────────────┐ │
+│  │                       QUIC (Quinn)                             │ │
+│  └────────────────────────────┬───────────────────────────────────┘ │
+│  ┌────────────────────────────┴───────────────────────────────────┐ │
+│  │                   UDP Socket + Relay Server                    │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Module Overview
 
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `node.rs` | ~545 | Public API facade, orchestrates all subsystems |
-| `transport.rs` | ~1705 | SmartSock, path probing, relay tunneling, virtual addressing |
-| `rpc.rs` | ~1480 | Connection caching, RPC dispatch, SmartConnect logic |
-| `dht.rs` | ~2110 | Kademlia DHT with adaptive parameters, iterative lookups |
-| `plumtree.rs` | ~1570 | Epidemic broadcast trees for PubSub |
-| `relay.rs` | ~1350 | UDP relay server/client with actor-based architecture |
-| `hyparview.rs` | ~770 | Hybrid partial view membership protocol |
-| `routing.rs` | ~610 | K-bucket routing table with rate limiting |
-| `identity.rs` | ~910 | Ed25519 keypairs, endpoint records, signatures |
-| `messages.rs` | ~650 | RPC message types and serialization |
-| `storage.rs` | ~575 | Local DHT storage with quotas and rate limiting |
-| `crypto.rs` | ~395 | TLS certificates, Ed25519 verification |
+| Module | Description |
+|--------|-------------|
+| `node` | High-level facade exposing the complete public API |
+| `transport` | SmartSock with path probing, relay tunnels, and virtual addresses |
+| `rpc` | Connection pooling, RPC dispatch, and actor-based state management |
+| `dht` | Kademlia-style DHT with latency tiering and adaptive parameters |
+| `plumtree` | Epidemic broadcast trees for efficient PubSub |
+| `hyparview` | Hybrid partial view membership protocol |
+| `relay` | UDP relay server and client for NAT traversal |
+| `crypto` | Ed25519 certificates, identity verification, custom TLS |
+| `identity` | Keypairs, endpoint records, and signed address publication |
+| `storage` | LRU storage with per-peer quotas and pressure-based eviction |
+| `routing` | Kademlia routing table with bucket refresh |
+| `messages` | Protocol message types and bounded serialization |
 
 ## Core Concepts
 
-### Identity (Zero-Hash Architecture)
+### Identity (Ed25519 Public Keys)
 
-Node identities are Ed25519 public keys (32 bytes, displayed as 64 hex characters). This "Zero-Hash" approach means the node ID *is* the public key—no separate hash mapping required.
+Every node has a cryptographic identity derived from an Ed25519 keypair:
 
 ```rust
-let keypair = Keypair::generate();
-let identity: Identity = keypair.identity();  // [u8; 32]
-println!("{}", identity);  // 64 hex chars
+let node = Node::bind("0.0.0.0:0").await?;
+let identity: String = node.identity();  // 64 hex characters (32 bytes)
+let keypair = node.keypair();            // Access for signing
 ```
+
+Identities are:
+- **Self-certifying** — The identity IS the public key
+- **Collision-resistant** — 256-bit space makes collisions infeasible
+- **Verifiable** — Every connection verifies peer identity via mTLS
 
 ### Contact
 
-A `Contact` represents a reachable peer: identity + network addresses.
+A `Contact` represents a reachable peer:
 
 ```rust
 pub struct Contact {
-    pub identity: Identity,
-    pub addr: String,        // Primary address
-    pub addrs: Vec<String>,  // Additional addresses
+    pub identity: Identity,   // Ed25519 public key
+    pub addr: String,         // Primary address (IP:port)
+    pub addrs: Vec<String>,   // Additional addresses
 }
 ```
 
 ### SmartAddr (Virtual Addressing)
 
-SmartSock maps identities to virtual IPv6 addresses in the `fd00:c0f1::/48` prefix, enabling identity-based routing through QUIC.
+SmartSock maps identities to virtual IPv6 addresses in the `fd00:c0f1::/32` range:
+
+```
+Identity (32 bytes) → blake3 hash → fd00:c0f1:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
+```
+
+This enables:
+- **Transparent path switching** — QUIC sees stable addresses while SmartSock handles path changes
+- **Relay abstraction** — Applications use identity-based addressing regardless of NAT status
 
 ### SmartConnect
 
-When connecting to a peer, Corium uses a multi-stage approach:
+Automatic connection establishment with fallback:
 
-1. **Direct Connection**: Try connecting directly to peer's addresses
-2. **DHT Path Nodes**: Nodes contacted during DHT lookup become relay candidates
-3. **Relay Fallback**: If direct fails, negotiate relay through path nodes
-4. **Path Probing**: Continuously probe for better paths after connection
+1. **Try direct connection** to published addresses
+2. **If direct fails**, use peer's designated relays
+3. **Configure relay tunnel** and establish QUIC connection through relay
+
+```rust
+// SmartConnect handles all complexity internally
+let conn = node.connect_peer("target_identity_hex").await?;
+```
 
 ## NAT Traversal
 
 ### How SmartSock Works
 
-```
-┌────────┐                    ┌────────┐                    ┌────────┐
-│ Node A │                    │ Relay  │                    │ Node B │
-│ (NAT)  │                    │        │                    │ (NAT)  │
-└───┬────┘                    └───┬────┘                    └───┬────┘
-    │                             │                             │
-    │ 1. Try direct connect       │                             │
-    │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-    │                             │                             │
-    │ 2. If failed, request relay │                             │
-    │────────────────────────────▶│                             │
-    │                             │ 3. Notify target            │
-    │                             │────────────────────────────▶│
-    │                             │                             │
-    │                             │◀────────────────────────────│
-    │◀────────────────────────────│ 4. Relay established        │
-    │                             │                             │
-    │ 5. CRLY-framed packets      │                             │
-    │════════════════════════════▶│════════════════════════════▶│
-    │◀════════════════════════════│◀════════════════════════════│
-    │                             │                             │
-    │ 6. Path probing (SMPR)      │                             │
-    │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-    │                             │                             │
-    │ 7. Upgrade to direct if possible                          │
-    │──────────────────────────────────────────────────────────▶│
-```
+SmartSock implements transparent NAT traversal:
+
+1. **Path Probing** — Periodic probes measure RTT to all known paths
+2. **Path Selection** — Best path chosen (direct preferred, relay as fallback)
+3. **Relay Tunnels** — UDP packets wrapped in CRLY frames through relay
+4. **Automatic Upgrade** — Switch from relay to direct when hole-punch succeeds
 
 ### Protocol Headers
 
-| Protocol | Magic | Description |
-|----------|-------|-------------|
-| Relay Tunnel | `CRLY` | 4-byte magic + 16-byte session ID + payload |
-| Path Probe | `SMPR` | Request (0x01) / Response (0x02) with RTT measurement |
+**Path Probe (SMPR)**
+```
+┌──────────┬──────────┬──────────┬──────────────┐
+│  Magic   │   Type   │  Tx ID   │  Timestamp   │
+│  4 bytes │  1 byte  │  8 bytes │   8 bytes    │
+└──────────┴──────────┴──────────┴──────────────┘
+```
 
-### Path Selection
+**Relay Frame (CRLY)**
+```
+┌──────────┬──────────────┬──────────────────────┐
+│  Magic   │  Session ID  │    QUIC Payload      │
+│  4 bytes │   16 bytes   │     (variable)       │
+└──────────┴──────────────┴──────────────────────┘
+```
 
-SmartSock maintains a `PeerPathState` for each peer with:
-- **Direct candidates**: Known IP addresses
-- **Relay candidates**: Available relay tunnels
-- **Active path**: Currently selected path
-- **RTT measurements**: Exponential moving average (α=0.2)
+### Path Selection Algorithm
 
-Direct paths are preferred unless relay is significantly faster (>50ms advantage).
+```
+if direct_path.rtt + 10ms < current_path.rtt:
+    switch to direct_path
+elif relay_path.rtt + 50ms < direct_path.rtt:
+    switch to relay_path (relay gets 50ms handicap)
+```
 
 ## DHT (Distributed Hash Table)
 
 ### Kademlia Implementation
 
-- **XOR Distance Metric**: Peers organized by XOR distance from target
-- **K-Buckets**: 256 buckets for 256-bit key space
-- **Iterative Lookups**: Parallel queries with configurable α
-- **Adaptive Parameters**: `k` and `α` adjust based on churn rate
+- **256 k-buckets** with configurable k (default: 20, adaptive: 10-30)
+- **Iterative lookups** with configurable α (default: 3, adaptive: 2-5)
+- **Content-addressed storage** using blake3 hashing
 
 ### Key Operations
 
 ```rust
-// Store a value
-dht.store(key, value).await?;
+// Store and retrieve
+let key = node.put(data).await?;
+let value = node.get(&key).await?;
 
-// Retrieve a value
-let value = dht.get(key).await?;
+// Find peers near a target
+let peers = node.find_peers(target_identity).await?;
 
-// Find nodes close to a key
-let nodes = dht.find_node(target).await?;
+// Resolve peer's published endpoint record
+let record = node.resolve_peer(&peer_id).await?;
 ```
 
 ### Latency Tiering
 
-Peers are clustered by RTT into tiers:
-- **Tier 0**: Fastest peers (used for lookups)
-- **Tier 1-N**: Progressively slower peers (used for storage offloading)
+The DHT implements Coral-inspired latency tiering:
+
+- **RTT samples** collected per peer (up to 32 samples)
+- **K-means clustering** groups peers into 1-7 latency tiers
+- **Tiered lookups** prefer faster peers for lower latency
+- **Cold storage offload** moves evicted data to slower tiers
 
 ## PlumTree (PubSub)
 
 ### Epidemic Broadcast Trees
 
-PlumTree combines gossip reliability with tree efficiency:
-
-1. **Eager Push**: Forward full messages to `eager_peers` (default: 4)
-2. **Lazy Push**: Send `IHave` to `lazy_peers` (default: 6)
-3. **IWant**: Request missing messages
-4. **Graft/Prune**: Dynamically repair the broadcast tree
+PlumTree combines:
+- **Eager push** — Fast tree-based delivery to connected peers
+- **Lazy push** — IHave/IWant recovery via gossip mesh
+- **Automatic repair** — Tree rebuilds on peer failure
 
 ### Message Flow
 
 ```
-Publisher ──▶ Eager Peers ──▶ Their Eager Peers ──▶ ...
-     │              │
-     └── IHave ────▶ Lazy Peers (request via IWant if needed)
+Publisher → Eager Push (tree) → Subscribers
+              ↓
+         Lazy Push (IHave)
+              ↓
+         IWant requests
+              ↓
+         Message recovery
 ```
 
 ### Message Authentication
 
-All PubSub messages are signed with the sender's Ed25519 key:
+All published messages include Ed25519 signatures:
 
 ```rust
-pub struct PlumTreeMessage::Publish {
-    topic: String,
-    msg_id: [u8; 32],
-    source: Identity,
-    seqno: u64,
-    data: Vec<u8>,
-    signature: Vec<u8>,  // Ed25519 signature
-}
+// Messages are signed with publisher's keypair
+node.publish("topic", data).await?;
+
+// Signatures verified on receipt (invalid messages rejected)
+let msg = rx.recv().await?;  // msg.from is verified sender
 ```
+
+### Rate Limiting
+
+| Limit | Value |
+|-------|-------|
+| Publish rate | 100/sec |
+| Per-peer receive rate | 50/sec |
+| Max message size | 64 KB |
+| Max topics | 10,000 |
+| Max peers per topic | 1,000 |
 
 ## HyParView (Membership)
 
-Maintains a robust overlay network with:
-- **Active View**: Small set of direct connections (default: 5)
-- **Passive View**: Larger pool of known peers (default: 30)
-- **Shuffle Protocol**: Periodically exchanges peers to improve connectivity
-- **Forward Join**: New nodes propagate through the network
+Hybrid Partial View membership protocol:
+
+- **Active view** (5 peers) — Fully connected TCP/QUIC links
+- **Passive view** (30 peers) — Known but not connected
+- **Shuffle protocol** — Periodic peer exchange
+- **Failure detection** — Automatic promotion from passive view
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│   Active View   │────▶│  Passive View   │
+│   (connected)   │◀────│   (standby)     │
+└─────────────────┘     └─────────────────┘
+        │                       │
+        └───────Shuffle─────────┘
+```
 
 ## Security
 
@@ -321,26 +345,24 @@ Maintains a robust overlay network with:
 
 | Layer | Protection |
 |-------|------------|
-| **Transport** | TLS 1.3 via QUIC (mutual authentication) |
-| **Identity** | Ed25519 key pairs, certificates embed public key |
-| **Messages** | Signed PubSub, bounded deserialization |
-| **Resources** | Rate limiting, bounded collections, timeouts |
+| **Identity** | Ed25519 keypairs, identity = public key |
+| **Transport** | Mutual TLS on all QUIC connections |
+| **RPC** | Identity verification on every request |
+| **Storage** | Per-peer quotas, rate limiting, content validation |
+| **Routing** | Rate-limited insertions, ping verification |
+| **PubSub** | Message signatures, replay protection |
 
 ### Security Constants
 
-```rust
-const MAX_VALUE_SIZE: usize = 1024 * 1024;           // 1 MB max DHT value
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;           // 64 KB max PubSub message
-const MAX_CONTACTS_PER_RESPONSE: usize = 100;        // Limit DHT response size
-const CONNECTION_STALE_TIMEOUT: Duration = 60s;      // Connection cache TTL
-const RPC_STREAM_TIMEOUT: Duration = 30s;            // RPC timeout
-
-// Relay security limits
-const MAX_SESSIONS: usize = 10_000;                  // Max relay sessions
-const MAX_SIGNALING_CHANNELS: usize = 10_000;        // Max NAT signaling registrations
-const SESSION_TIMEOUT: Duration = 300s;              // Active session TTL
-const PENDING_SESSION_TIMEOUT: Duration = 30s;       // Incomplete session TTL
-```
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MAX_VALUE_SIZE` | 1 MB | DHT value limit |
+| `MAX_RESPONSE_SIZE` | 1 MB | RPC response limit |
+| `MAX_SESSIONS` | 10,000 | Relay session limit |
+| `MAX_SESSIONS_PER_IP` | 50 | Per-IP relay rate limit |
+| `PER_PEER_STORAGE_QUOTA` | 1 MB | DHT storage per peer |
+| `PER_PEER_ENTRY_LIMIT` | 100 | DHT entries per peer |
+| `MAX_CONCURRENT_STREAMS` | 64 | QUIC streams per connection |
 
 ## CLI Usage
 
@@ -348,30 +370,32 @@ const PENDING_SESSION_TIMEOUT: Duration = 30s;       // Incomplete session TTL
 
 ```bash
 # Start a node on a random port
-cargo run --release
+cargo run
 
 # Start with specific bind address
-cargo run --release -- --bind 0.0.0.0:4433
+cargo run -- --bind 0.0.0.0:4433
 
 # Bootstrap from existing peer
-cargo run --release -- -B 192.168.1.100:4433/abc123...
+cargo run -- --bootstrap 192.168.1.100:4433/abc123...def456
+
+# With debug logging
+RUST_LOG=debug cargo run
 ```
 
 ### Chatroom Example
 
 ```bash
-# Start first node
-cargo run --release --example chatroom -- --name Alice --room general
+# Terminal 1: Start first node
+cargo run --example chatroom -- --name Alice --room dev
 
-# Join from another terminal (copy bootstrap string from first node)
-cargo run --release --example chatroom -- --name Bob --room general -B <bootstrap_string>
+# Terminal 2: Join with bootstrap (copy the bootstrap string from Terminal 1)
+cargo run --example chatroom -- --name Bob --room dev --bootstrap <bootstrap_string>
 ```
 
-Commands in chatroom:
-- Type message and press Enter to broadcast
-- `/dm <identity> <message>` - Send direct message
-- `/peers` - List known peers
-- `/quit` - Exit
+The chatroom demonstrates:
+- PubSub messaging (`/room` messages)
+- Direct messaging (`/dm <identity> <message>`)
+- Peer discovery (`/peers`)
 
 ## Testing
 
@@ -388,7 +412,10 @@ cargo test test_smart_addr
 # Run integration tests
 cargo test --test node_public_api
 
-# Spawn local cluster
+# Run relay tests
+cargo test --test relay_infrastructure
+
+# Spawn local cluster (7 nodes)
 ./scripts/spawn_cluster.sh
 ```
 
@@ -404,6 +431,8 @@ cargo test --test node_public_api
 | `bincode` | Binary serialization |
 | `lru` | LRU caches |
 | `tracing` | Structured logging |
+| `rcgen` | X.509 certificate generation |
+| `x509-parser` | Certificate parsing |
 
 ## References
 
