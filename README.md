@@ -94,6 +94,24 @@ let peers = node.find_peers(target_identity).await?;
 let record = node.resolve_peer(&peer_identity).await?;
 ```
 
+### NAT Traversal
+
+```rust
+// Automatically detect NAT and configure relay if needed
+let (is_public, relay, incoming_rx) = node
+    .configure_nat(&helper_contact, vec![local_addr.to_string()])
+    .await?;
+
+if !is_public {
+    // NAT-bound: handle incoming relay connections
+    if let Some(mut rx) = incoming_rx {
+        while let Some(incoming) = rx.recv().await {
+            node.accept_incoming(&incoming).await?;
+        }
+    }
+}
+```
+
 ## Architecture
 
 ```
@@ -117,8 +135,8 @@ let record = node.resolve_peer(&peer_identity).await?;
 │         ┌─────────────────┼─────────────────┐                    │
 │         │                 │                 │                    │
 │  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐           │
-│  │   SmartSock  │  │    QUIC      │  │  UdpRelay    │           │
-│  │ (Path Mgmt)  │  │  (Endpoint)  │  │   Server     │           │
+│  │   SmartSock  │  │    QUIC      │  │ RelayServer  │           │
+│  │ (Path Mgmt)  │  │  (Endpoint)  │  │(Actor-based) │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -128,16 +146,18 @@ let record = node.resolve_peer(&peer_identity).await?;
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `node.rs` | ~370 | Public API facade, orchestrates all subsystems |
-| `transport.rs` | ~2260 | SmartSock, path probing, relay tunneling, virtual addressing |
-| `rpc.rs` | ~1190 | Connection caching, RPC dispatch, SmartConnect logic |
-| `dht.rs` | ~2560 | Kademlia DHT with adaptive parameters, iterative lookups |
+| `node.rs` | ~545 | Public API facade, orchestrates all subsystems |
+| `transport.rs` | ~1705 | SmartSock, path probing, relay tunneling, virtual addressing |
+| `rpc.rs` | ~1480 | Connection caching, RPC dispatch, SmartConnect logic |
+| `dht.rs` | ~2110 | Kademlia DHT with adaptive parameters, iterative lookups |
 | `plumtree.rs` | ~1570 | Epidemic broadcast trees for PubSub |
+| `relay.rs` | ~1350 | UDP relay server/client with actor-based architecture |
 | `hyparview.rs` | ~770 | Hybrid partial view membership protocol |
 | `routing.rs` | ~610 | K-bucket routing table with rate limiting |
-| `identity.rs` | ~880 | Ed25519 keypairs, endpoint records, signatures |
-| `messages.rs` | ~630 | RPC message types and serialization |
-| `crypto.rs` | ~400 | TLS certificates, Ed25519 verification |
+| `identity.rs` | ~910 | Ed25519 keypairs, endpoint records, signatures |
+| `messages.rs` | ~650 | RPC message types and serialization |
+| `storage.rs` | ~575 | Local DHT storage with quotas and rate limiting |
+| `crypto.rs` | ~395 | TLS certificates, Ed25519 verification |
 
 ## Core Concepts
 
@@ -314,6 +334,12 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;           // 64 KB max PubSub message
 const MAX_CONTACTS_PER_RESPONSE: usize = 100;        // Limit DHT response size
 const CONNECTION_STALE_TIMEOUT: Duration = 60s;      // Connection cache TTL
 const RPC_STREAM_TIMEOUT: Duration = 30s;            // RPC timeout
+
+// Relay security limits
+const MAX_SESSIONS: usize = 10_000;                  // Max relay sessions
+const MAX_SIGNALING_CHANNELS: usize = 10_000;        // Max NAT signaling registrations
+const SESSION_TIMEOUT: Duration = 300s;              // Active session TTL
+const PENDING_SESSION_TIMEOUT: Duration = 30s;       // Incomplete session TTL
 ```
 
 ## CLI Usage
