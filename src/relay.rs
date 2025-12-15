@@ -737,8 +737,7 @@ impl RelayTunnel {
     }
     
     /// Get how long this tunnel has been established.
-    /// Used for diagnostics and by `is_older_than()`.
-    #[allow(dead_code)]
+    /// Used for diagnostics, telemetry logging, and by `is_older_than()`.
     pub fn age(&self) -> Duration {
         self.established_at.elapsed()
     }

@@ -1118,7 +1118,7 @@ impl SmartSock {
     /// Clean up relay tunnels that have been idle longer than RELAY_TUNNEL_STALE_TIMEOUT.
     /// This provides defense-in-depth against leaks if connection-close cleanup is missed.
     pub async fn cleanup_stale_relay_tunnels(&self) -> usize {
-        let mut stale_tunnels: Vec<(SmartAddr, [u8; 16], std::net::SocketAddr)> = Vec::new();
+        let mut stale_tunnels: Vec<(SmartAddr, [u8; 16], std::net::SocketAddr, u64)> = Vec::new();
         
         // First pass: identify stale tunnels while holding the lock
         {
@@ -1126,7 +1126,7 @@ impl SmartSock {
             for (smart_addr, state) in peers.iter() {
                 for (session_id, tunnel) in &state.relay_tunnels {
                     if tunnel.is_older_than(RELAY_TUNNEL_STALE_TIMEOUT) {
-                        stale_tunnels.push((*smart_addr, *session_id, tunnel.relay_addr));
+                        stale_tunnels.push((*smart_addr, *session_id, tunnel.relay_addr, tunnel.age().as_secs()));
                     }
                 }
             }
@@ -1140,7 +1140,7 @@ impl SmartSock {
         let mut removed_count = 0;
         {
             let mut peers = self.peers.write().await;
-            for (smart_addr, session_id, relay_addr) in &stale_tunnels {
+            for (smart_addr, session_id, relay_addr, age_secs) in &stale_tunnels {
                 if let Some(state) = peers.get_mut(smart_addr) {
                     if state.relay_tunnels.remove(session_id).is_some() {
                         removed_count += 1;
@@ -1148,8 +1148,8 @@ impl SmartSock {
                             peer = ?state.identity,
                             session = hex::encode(session_id),
                             relay = %relay_addr,
-                            "removed stale relay tunnel (age exceeded {}s)",
-                            RELAY_TUNNEL_STALE_TIMEOUT.as_secs()
+                            age_secs = age_secs,
+                            "removed stale relay tunnel"
                         );
                     }
                 }
@@ -1159,7 +1159,7 @@ impl SmartSock {
         // Third pass: clean up reverse map
         if removed_count > 0 {
             let mut reverse = self.reverse_map.write().await;
-            for (_, _, relay_addr) in stale_tunnels {
+            for (_, _, relay_addr, _) in stale_tunnels {
                 reverse.remove(&relay_addr);
             }
         }

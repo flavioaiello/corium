@@ -245,7 +245,7 @@ impl RoutingTable {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn update(&mut self, contact: Contact) {
         let _ = self.update_with_pending(contact);
     }

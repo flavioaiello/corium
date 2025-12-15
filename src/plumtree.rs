@@ -246,7 +246,7 @@ impl TopicState {
 
     /// Add a peer as eager. If eager count exceeds target, demotes oldest eager to lazy.
     /// Returns true if peer was added (as eager or lazy), false if at MAX_PEERS_PER_TOPIC.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn add_eager(&mut self, peer: Identity) -> bool {
         self.add_peer_with_limits(peer, usize::MAX, usize::MAX)
     }
@@ -280,7 +280,7 @@ impl TopicState {
     }
 
     /// Promote a peer to eager if under target, otherwise add as lazy.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn promote_to_eager(&mut self, peer: Identity) {
         self.promote_to_eager_with_limit(peer, usize::MAX)
     }
@@ -495,9 +495,6 @@ enum Command {
     NeighborDown(Identity),
     GetSubscriptions(oneshot::Sender<Vec<String>>),
     Quit,
-    // Debug/Test accessors
-    GetEagerPeers(String, oneshot::Sender<Vec<Identity>>),
-    GetLazyPeers(String, oneshot::Sender<Vec<Identity>>),
 }
 
 
@@ -564,25 +561,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
     pub async fn quit(&self) {
         let _ = self.cmd_tx.send(Command::Quit).await;
-    }
-
-    // Test helpers
-    #[allow(dead_code)]
-    pub async fn eager_peers(&self, topic: &str) -> Vec<Identity> {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::GetEagerPeers(topic.to_string(), tx)).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub async fn lazy_peers(&self, topic: &str) -> Vec<Identity> {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::GetLazyPeers(topic.to_string(), tx)).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
     }
 }
 
@@ -685,18 +663,6 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                         }
                         Some(Command::GetSubscriptions(reply)) => {
                             let _ = reply.send(self.subscriptions.iter().cloned().collect());
-                        }
-                        Some(Command::GetEagerPeers(topic, reply)) => {
-                            let peers = self.topics.get(&topic)
-                                .map(|s| s.eager_peers.iter().copied().collect())
-                                .unwrap_or_default();
-                            let _ = reply.send(peers);
-                        }
-                        Some(Command::GetLazyPeers(topic, reply)) => {
-                            let peers = self.topics.get(&topic)
-                                .map(|s| s.lazy_peers.iter().copied().collect())
-                                .unwrap_or_default();
-                            let _ = reply.send(peers);
                         }
                         Some(Command::Quit) => {
                             debug!("PlumTree actor quitting");
