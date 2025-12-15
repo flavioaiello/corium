@@ -100,7 +100,6 @@ pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
 
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RelaySession {
     pub session_id: [u8; 16],
     pub peer_a_identity: Identity,
@@ -136,11 +135,23 @@ impl RelaySession {
         }
     }
 
+    /// Returns the session ID as a hex string (useful for logging).
+    pub fn session_id_hex(&self) -> String {
+        hex::encode(self.session_id)
+    }
+
+    /// Returns the session age (time since creation).
+    pub fn age(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
     pub fn is_complete(&self) -> bool {
         self.peer_b_addr.is_some()
     }
 
     pub fn is_expired(&self) -> bool {
+        // Sessions expire based on inactivity only.
+        // Active sessions stay alive indefinitely to avoid sudden connection drops.
         if self.is_complete() {
             self.last_activity.elapsed() > SESSION_TIMEOUT
         } else {
@@ -1127,14 +1138,17 @@ impl RelayServerActor {
     fn cleanup_expired(&mut self) -> usize {
         let before = self.sessions.len();
         
-        self.sessions.retain(|session_id, session| {
+        self.sessions.retain(|_session_id, session| {
             if session.is_expired() {
                 self.addr_to_session.remove(&session.peer_a_addr);
                 if let Some(peer_b) = session.peer_b_addr {
                     self.addr_to_session.remove(&peer_b);
                 }
                 trace!(
-                    session = hex::encode(session_id),
+                    session = session.session_id_hex(),
+                    age_secs = session.age().as_secs(),
+                    bytes_relayed = session.bytes_relayed,
+                    packets_relayed = session.packets_relayed,
                     "expired relay session"
                 );
                 false
@@ -1298,6 +1312,7 @@ mod tests {
         let session = RelaySession::new_pending(session_id, peer_a, peer_b, peer_a_addr);
 
         assert_eq!(session.session_id, session_id);
+        assert_eq!(session.session_id_hex(), hex::encode(session_id));
         assert_eq!(session.peer_a_identity, peer_a);
         assert_eq!(session.peer_b_identity, peer_b);
         assert_eq!(session.peer_a_addr, peer_a_addr);
@@ -1305,6 +1320,9 @@ mod tests {
         assert!(!session.is_complete());
         assert_eq!(session.bytes_relayed, 0);
         assert_eq!(session.packets_relayed, 0);
+        
+        // created_at should be recent
+        assert!(session.age() < Duration::from_secs(1));
     }
 
     #[test]

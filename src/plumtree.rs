@@ -14,13 +14,13 @@ use crate::messages::{MessageId, PlumTreeMessage};
 use crate::rpc::PlumTreeRpc;
 
 
-pub const DEFAULT_EAGER_PEERS: usize = 4;
+pub const DEFAULT_EAGER_PEERS: usize = 6;
 pub const DEFAULT_LAZY_PEERS: usize = 6;
 pub const DEFAULT_IHAVE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_LAZY_PUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-pub const DEFAULT_MESSAGE_CACHE_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_MESSAGE_CACHE_SIZE: usize = 10_000;
+pub const DEFAULT_MESSAGE_CACHE_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_IHAVE_LENGTH: usize = 100;
 
@@ -59,18 +59,28 @@ pub const SEQNO_WINDOW_SIZE: usize = 128;
 pub const MAX_MESSAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct PlumTreeConfig {
+    /// Target number of eager peers per topic (gossip tree fanout).
     pub eager_peers: usize,
+    /// Target number of lazy peers per topic (reliability mesh).
     pub lazy_peers: usize,
+    /// Timeout for IHave/IWant exchanges.
     pub ihave_timeout: Duration,
+    /// Interval between lazy push rounds.
     pub lazy_push_interval: Duration,
+    /// Maximum number of messages in cache.
     pub message_cache_size: usize,
+    /// Time-to-live for cached messages.
     pub message_cache_ttl: Duration,
+    /// Interval between heartbeat rounds.
     pub heartbeat_interval: Duration,
+    /// Maximum message size in bytes.
     pub max_message_size: usize,
+    /// Maximum IHave message IDs per notification.
     pub max_ihave_length: usize,
+    /// Rate limit for publishing messages per second.
     pub publish_rate_limit: usize,
+    /// Rate limit for messages received per peer per second.
     pub per_peer_rate_limit: usize,
 }
 
@@ -94,13 +104,11 @@ impl Default for PlumTreeConfig {
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SignatureError {
     Missing,
     InvalidLength,
     VerificationFailed,
     InvalidPublicKey,
-    ReplayDetected,
 }
 
 fn build_signed_data(topic: &str, seqno: u64, data: &[u8]) -> Vec<u8> {
@@ -185,7 +193,6 @@ impl SeqnoTracker {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ReceivedMessage {
     pub topic: String,
     pub source: Identity,
@@ -202,6 +209,7 @@ pub(crate) struct CachedMessage {
     pub seqno: u64,
     pub data: Vec<u8>,
     pub signature: Vec<u8>,
+    pub cached_at: Instant,
 }
 
 impl CachedMessage {
@@ -236,12 +244,32 @@ impl TopicState {
         self.eager_peers.len() + self.lazy_peers.len()
     }
 
+    /// Add a peer as eager. If eager count exceeds target, demotes oldest eager to lazy.
+    /// Returns true if peer was added (as eager or lazy), false if at MAX_PEERS_PER_TOPIC.
+    #[allow(dead_code)] // Used in tests
     pub fn add_eager(&mut self, peer: Identity) -> bool {
-        if self.total_peers() >= MAX_PEERS_PER_TOPIC && !self.contains(&peer) {
+        self.add_peer_with_limits(peer, usize::MAX, usize::MAX)
+    }
+
+    /// Add a peer with enforcement of eager/lazy target limits.
+    /// If eager count would exceed target, adds as lazy instead.
+    pub fn add_peer_with_limits(&mut self, peer: Identity, eager_target: usize, lazy_target: usize) -> bool {
+        if self.contains(&peer) {
+            return true; // Already present
+        }
+        if self.total_peers() >= MAX_PEERS_PER_TOPIC {
             return false;
         }
-        self.lazy_peers.remove(&peer);
-        self.eager_peers.insert(peer);
+        
+        // Add as eager if under target, otherwise as lazy
+        if self.eager_peers.len() < eager_target {
+            self.eager_peers.insert(peer);
+        } else if self.lazy_peers.len() < lazy_target {
+            self.lazy_peers.insert(peer);
+        } else {
+            // Both at target, add as lazy anyway (will be rebalanced)
+            self.lazy_peers.insert(peer);
+        }
         true
     }
 
@@ -251,12 +279,45 @@ impl TopicState {
         }
     }
 
+    /// Promote a peer to eager if under target, otherwise add as lazy.
+    #[allow(dead_code)] // Used in tests
     pub fn promote_to_eager(&mut self, peer: Identity) {
+        self.promote_to_eager_with_limit(peer, usize::MAX)
+    }
+
+    /// Promote a peer to eager only if under the target limit.
+    pub fn promote_to_eager_with_limit(&mut self, peer: Identity, eager_target: usize) {
         let was_lazy = self.lazy_peers.remove(&peer);
         let is_eager = self.eager_peers.contains(&peer);
         
-        if was_lazy || (!is_eager && self.total_peers() < MAX_PEERS_PER_TOPIC) {
+        if is_eager {
+            return; // Already eager
+        }
+        
+        if self.eager_peers.len() < eager_target {
+            // Under target, promote to eager
             self.eager_peers.insert(peer);
+        } else if was_lazy {
+            // At target, keep as lazy
+            self.lazy_peers.insert(peer);
+        } else if self.total_peers() < MAX_PEERS_PER_TOPIC {
+            // New peer, add as lazy since eager is at target
+            self.lazy_peers.insert(peer);
+        }
+    }
+
+    /// Rebalance eager/lazy peers to match target counts.
+    /// Demotes excess eager peers to lazy.
+    pub fn rebalance(&mut self, eager_target: usize, _lazy_target: usize) {
+        // Demote excess eager peers to lazy
+        while self.eager_peers.len() > eager_target {
+            // Pick a random eager peer to demote
+            if let Some(peer) = self.eager_peers.iter().next().copied() {
+                self.eager_peers.remove(&peer);
+                self.lazy_peers.insert(peer);
+            } else {
+                break;
+            }
         }
     }
 
@@ -671,7 +732,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         
         for peer in self.known_peers.iter() {
             if *peer != self.local_identity {
-                state.add_eager(*peer);
+                state.add_peer_with_limits(*peer, self.config.eager_peers, self.config.lazy_peers);
             }
         }
 
@@ -742,6 +803,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             seqno,
             data: data.clone(),
             signature: signature.clone(),
+            cached_at: Instant::now(),
         });
 
         if let Some(state) = self.topics.get_mut(topic) {
@@ -778,6 +840,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                 msg_id,
                 received_at: Instant::now(),
             };
+            trace!(
+                topic = %received.topic,
+                seqno = received.seqno,
+                msg_id = %hex::encode(&received.msg_id[..8]),
+                data_len = received.data.len(),
+                "delivering local message to subscriber"
+            );
             if self.message_tx.send(received).await.is_err() {
                 warn!("message channel closed during local delivery");
             }
@@ -863,11 +932,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         
         for topic in self.subscriptions.iter() {
             if let Some(state) = self.topics.get_mut(topic) {
-                state.add_eager(peer);
+                state.add_peer_with_limits(peer, self.config.eager_peers, self.config.lazy_peers);
                 debug!(
                     peer = %hex::encode(&peer.as_bytes()[..8]),
                     topic = %topic,
-                    "added HyParView neighbor as eager peer"
+                    "added HyParView neighbor to topic"
                 );
             }
         }
@@ -901,11 +970,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         if let Some(state) = self.topics.get_mut(topic) {
-            state.add_eager(*from);
+            state.add_peer_with_limits(*from, self.config.eager_peers, self.config.lazy_peers);
             trace!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
                 topic = %topic,
-                "peer subscribed, added as eager"
+                "peer subscribed, added to topic"
             );
         }
     }
@@ -931,7 +1000,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         let state = self.topics.entry(topic.to_string()).or_default();
-        state.promote_to_eager(*from);
+        state.promote_to_eager_with_limit(*from, self.config.eager_peers);
         
         debug!(
             peer = %hex::encode(&from.as_bytes()[..8]),
@@ -1037,6 +1106,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             seqno,
             data: data.clone(),
             signature: signature.clone(),
+            cached_at: Instant::now(),
         });
 
         if let Some(state) = self.topics.get_mut(topic) {
@@ -1057,6 +1127,15 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                 msg_id,
                 received_at: Instant::now(),
             };
+            trace!(
+                topic = %received.topic,
+                source = %hex::encode(&received.source.as_bytes()[..8]),
+                seqno = received.seqno,
+                msg_id = %hex::encode(&received.msg_id[..8]),
+                data_len = received.data.len(),
+                latency_us = received.received_at.elapsed().as_micros(),
+                "delivering forwarded message to subscriber"
+            );
             if self.message_tx.send(received).await.is_err() {
                 warn!("message channel closed");
             }
@@ -1098,7 +1177,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         if let Some(state) = self.topics.get_mut(topic) {
-            state.promote_to_eager(*from);
+            state.promote_to_eager_with_limit(*from, self.config.eager_peers);
             
             for msg_id in &missing {
                 state.record_iwant(*msg_id, *from);
@@ -1164,6 +1243,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         let subscribed_topics: Vec<String> = self.subscriptions.iter().cloned().collect();
 
         for topic in subscribed_topics {
+            // Rebalance eager/lazy peers to respect target counts
+            if let Some(state) = self.topics.get_mut(&topic) {
+                state.rebalance(self.config.eager_peers, self.config.lazy_peers);
+            }
+            
             self.lazy_push(&topic).await;
             self.check_timeouts(&topic).await;
         }
@@ -1240,6 +1324,36 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         let now = Instant::now();
         self.rate_limits.retain(|_, limiter| !limiter.is_stale(now));
         self.outbound.retain(|_, msgs| !msgs.is_empty());
+        self.evict_expired_cache_entries();
+    }
+
+    /// Evict cache entries that have exceeded message_cache_ttl.
+    fn evict_expired_cache_entries(&mut self) {
+        let ttl = self.config.message_cache_ttl;
+        let mut expired_ids = Vec::new();
+        
+        // Collect expired message IDs
+        for (msg_id, cached) in self.message_cache.iter() {
+            if cached.cached_at.elapsed() > ttl {
+                expired_ids.push(*msg_id);
+            }
+        }
+        
+        // Remove expired entries
+        for msg_id in &expired_ids {
+            if let Some(evicted) = self.message_cache.pop(msg_id) {
+                self.message_cache_bytes = self.message_cache_bytes.saturating_sub(evicted.size_bytes());
+            }
+        }
+        
+        if !expired_ids.is_empty() {
+            trace!(
+                evicted = expired_ids.len(),
+                cache_size = self.message_cache.len(),
+                cache_bytes = self.message_cache_bytes,
+                "evicted expired messages from cache"
+            );
+        }
     }
 
 
@@ -1299,6 +1413,7 @@ mod tests {
         assert!(config.eager_peers > 0);
         assert!(config.lazy_peers > 0);
         assert!(config.message_cache_size > 0);
+        assert!(config.message_cache_ttl.as_secs() > 0);
         assert!(config.max_message_size > 0);
         assert!(config.publish_rate_limit > 0);
         assert!(config.per_peer_rate_limit > 0);
