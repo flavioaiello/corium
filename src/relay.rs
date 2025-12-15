@@ -22,10 +22,12 @@
 //! - Automatic relay discovery and best-RTT selection
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
@@ -81,6 +83,10 @@ pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum entries in addr_to_session map (bounded to prevent memory exhaustion).
 /// SECURITY: Secondary bound on address lookup table.
 pub const MAX_ADDR_TO_SESSION_ENTRIES: usize = 20_000;
+
+/// Maximum entries in ip_session_count rate limiter.
+/// SECURITY: Bounds the rate limiter itself to prevent memory exhaustion.
+pub const MAX_IP_SESSION_COUNT_ENTRIES: usize = 10_000;
 
 /// Sender for pushing signaling notifications to registered NAT nodes.
 pub type SignalingSender = mpsc::Sender<RelayResponse>;
@@ -836,17 +842,20 @@ struct RelayServerActor {
     addr_to_session: HashMap<SocketAddr, [u8; 16]>,
     signaling_channels: HashMap<Identity, SignalingSender>,
     /// Per-IP session count for rate limiting. Tracks (count, window_start).
-    ip_session_count: HashMap<std::net::IpAddr, (usize, Instant)>,
+    /// SECURITY: LruCache bounds memory growth from IP address tracking.
+    ip_session_count: LruCache<IpAddr, (usize, Instant)>,
 }
 
 impl RelayServerActor {
     fn new(socket: Arc<UdpSocket>) -> Self {
+        let ip_session_count_cap = NonZeroUsize::new(MAX_IP_SESSION_COUNT_ENTRIES)
+            .expect("MAX_IP_SESSION_COUNT_ENTRIES must be non-zero");
         Self {
             socket,
             sessions: HashMap::new(),
             addr_to_session: HashMap::new(),
             signaling_channels: HashMap::new(),
-            ip_session_count: HashMap::new(),
+            ip_session_count: LruCache::new(ip_session_count_cap),
         }
     }
 
@@ -926,9 +935,10 @@ impl RelayServerActor {
         // SECURITY: Per-IP rate limiting to prevent session exhaustion attacks
         let ip = peer_a_addr.ip();
         let now = Instant::now();
+        
+        // LruCache::get_or_insert handles bounded eviction automatically
         let (count, window_start) = self.ip_session_count
-            .entry(ip)
-            .or_insert((0, now));
+            .get_or_insert_mut(ip, || (0, now));
         
         // Reset window if expired
         if now.duration_since(*window_start) > RATE_LIMIT_WINDOW {
@@ -1204,13 +1214,9 @@ impl RelayServerActor {
             }
         });
         
-        // SECURITY: Clean up stale ip_session_count entries to prevent unbounded growth.
-        // Entries are stale if their rate limit window has expired.
-        let now = Instant::now();
-        self.ip_session_count.retain(|_ip, (count, window_start)| {
-            // Keep if window is still active and has non-zero count
-            now.duration_since(*window_start) <= RATE_LIMIT_WINDOW && *count > 0
-        });
+        // NOTE: ip_session_count cleanup is no longer needed here.
+        // The LruCache automatically evicts oldest entries when at capacity,
+        // and stale rate limit windows are reset on next access in register_session().
         
         let removed = before - self.sessions.len();
         if removed > 0 {

@@ -1311,6 +1311,10 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
 
+        // Track which message IDs we actually record for IWant requests.
+        // SECURITY: Only request messages we've tracked to prevent unbounded state.
+        let mut recorded_ids: Vec<MessageId> = Vec::with_capacity(missing.len());
+
         if let Some(state) = self.topics.get_mut(topic) {
             state.promote_to_eager_with_limit(*from, self.config.eager_peers);
             
@@ -1326,7 +1330,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                 }
                 let delta = state.record_iwant(*msg_id, *from);
                 self.global_pending_iwants = (self.global_pending_iwants as i32 + delta).max(0) as usize;
+                recorded_ids.push(*msg_id);
             }
+        }
+
+        // Only send IWant for messages we actually recorded
+        if recorded_ids.is_empty() {
+            return;
         }
 
         self.queue_message(from, PlumTreeMessage::Graft {
@@ -1334,13 +1344,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }).await;
 
         self.queue_message(from, PlumTreeMessage::IWant { 
-            msg_ids: missing.clone() 
+            msg_ids: recorded_ids.clone() 
         }).await;
 
         debug!(
             from = %hex::encode(&from.as_bytes()[..8]),
             topic = %topic,
-            missing = missing.len(),
+            missing = recorded_ids.len(),
             "IHave received, promoted sender to eager and requested missing"
         );
     }
