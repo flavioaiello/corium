@@ -437,7 +437,7 @@ impl PeerPathState {
         }
     }
 
-    #[allow(dead_code)]
+    /// Returns the currently active relay tunnel, if the active path uses a relay.
     pub fn active_tunnel(&self) -> Option<&RelayTunnel> {
         match &self.active_path {
             Some(PathChoice::Relay { session_id, .. }) => {
@@ -447,7 +447,7 @@ impl PeerPathState {
         }
     }
 
-    #[allow(dead_code)]
+    /// Returns whether the current active path uses a relay tunnel.
     pub fn is_relayed(&self) -> bool {
         matches!(self.active_path, Some(PathChoice::Relay { .. }))
     }
@@ -604,6 +604,9 @@ impl PeerPathState {
     
     pub fn maybe_switch_path(&mut self) -> Option<PathChoice> {
         let best = self.select_best_path()?;
+        let was_relayed = self.is_relayed();
+        // Capture tunnel age before switching (for diagnostics when leaving relay path)
+        let tunnel_age_secs = self.active_tunnel().map(|t| t.age().as_secs());
         
         let should_switch = match (&self.active_path, &best) {
             (None, _) => true,
@@ -624,6 +627,8 @@ impl PeerPathState {
         if should_switch {
             tracing::info!(
                 peer = ?self.identity,
+                was_relayed = was_relayed,
+                tunnel_age_secs = ?tunnel_age_secs,
                 old_path = ?self.active_path,
                 new_path = ?best,
                 "switching to better path"
