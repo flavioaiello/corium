@@ -630,12 +630,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         node
     }
 
-    #[allow(dead_code)]
+    /// Get the identity of this DHT node.
     pub fn identity(&self) -> Identity {
         self.id
     }
 
-    #[allow(dead_code)]
+    /// Get the contact information for this DHT node.
     pub fn contact(&self) -> Contact {
         self.self_contact.clone()
     }
