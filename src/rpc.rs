@@ -8,7 +8,7 @@ use lru::LruCache;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use quinn::{ClientConfig, Connection, Endpoint, Incoming};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
 use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
@@ -75,6 +75,218 @@ const RPC_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 const RELAY_ASSISTED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Command channel capacity for the RPC actor.
+const RPC_COMMAND_CHANNEL_SIZE: usize = 256;
+
+/// Interval for cleaning up stale connections.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+
+// ============================================================================
+// Actor Commands
+// ============================================================================
+
+enum RpcCommand {
+    /// Get a cached connection or establish a new one
+    GetOrConnect {
+        contact: Contact,
+        reply: oneshot::Sender<Result<Connection>>,
+    },
+    /// Cache a contact for future resolution
+    CacheContact {
+        contact: Contact,
+    },
+    /// Resolve an identity to a cached contact
+    ResolveContact {
+        identity: Identity,
+        reply: oneshot::Sender<Option<Contact>>,
+    },
+    /// Invalidate a connection after failure
+    InvalidateConnection {
+        peer_id: Identity,
+    },
+    /// Mark a connection as successfully used
+    MarkSuccess {
+        peer_id: Identity,
+    },
+    /// Shutdown the actor
+    #[allow(dead_code)]
+    Quit,
+}
+
+
+// ============================================================================
+// Actor (owns all mutable state)
+// ============================================================================
+
+struct RpcNodeActor {
+    endpoint: Endpoint,
+    client_config: ClientConfig,
+    connections: LruCache<Identity, CachedConnection>,
+    contact_cache: LruCache<Identity, Contact>,
+    in_flight: std::collections::HashSet<Identity>,
+}
+
+impl RpcNodeActor {
+    fn new(endpoint: Endpoint, client_config: ClientConfig) -> Self {
+        Self {
+            endpoint,
+            client_config,
+            connections: LruCache::new(NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()),
+            contact_cache: LruCache::new(NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()),
+            in_flight: std::collections::HashSet::new(),
+        }
+    }
+
+    async fn run(mut self, mut cmd_rx: mpsc::Receiver<RpcCommand>) {
+        let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
+        cleanup_interval.tick().await; // Skip initial tick
+
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(RpcCommand::GetOrConnect { contact, reply }) => {
+                            let result = self.get_or_connect(contact).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(RpcCommand::CacheContact { contact }) => {
+                            self.contact_cache.put(contact.identity, contact);
+                        }
+                        Some(RpcCommand::ResolveContact { identity, reply }) => {
+                            let contact = self.contact_cache.get(&identity).cloned();
+                            let _ = reply.send(contact);
+                        }
+                        Some(RpcCommand::InvalidateConnection { peer_id }) => {
+                            if self.connections.pop(&peer_id).is_some() {
+                                debug!(
+                                    peer = hex::encode(&peer_id.as_bytes()[..8]),
+                                    "invalidated cached connection after failure"
+                                );
+                            }
+                        }
+                        Some(RpcCommand::MarkSuccess { peer_id }) => {
+                            if let Some(cached) = self.connections.get_mut(&peer_id) {
+                                cached.mark_success();
+                            }
+                        }
+                        Some(RpcCommand::Quit) | None => {
+                            debug!("RpcNode actor shutting down");
+                            break;
+                        }
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    self.cleanup_stale_connections();
+                }
+            }
+        }
+    }
+
+    fn cleanup_stale_connections(&mut self) {
+        // Collect keys to remove (can't mutate while iterating)
+        let stale_peers: Vec<Identity> = self.connections
+            .iter()
+            .filter(|(_, cached)| cached.is_closed() || cached.is_stale())
+            .map(|(id, _)| *id)
+            .collect();
+
+        for peer_id in stale_peers {
+            self.connections.pop(&peer_id);
+            trace!(
+                peer = hex::encode(&peer_id.as_bytes()[..8]),
+                "cleaned up stale connection"
+            );
+        }
+    }
+
+    async fn get_or_connect(&mut self, contact: Contact) -> Result<Connection> {
+        let peer_id = contact.identity;
+
+        // Check cache first
+        if let Some(cached) = self.connections.get_mut(&peer_id) {
+            if cached.is_closed() {
+                trace!(
+                    peer = hex::encode(&peer_id.as_bytes()[..8]),
+                    "cached connection is closed, removing"
+                );
+                self.connections.pop(&peer_id);
+            } else if !cached.is_stale() {
+                return Ok(cached.connection.clone());
+            } else if cached.check_health_passive() {
+                cached.mark_success();
+                return Ok(cached.connection.clone());
+            } else {
+                debug!(
+                    peer = hex::encode(&peer_id.as_bytes()[..8]),
+                    "stale connection failed passive health check, removing"
+                );
+                self.connections.pop(&peer_id);
+            }
+        }
+
+        // Check if connection is already in flight
+        if self.in_flight.contains(&peer_id) {
+            // Wait and retry - but we need to release the lock
+            // Use a bounded retry with backoff
+            const MAX_WAIT_RETRIES: usize = 10;
+            const BASE_WAIT_INTERVAL_MS: u64 = 25;
+            
+            for retry in 0..MAX_WAIT_RETRIES {
+                let backoff_ms = BASE_WAIT_INTERVAL_MS * (1 << retry.min(5));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                
+                // Check if the connection appeared
+                if let Some(cached) = self.connections.get(&peer_id) {
+                    if !cached.is_closed() {
+                        return Ok(cached.connection.clone());
+                    }
+                }
+                
+                // Check if in_flight cleared
+                if !self.in_flight.contains(&peer_id) {
+                    break;
+                }
+            }
+            
+            if self.in_flight.contains(&peer_id) {
+                anyhow::bail!("timed out waiting for concurrent connection to peer");
+            }
+        }
+
+        // Mark in-flight
+        self.in_flight.insert(peer_id);
+
+        // Establish connection
+        let result = self.connect(&contact).await;
+
+        // Clear in-flight
+        self.in_flight.remove(&peer_id);
+
+        let conn = result?;
+        
+        // Cache the connection
+        self.connections.put(peer_id, CachedConnection::new(conn.clone()));
+        
+        Ok(conn)
+    }
+
+    async fn connect(&self, contact: &Contact) -> Result<Connection> {
+        let addr: SocketAddr = contact.addr.parse()
+            .with_context(|| format!("invalid socket address: {}", contact.addr))?;
+        let sni = identity_to_sni(&contact.identity);
+        
+        let conn = self
+            .endpoint
+            .connect_with(self.client_config.clone(), addr, &sni)
+            .with_context(|| format!("failed to initiate connection to {}", addr))?
+            .await
+            .with_context(|| format!("failed to establish connection to {}", addr))?;
+        
+        Ok(conn)
+    }
+}
+
 
 
 #[derive(Clone)]
@@ -113,15 +325,17 @@ impl CachedConnection {
 }
 
 
+// ============================================================================
+// RpcNode Handle (public API - cheap to clone)
+// ============================================================================
+
 #[derive(Clone)]
 pub struct RpcNode {
     pub endpoint: Endpoint,
     pub self_contact: Contact,
     client_config: ClientConfig,
     our_peer_id: Option<Identity>,
-    connections: Arc<RwLock<LruCache<Identity, CachedConnection>>>,
-    contact_cache: Arc<RwLock<LruCache<Identity, Contact>>>,
-    in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<Identity>>>,
+    cmd_tx: mpsc::Sender<RpcCommand>,
     smartsock: Option<Arc<SmartSock>>,
 }
 
@@ -132,18 +346,18 @@ impl RpcNode {
         client_config: ClientConfig,
         our_peer_id: Identity,
     ) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(RPC_COMMAND_CHANNEL_SIZE);
+        
+        // Spawn the actor
+        let actor = RpcNodeActor::new(endpoint.clone(), client_config.clone());
+        tokio::spawn(actor.run(cmd_rx));
+        
         Self {
             endpoint,
             self_contact,
             client_config,
             our_peer_id: Some(our_peer_id),
-            connections: Arc::new(RwLock::new(LruCache::<Identity, CachedConnection>::new(
-                NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
-            ))),
-            contact_cache: Arc::new(RwLock::new(LruCache::<Identity, Contact>::new(
-                NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()
-            ))),
-            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            cmd_tx,
             smartsock: None,
         }
     }
@@ -154,125 +368,45 @@ impl RpcNode {
     }
     
     pub async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
-        let mut cache = self.contact_cache.write().await;
-        cache.get(identity).cloned()
+        let (reply_tx, reply_rx) = oneshot::channel();
+        
+        if self.cmd_tx.send(RpcCommand::ResolveContact {
+            identity: *identity,
+            reply: reply_tx,
+        }).await.is_err() {
+            return None;
+        }
+        
+        reply_rx.await.ok().flatten()
     }
 
     pub async fn cache_contact(&self, contact: &Contact) {
-        let mut cache = self.contact_cache.write().await;
-        cache.put(contact.identity, contact.clone());
-    }
-
-    fn parse_addr(&self, contact: &Contact) -> Result<SocketAddr> {
-        contact
-            .addr
-            .parse()
-            .with_context(|| format!("invalid socket address: {}", contact.addr))
-    }
-
-    async fn connect(&self, contact: &Contact) -> Result<Connection> {
-        let addr = self.parse_addr(contact)?;
-        let sni = identity_to_sni(&contact.identity);
-        
-        let conn = self
-            .endpoint
-            .connect_with(self.client_config.clone(), addr, &sni)
-            .with_context(|| format!("failed to initiate connection to {}", addr))?
-            .await
-            .with_context(|| format!("failed to establish connection to {}", addr))?;
-        
-        Ok(conn)
+        let _ = self.cmd_tx.send(RpcCommand::CacheContact {
+            contact: contact.clone(),
+        }).await;
     }
 
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
-        let peer_id = contact.identity;
+        let (reply_tx, reply_rx) = oneshot::channel();
         
-        {
-            let mut cache = self.connections.write().await;
-            if let Some(cached) = cache.get_mut(&peer_id) {
-                if cached.is_closed() {
-                    trace!(
-                        peer = hex::encode(&peer_id.as_bytes()[..8]),
-                        "cached connection is closed, removing"
-                    );
-                    cache.pop(&peer_id);
-                } else if !cached.is_stale() {
-                    return Ok(cached.connection.clone());
-                } else if cached.check_health_passive() {
-                    cached.mark_success();
-                    return Ok(cached.connection.clone());
-                } else {
-                    debug!(
-                        peer = hex::encode(&peer_id.as_bytes()[..8]),
-                        "stale connection failed passive health check, removing"
-                    );
-                    cache.pop(&peer_id);
-                }
-            }
-        }
+        self.cmd_tx.send(RpcCommand::GetOrConnect {
+            contact: contact.clone(),
+            reply: reply_tx,
+        }).await.map_err(|_| anyhow::anyhow!("RPC actor closed"))?;
         
-        const MAX_WAIT_RETRIES: usize = 10;
-        const BASE_WAIT_INTERVAL_MS: u64 = 25;
-        const MAX_TOTAL_WAIT_MS: u64 = 2000;
-        
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(MAX_TOTAL_WAIT_MS);
-        
-        for retry in 0..=MAX_WAIT_RETRIES {
-            {
-                let mut in_flight = self.in_flight.lock().await;
-                if !in_flight.contains(&peer_id) {
-                    in_flight.insert(peer_id);
-                    break;
-                }
-            }
-            
-            if retry == MAX_WAIT_RETRIES || std::time::Instant::now() >= deadline {
-                anyhow::bail!("timed out waiting for concurrent connection to peer");
-            }
-            
-            let backoff_ms = BASE_WAIT_INTERVAL_MS * (1 << retry.min(5));
-            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            
-            let cache = self.connections.read().await;
-            if let Some(cached) = cache.peek(&peer_id) {
-                if !cached.is_closed() {
-                    return Ok(cached.connection.clone());
-                }
-            }
-        }
-        
-        let result = self.connect(contact).await;
-        
-        {
-            let mut in_flight = self.in_flight.lock().await;
-            in_flight.remove(&peer_id);
-        }
-        
-        let conn = result?;
-        
-        {
-            let mut cache = self.connections.write().await;
-            cache.put(peer_id, CachedConnection::new(conn.clone()));
-        }
-        
-        Ok(conn)
+        reply_rx.await.map_err(|_| anyhow::anyhow!("RPC actor closed"))?
     }
 
     async fn invalidate_connection(&self, peer_id: &Identity) {
-        let mut cache = self.connections.write().await;
-        if cache.pop(peer_id).is_some() {
-            debug!(
-                peer = hex::encode(&peer_id.as_bytes()[..8]),
-                "invalidated cached connection after failure"
-            );
-        }
+        let _ = self.cmd_tx.send(RpcCommand::InvalidateConnection {
+            peer_id: *peer_id,
+        }).await;
     }
 
     async fn mark_connection_success(&self, peer_id: &Identity) {
-        let mut cache = self.connections.write().await;
-        if let Some(cached) = cache.get_mut(peer_id) {
-            cached.mark_success();
-        }
+        let _ = self.cmd_tx.send(RpcCommand::MarkSuccess {
+            peer_id: *peer_id,
+        }).await;
     }
 
     pub(crate) async fn rpc(&self, contact: &Contact, request: DhtNodeRequest) -> Result<DhtNodeResponse> {
@@ -882,8 +1016,8 @@ impl PlumTreeRpc for RpcNode {
     }
     
     async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
-        let mut cache = self.contact_cache.write().await;
-        cache.get(identity).cloned()
+        // Delegate to the existing method which uses the actor
+        RpcNode::resolve_identity_to_contact(self, identity).await
     }
 }
 
@@ -1072,7 +1206,13 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
         let stream = match connection.accept_bi().await {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                debug!(remote = %remote, "connection closed");
+                debug!(remote = %remote, "connection closed by application");
+                hyparview.handle_peer_disconnected(verified_identity).await;
+                break Ok(());
+            }
+            Err(quinn::ConnectionError::TimedOut) => {
+                // Idle timeout is normal - connection had no activity
+                debug!(remote = %remote, "connection idle timeout");
                 hyparview.handle_peer_disconnected(verified_identity).await;
                 break Ok(());
             }

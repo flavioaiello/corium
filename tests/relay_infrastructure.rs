@@ -2,13 +2,38 @@
 //!
 //! These tests validate the UDP relay server, relay session management,
 //! and relay-assisted connectivity at an integration level.
+//!
+//! Run with verbose output: RUST_LOG=debug cargo test --test relay_infrastructure -- --nocapture
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::sync::Once;
+use std::time::{Duration, Instant};
 
 use corium::Node;
 use tokio::time::timeout;
+
+/// One-time tracing initialization
+static INIT: Once = Once::new();
+
+/// Initialize tracing for tests. Call at start of slow tests.
+/// Use RUST_LOG=debug or RUST_LOG=trace for verbose output.
+fn init_tracing() {
+    INIT.call_once(|| {
+        if std::env::var("RUST_LOG").is_ok() {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_test_writer()
+                .try_init()
+                .ok();
+        }
+    });
+}
+
+/// Progress marker that prints elapsed time
+fn progress(start: Instant, msg: &str) {
+    eprintln!("[{:>6.2}s] {}", start.elapsed().as_secs_f64(), msg);
+}
 
 /// Atomic port counter for unique port allocation across parallel tests.
 /// Nodes use socket multiplexing, so relay shares the same port as QUIC.
@@ -256,34 +281,53 @@ async fn direct_connect_preferred_when_available() {
 
 #[tokio::test]
 async fn connect_with_relay_available() {
+    init_tracing();
+    let start = Instant::now();
+    progress(start, "Starting connect_with_relay_available");
+    
     let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    progress(start, "Relay node bound");
+    
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    progress(start, "Node1 bound");
+    
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    progress(start, "Node2 bound");
     
     let relay_id = relay.identity();
     let relay_addr = relay.local_addr().unwrap().to_string();
     
-    // All nodes bootstrap from relay
+    progress(start, "Starting node1 bootstrap...");
     node1.bootstrap(&relay_id, &relay_addr).await.expect("node1 bootstrap failed");
+    progress(start, "Node1 bootstrap complete");
+    
+    progress(start, "Starting node2 bootstrap...");
     node2.bootstrap(&relay_id, &relay_addr).await.expect("node2 bootstrap failed");
+    progress(start, "Node2 bootstrap complete");
     
     // Node1 publishes with relay info if available
+    progress(start, "Getting relay endpoint...");
     if let Some(relay_ep) = relay.relay_endpoint().await {
         let addrs = vec![node1.local_addr().unwrap().to_string()];
+        progress(start, "Publishing address with relays...");
         node1.publish_address_with_relays(addrs, vec![relay_ep]).await
             .expect("publish failed");
+        progress(start, "Publish complete");
     }
     
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Direct connect should still work since both are reachable
+    progress(start, "Starting connect...");
     let result = timeout(
         TEST_TIMEOUT,
         node2.connect(&node1.identity(), &node1.local_addr().unwrap().to_string())
     ).await;
+    progress(start, "Connect complete");
     
     assert!(result.is_ok(), "connect should complete");
     assert!(result.unwrap().is_ok(), "connect should succeed");
+    progress(start, "Test passed");
 }
 
 // ============================================================================

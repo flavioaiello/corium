@@ -749,6 +749,11 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         level_filter: Option<TieringLevel>,
     ) -> Result<LookupResult> {
         const MAX_LOOKUP_ITERATIONS: usize = 20;
+        /// Total timeout for the entire lookup operation.
+        /// Prevents spending excessive time in sparse networks.
+        const LOOKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+        
+        let lookup_start = Instant::now();
         
         let (tx, rx) = oneshot::channel();
         if self.cmd_tx.send(Command::GetLookupParams(target, level_filter, tx)).await.is_err() {
@@ -784,6 +789,17 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 break;
             }
             
+            // Check total lookup timeout
+            if lookup_start.elapsed() > LOOKUP_TOTAL_TIMEOUT {
+                debug!(
+                    target = ?hex::encode(&target.as_bytes()[..8]),
+                    elapsed_ms = lookup_start.elapsed().as_millis(),
+                    found = shortlist.len(),
+                    "iterative lookup timeout, returning current results"
+                );
+                break;
+            }
+            
             let candidates: Vec<Contact> = shortlist
                 .iter()
                 .filter(|c| !queried.contains(&c.identity) && c.identity != self.id)
@@ -799,6 +815,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 queried.insert(c.identity);
             }
 
+            // Per-query timeout to avoid slow nodes blocking the entire lookup
+            const PER_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+            
             let network = self.network.clone();
             let futures: Vec<_> = candidates
                 .into_iter()
@@ -806,7 +825,14 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                     let net = network.clone();
                     async move {
                         let start = Instant::now();
-                        let result = net.find_node(&contact, target).await;
+                        let result = tokio::time::timeout(
+                            PER_QUERY_TIMEOUT,
+                            net.find_node(&contact, target)
+                        ).await;
+                        let result = match result {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow!("query timeout")),
+                        };
                         (contact, start.elapsed(), result)
                     }
                 })
@@ -969,17 +995,23 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     async fn send_store_with_result(&self, contact: &Contact, key: Key, value: Vec<u8>) -> bool {
+        const STORE_TIMEOUT: Duration = Duration::from_secs(5);
         let start = Instant::now();
-        let result = self.network.store(contact, key, value).await;
+        let result = tokio::time::timeout(
+            STORE_TIMEOUT,
+            self.network.store(contact, key, value)
+        ).await;
+        
         match result {
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 let elapsed = start.elapsed();
                 self.record_rtt(contact, elapsed).await;
                 self.adjust_k(true).await;
                 self.observe_contact(contact.clone()).await;
                 true
             }
-            Err(_) => {
+            Ok(Err(_)) | Err(_) => {
+                // RPC error or timeout
                 self.adjust_k(false).await;
                 false
             }
@@ -999,9 +1031,19 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let closest = self.iterative_find_node_with_level(target, None).await?;
         let k = DEFAULT_K; 
 
-        for contact in closest.into_iter().take(k) {
-            self.send_store(&contact, key, value.clone()).await;
-        }
+        // Parallelize stores for faster completion
+        let store_futures: Vec<_> = closest
+            .into_iter()
+            .take(k)
+            .map(|contact| {
+                let value = value.clone();
+                async move {
+                    self.send_store(&contact, key, value).await
+                }
+            })
+            .collect();
+        
+        futures::future::join_all(store_futures).await;
 
         Ok(key)
     }
@@ -1020,9 +1062,19 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let closest = self.iterative_find_node(Identity::from_bytes(key)).await?;
         let k = DEFAULT_K;
 
-        for contact in closest.into_iter().take(k) {
-            self.send_store(&contact, key, value.clone()).await;
-        }
+        // Parallelize stores for faster completion
+        let store_futures: Vec<_> = closest
+            .into_iter()
+            .take(k)
+            .map(|contact| {
+                let value = value.clone();
+                async move {
+                    self.send_store(&contact, key, value).await
+                }
+            })
+            .collect();
+        
+        futures::future::join_all(store_futures).await;
 
         Ok(())
     }
@@ -1034,11 +1086,37 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         let closest = self.iterative_find_node(Identity::from_bytes(*key)).await?;
 
-        for contact in closest {
-            match self.network.find_value(&contact, *key).await {
-                Ok((Some(value), _)) => return Ok(Some(value)),
-                Ok((None, _)) => continue,
-                Err(_) => continue,
+        // Query contacts in parallel with early return on first success
+        const FIND_VALUE_TIMEOUT: Duration = Duration::from_secs(3);
+        
+        // Use select_ok pattern: query all in parallel, return first success
+        let network = self.network.clone();
+        let key_copy = *key;
+        let futures: Vec<_> = closest
+            .into_iter()
+            .map(|contact| {
+                let net = network.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        FIND_VALUE_TIMEOUT,
+                        net.find_value(&contact, key_copy)
+                    ).await;
+                    
+                    match result {
+                        Ok(Ok((Some(value), _))) => Ok(value),
+                        Ok(Ok((None, _))) => Err(()),
+                        Ok(Err(_)) => Err(()),
+                        Err(_) => Err(()), // timeout
+                    }
+                }
+            })
+            .collect();
+        
+        // Wait for all futures, check if any succeeded
+        let results = futures::future::join_all(futures).await;
+        for result in results {
+            if let Ok(value) = result {
+                return Ok(Some(value));
             }
         }
 

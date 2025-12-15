@@ -53,6 +53,15 @@ pub const SIGNALING_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of registered signaling channels.
 pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
 
+/// Maximum sessions per IP address (rate limiting).
+pub const MAX_SESSIONS_PER_IP: usize = 50;
+
+/// Rate limit window for session registration.
+pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum entries in addr_to_session map (bounded to prevent memory exhaustion).
+pub const MAX_ADDR_TO_SESSION_ENTRIES: usize = 20_000;
+
 /// Sender for pushing signaling notifications to registered NAT nodes.
 pub type SignalingSender = mpsc::Sender<RelayResponse>;
 
@@ -584,6 +593,16 @@ impl RelayClient {
         let from_peer = crate::identity::Identity::from_hex(&incoming.from_peer)
             .context("invalid from_peer identity in IncomingConnection")?;
         
+        // SECURITY: Validate relay_data_addr before using it.
+        // This prevents malicious relays from directing us to arbitrary addresses.
+        let _relay_addr: std::net::SocketAddr = incoming.relay_data_addr
+            .parse()
+            .context("invalid relay_data_addr format")?;
+        
+        // Note: In production, you might want to validate that the relay address
+        // is a known/trusted relay. For now we just ensure it's a valid socket address.
+        // Loopback addresses are allowed for testing purposes.
+        
         self.rpc
             .complete_relay_session(
                 &incoming.relay_data_addr,
@@ -684,11 +703,9 @@ impl RelayClient {
 pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
-    /// The identity of the peer at the other end of this tunnel. Used for logging/debugging.
-    #[allow(dead_code)]
+    /// The identity of the peer at the other end of this tunnel.
     pub peer_identity: Identity,
-    /// When this tunnel was established. Used for diagnostics.
-    #[allow(dead_code)]
+    /// When this tunnel was established.
     pub established_at: Instant,
 }
 
@@ -700,6 +717,21 @@ impl RelayTunnel {
             peer_identity,
             established_at: Instant::now(),
         }
+    }
+    
+    /// Get the identity of the peer at the other end of this tunnel.
+    pub fn peer_identity(&self) -> &Identity {
+        &self.peer_identity
+    }
+    
+    /// Get how long this tunnel has been established.
+    pub fn age(&self) -> Duration {
+        self.established_at.elapsed()
+    }
+    
+    /// Check if this tunnel has been established longer than the given duration.
+    pub fn is_older_than(&self, duration: Duration) -> bool {
+        self.established_at.elapsed() > duration
     }
     
     /// Encode a QUIC packet into a CRLY relay frame.
@@ -740,6 +772,8 @@ struct RelayServerActor {
     sessions: HashMap<[u8; 16], RelaySession>,
     addr_to_session: HashMap<SocketAddr, [u8; 16]>,
     signaling_channels: HashMap<Identity, SignalingSender>,
+    /// Per-IP session count for rate limiting. Tracks (count, window_start).
+    ip_session_count: HashMap<std::net::IpAddr, (usize, Instant)>,
 }
 
 impl RelayServerActor {
@@ -749,6 +783,7 @@ impl RelayServerActor {
             sessions: HashMap::new(),
             addr_to_session: HashMap::new(),
             signaling_channels: HashMap::new(),
+            ip_session_count: HashMap::new(),
         }
     }
 
@@ -825,8 +860,33 @@ impl RelayServerActor {
             return Err("max sessions reached");
         }
         
+        // SECURITY: Per-IP rate limiting to prevent session exhaustion attacks
+        let ip = peer_a_addr.ip();
+        let now = Instant::now();
+        let (count, window_start) = self.ip_session_count
+            .entry(ip)
+            .or_insert((0, now));
+        
+        // Reset window if expired
+        if now.duration_since(*window_start) > RATE_LIMIT_WINDOW {
+            *count = 0;
+            *window_start = now;
+        }
+        
+        if *count >= MAX_SESSIONS_PER_IP {
+            warn!(ip = %ip, "rate limit exceeded for session registration");
+            return Err("rate limit exceeded");
+        }
+        *count += 1;
+        
         if self.sessions.contains_key(&session_id) {
             return Err("session already exists");
+        }
+        
+        // SECURITY: Bound addr_to_session to prevent memory exhaustion
+        if self.addr_to_session.len() >= MAX_ADDR_TO_SESSION_ENTRIES {
+            warn!("addr_to_session map at capacity, rejecting new session");
+            return Err("address mapping at capacity");
         }
         
         let session = RelaySession::new_pending(
@@ -854,12 +914,31 @@ impl RelayServerActor {
         from_peer: Identity,
         target_peer: Identity,
     ) -> Result<(), &'static str> {
-        let session = self.sessions.get_mut(&session_id)
+        let session = self.sessions.get(&session_id)
             .ok_or("session not found")?;
 
+        // SECURITY: On identity mismatch, remove the session to prevent probing attacks.
+        // An attacker who guesses session IDs should not be able to keep probing.
         if session.peer_b_identity != from_peer || session.peer_a_identity != target_peer {
+            warn!(
+                session = hex::encode(session_id),
+                expected_from = ?session.peer_b_identity,
+                got_from = ?from_peer,
+                "identity mismatch in complete_session, removing session"
+            );
+            // Remove session and associated addr mappings
+            if let Some(removed) = self.sessions.remove(&session_id) {
+                self.addr_to_session.remove(&removed.peer_a_addr);
+                if let Some(peer_b) = removed.peer_b_addr {
+                    self.addr_to_session.remove(&peer_b);
+                }
+            }
             return Err("peer identity mismatch");
         }
+        
+        // Re-borrow as mutable after identity verification passed
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or("session not found")?;
         
         if session.peer_b_addr.is_some() {
             return Err("session already complete");
