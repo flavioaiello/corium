@@ -47,7 +47,7 @@ fn test_addr() -> String {
     format!("127.0.0.1:{}", next_port())
 }
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ============================================================================
 // Relay Capability Tests

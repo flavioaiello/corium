@@ -715,10 +715,8 @@ pub struct RelayTunnel {
     pub session_id: [u8; 16],
     pub relay_addr: SocketAddr,
     /// The identity of the peer at the other end of this tunnel.
-    #[allow(dead_code)]
     pub peer_identity: Identity,
     /// When this tunnel was established.
-    #[allow(dead_code)]
     pub established_at: Instant,
 }
 
@@ -739,13 +737,13 @@ impl RelayTunnel {
     }
     
     /// Get how long this tunnel has been established.
+    /// Used for diagnostics and by `is_older_than()`.
     #[allow(dead_code)]
     pub fn age(&self) -> Duration {
         self.established_at.elapsed()
     }
     
     /// Check if this tunnel has been established longer than the given duration.
-    #[allow(dead_code)]
     pub fn is_older_than(&self, duration: Duration) -> bool {
         self.established_at.elapsed() > duration
     }

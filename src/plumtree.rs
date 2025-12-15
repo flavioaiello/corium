@@ -446,15 +446,34 @@ impl PeerRateLimit {
     }
 }
 
-#[allow(dead_code)]
+/// Structured error type for message publication failures.
+/// 
+/// Used by `PlumTree::publish()` to indicate why a message was rejected.
+/// Callers can match on this to handle specific rejection reasons programmatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRejection {
+    /// Message payload exceeds `PlumTreeConfig::max_message_size`.
     MessageTooLarge,
+    /// Topic name exceeds `MAX_TOPIC_LENGTH` (256 bytes).
     TopicTooLong,
+    /// Topic name contains invalid characters or is empty.
+    InvalidTopic,
+    /// Local publish rate limit exceeded (per `PlumTreeConfig::publish_rate_limit`).
     RateLimited,
-    Duplicate,
-    InvalidMessageId,
 }
+
+impl std::fmt::Display for MessageRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MessageTooLarge => write!(f, "message size exceeds maximum allowed"),
+            Self::TopicTooLong => write!(f, "topic name exceeds maximum length"),
+            Self::InvalidTopic => write!(f, "topic name is invalid (empty or contains non-ASCII characters)"),
+            Self::RateLimited => write!(f, "local publish rate limit exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for MessageRejection {}
 
 
 #[async_trait::async_trait]
@@ -772,17 +791,24 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
     }
 
     async fn handle_publish_cmd(&mut self, topic: &str, data: Vec<u8>) -> anyhow::Result<MessageId> {
+        // Validate message size
         if data.len() > self.config.max_message_size {
-            anyhow::bail!("message size {} exceeds maximum {}", data.len(), self.config.max_message_size);
+            return Err(MessageRejection::MessageTooLarge.into());
         }
+        
+        // Validate topic name
         if topic.len() > MAX_TOPIC_LENGTH {
-            anyhow::bail!("topic length {} exceeds maximum {}", topic.len(), MAX_TOPIC_LENGTH);
+            return Err(MessageRejection::TopicTooLong.into());
+        }
+        if !is_valid_topic(topic) {
+            return Err(MessageRejection::InvalidTopic.into());
         }
 
+        // Check local publish rate limit
         {
             let limiter = self.rate_limits.entry(self.local_identity).or_default();
             if limiter.check_and_record(self.config.publish_rate_limit) {
-                anyhow::bail!("local publish rate limit exceeded");
+                return Err(MessageRejection::RateLimited.into());
             }
         }
 
@@ -1669,19 +1695,29 @@ mod tests {
     }
 
     #[test]
-    fn message_rejection_variants() {
+    fn message_rejection_variants_and_display() {
         let variants = [
-            MessageRejection::MessageTooLarge,
-            MessageRejection::TopicTooLong,
-            MessageRejection::RateLimited,
-            MessageRejection::Duplicate,
-            MessageRejection::InvalidMessageId,
+            (MessageRejection::MessageTooLarge, "message size exceeds maximum allowed"),
+            (MessageRejection::TopicTooLong, "topic name exceeds maximum length"),
+            (MessageRejection::InvalidTopic, "topic name is invalid (empty or contains non-ASCII characters)"),
+            (MessageRejection::RateLimited, "local publish rate limit exceeded"),
         ];
         
-        for v in &variants {
+        for (v, expected_msg) in &variants {
+            // Test Clone + Copy
             let cloned = *v;
-            let _debug = format!("{:?}", cloned);
             assert_eq!(*v, cloned);
+            
+            // Test Debug
+            let _debug = format!("{:?}", cloned);
+            
+            // Test Display
+            let display = format!("{}", v);
+            assert_eq!(&display, *expected_msg);
+            
+            // Test Error trait (can convert to anyhow::Error)
+            let err: anyhow::Error = (*v).into();
+            assert!(err.to_string().contains(expected_msg));
         }
     }
 }

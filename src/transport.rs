@@ -78,6 +78,9 @@ pub const PROBE_HEADER_SIZE: usize = 21;
 pub const PATH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 pub const PATH_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PROBE_FAILURES: u32 = 3;
+/// Relay tunnels are cleaned up if idle longer than this.
+/// Matches the server-side SESSION_TIMEOUT in relay.rs.
+const RELAY_TUNNEL_STALE_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_RTT_ADVANTAGE_MS: f32 = 50.0;
 const RTT_EMA_OLD: f32 = 0.8;
 const RTT_EMA_NEW: f32 = 0.2;
@@ -1112,6 +1115,58 @@ impl SmartSock {
         }
     }
     
+    /// Clean up relay tunnels that have been idle longer than RELAY_TUNNEL_STALE_TIMEOUT.
+    /// This provides defense-in-depth against leaks if connection-close cleanup is missed.
+    pub async fn cleanup_stale_relay_tunnels(&self) -> usize {
+        let mut stale_tunnels: Vec<(SmartAddr, [u8; 16], std::net::SocketAddr)> = Vec::new();
+        
+        // First pass: identify stale tunnels while holding the lock
+        {
+            let peers = self.peers.read().await;
+            for (smart_addr, state) in peers.iter() {
+                for (session_id, tunnel) in &state.relay_tunnels {
+                    if tunnel.is_older_than(RELAY_TUNNEL_STALE_TIMEOUT) {
+                        stale_tunnels.push((*smart_addr, *session_id, tunnel.relay_addr));
+                    }
+                }
+            }
+        }
+        
+        if stale_tunnels.is_empty() {
+            return 0;
+        }
+        
+        // Second pass: remove stale tunnels
+        let mut removed_count = 0;
+        {
+            let mut peers = self.peers.write().await;
+            for (smart_addr, session_id, relay_addr) in &stale_tunnels {
+                if let Some(state) = peers.get_mut(smart_addr) {
+                    if state.relay_tunnels.remove(session_id).is_some() {
+                        removed_count += 1;
+                        tracing::debug!(
+                            peer = ?state.identity,
+                            session = hex::encode(session_id),
+                            relay = %relay_addr,
+                            "removed stale relay tunnel (age exceeded {}s)",
+                            RELAY_TUNNEL_STALE_TIMEOUT.as_secs()
+                        );
+                    }
+                }
+            }
+        }
+        
+        // Third pass: clean up reverse map
+        if removed_count > 0 {
+            let mut reverse = self.reverse_map.write().await;
+            for (_, _, relay_addr) in stale_tunnels {
+                reverse.remove(&relay_addr);
+            }
+        }
+        
+        removed_count
+    }
+    
     pub async fn switch_to_best_paths(&self) {
         let switches: Vec<(Identity, PathChoice)> = {
             let mut peers = self.peers.write().await;
@@ -1138,6 +1193,10 @@ impl SmartSock {
         let sock = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PATH_PROBE_INTERVAL);
+            // Run stale tunnel cleanup every 60 seconds (12 probe intervals)
+            let mut cleanup_counter = 0u32;
+            const CLEANUP_INTERVAL_TICKS: u32 = 12;
+            
             loop {
                 interval.tick().await;
                 
@@ -1154,6 +1213,16 @@ impl SmartSock {
                 }
                 
                 sock.switch_to_best_paths().await;
+                
+                // Periodic cleanup of stale relay tunnels
+                cleanup_counter += 1;
+                if cleanup_counter >= CLEANUP_INTERVAL_TICKS {
+                    cleanup_counter = 0;
+                    let removed = sock.cleanup_stale_relay_tunnels().await;
+                    if removed > 0 {
+                        tracing::debug!(removed = removed, "cleaned up stale relay tunnels");
+                    }
+                }
             }
         })
     }
@@ -1192,6 +1261,10 @@ impl SmartSock {
         let probe_smartsock = smartsock.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PATH_PROBE_INTERVAL);
+            // Run stale tunnel cleanup every 60 seconds (12 probe intervals)
+            let mut cleanup_counter = 0u32;
+            const CLEANUP_INTERVAL_TICKS: u32 = 12;
+            
             loop {
                 interval.tick().await;
                 
@@ -1208,6 +1281,16 @@ impl SmartSock {
                 }
                 
                 probe_smartsock.switch_to_best_paths().await;
+                
+                // Periodic cleanup of stale relay tunnels
+                cleanup_counter += 1;
+                if cleanup_counter >= CLEANUP_INTERVAL_TICKS {
+                    cleanup_counter = 0;
+                    let removed = probe_smartsock.cleanup_stale_relay_tunnels().await;
+                    if removed > 0 {
+                        tracing::debug!(removed = removed, "cleaned up stale relay tunnels");
+                    }
+                }
             }
         });
         

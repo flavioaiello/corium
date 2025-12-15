@@ -1212,16 +1212,42 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 debug!(remote = %remote, "connection closed by application");
                 hyparview.handle_peer_disconnected(verified_identity).await;
+                // Clean up relay tunnels for this peer
+                if let Some(ss) = &smartsock {
+                    let removed = ss.cleanup_peer_relay_tunnels(&verified_identity).await;
+                    if !removed.is_empty() {
+                        debug!(
+                            peer = hex::encode(verified_identity),
+                            tunnels_removed = removed.len(),
+                            "cleaned up relay tunnels on connection close"
+                        );
+                    }
+                }
                 break Ok(());
             }
             Err(quinn::ConnectionError::TimedOut) => {
                 // Idle timeout is normal - connection had no activity
                 debug!(remote = %remote, "connection idle timeout");
                 hyparview.handle_peer_disconnected(verified_identity).await;
+                // Clean up relay tunnels for this peer
+                if let Some(ss) = &smartsock {
+                    let removed = ss.cleanup_peer_relay_tunnels(&verified_identity).await;
+                    if !removed.is_empty() {
+                        debug!(
+                            peer = hex::encode(verified_identity),
+                            tunnels_removed = removed.len(),
+                            "cleaned up relay tunnels on idle timeout"
+                        );
+                    }
+                }
                 break Ok(());
             }
             Err(e) => {
                 hyparview.handle_peer_disconnected(verified_identity).await;
+                // Clean up relay tunnels for this peer
+                if let Some(ss) = &smartsock {
+                    ss.cleanup_peer_relay_tunnels(&verified_identity).await;
+                }
                 break Err(e.into());
             }
         };
