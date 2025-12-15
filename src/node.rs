@@ -12,23 +12,12 @@ use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
-use crate::transport::{Contact, SmartSock, UdpRelay};
+use crate::relay::{Relay, RelayClient, NatStatus};
+use crate::transport::{Contact, SmartSock};
 use crate::rpc::{self, RpcNode};
 
-
-/// Notification of an incoming connection request via relay signaling.
-/// 
-/// When a NAT-bound node receives this, it should initiate a relay connection
-/// using the provided session_id to complete the relay handshake.
-#[derive(Debug, Clone)]
-pub struct IncomingConnection {
-    /// Hex-encoded identity of the peer that wants to connect.
-    pub from_peer: String,
-    /// Session ID to use when completing the relay connection.
-    pub session_id: [u8; 16],
-    /// Address to send relay data packets to.
-    pub relay_data_addr: String,
-}
+// Re-export from relay module for backwards compatibility
+pub use crate::relay::IncomingConnection;
 
 
 pub struct Node {
@@ -40,6 +29,7 @@ pub struct Node {
     rpcnode: RpcNode,
     hyparview: HyParView,
     plumtree: PlumTree<RpcNode>,
+    relay_client: RelayClient,
     plumtree_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>,
     direct_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(Identity, Vec<u8>)>>>,
     server_handle: tokio::task::JoinHandle<Result<()>>,
@@ -93,9 +83,9 @@ impl Node {
             DEFAULT_ALPHA,
         );
         
-        let udprelay = UdpRelay::with_socket(smartsock.inner_socket().clone());
-        smartsock.set_udprelay(udprelay.clone());
-        let udprelay_addr = local_addr;
+        // Initialize relay server (shares socket with SmartSock)
+        let relay = Relay::with_socket(smartsock.inner_socket().clone());
+        smartsock.set_udprelay(relay);
         info!("UDP relay server sharing port {}", local_addr);
         
         let hyparview = HyParView::spawn(identity, HyParViewConfig::default(), Arc::new(rpcnode.clone()));
@@ -105,13 +95,20 @@ impl Node {
         
         hyparview.set_neighbor_callback(Arc::new(plumtree.clone())).await;
         
+        // Create relay client for NAT traversal
+        let relay_client = RelayClient::new(
+            Arc::new(rpcnode.clone()),
+            dhtnode.clone(),
+            keypair.clone(),
+            local_addr,
+        );
+        
         let server_handle = {
             let endpoint = endpoint.clone();
             let dhtnode = dhtnode.clone();
-            let udprelay = udprelay.clone();
-            let smartsock_for_server = Some(smartsock.clone());
-            let plumtree_handler: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
-            let hyparview_for_server = hyparview.clone();
+            let smartsock = smartsock.clone();
+            let plumtree: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
+            let hyparview = hyparview.clone();
             
             let (direct_tx, direct_rx) = tokio::sync::mpsc::channel::<(Identity, Vec<u8>)>(256);
             let direct_receiver = tokio::sync::Mutex::new(Some(direct_rx));
@@ -119,16 +116,12 @@ impl Node {
             let server_task = tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
                     let node = dhtnode.clone();
-                    let plumtree = Some(plumtree_handler.clone());
-                    let udprelay = Some(udprelay.clone());
-                    let udprelay_addr = Some(udprelay_addr);
-                    let ss = smartsock_for_server.clone();
-                    let hv = hyparview_for_server.clone();
-                    let direct_sender = Some(direct_tx.clone());
+                    let plumtree = Some(plumtree.clone());
+                    let ss = Some(smartsock.clone());
+                    let hv = hyparview.clone();
+                    let direct_tx = Some(direct_tx.clone());
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            rpc::handle_connection(node, plumtree, udprelay, udprelay_addr, ss, incoming, hv, direct_sender).await
-                        {
+                        if let Err(e) = rpc::handle_connection(node, plumtree, ss, incoming, hv, direct_tx).await {
                             warn!("connection error: {:?}", e);
                         }
                     });
@@ -150,6 +143,7 @@ impl Node {
             rpcnode,
             hyparview,
             plumtree,
+            relay_client,
             plumtree_receiver,
             direct_receiver: server_handle.1,
             server_handle: server_handle.0,
@@ -181,6 +175,18 @@ impl Node {
     
     pub fn smartsock(&self) -> &Arc<SmartSock> {
         &self.smartsock
+    }
+
+    /// Get the relay handle for this node.
+    /// 
+    /// All nodes run an embedded relay server that shares the QUIC socket.
+    /// Use this to access relay telemetry, session counts, or to check
+    /// if the relay is operational.
+    /// 
+    /// # Returns
+    /// The Relay handle, or `None` if the relay hasn't been initialized.
+    pub fn relay(&self) -> Option<crate::relay::Relay> {
+        self.smartsock.relay()
     }
 
     
@@ -260,32 +266,43 @@ impl Node {
             addrs: vec![],
         };
         
-        let response_rx = self.rpcnode
-            .register_for_signaling(&relay_contact, self.keypair.identity())
-            .await?;
+        self.relay_client.register_with_relay(&relay_contact).await?;
         
-        // Transform RelayResponse into IncomingConnection
-        let (tx, rx) = tokio::sync::mpsc::channel::<IncomingConnection>(16);
-        
-        tokio::spawn(async move {
-            let mut response_rx = response_rx;
-            while let Some(response) = response_rx.recv().await {
-                if let crate::messages::RelayResponse::Incoming { from_peer, session_id, relay_data_addr } = response {
-                    let incoming = IncomingConnection {
-                        from_peer: hex::encode(from_peer.as_bytes()),
-                        session_id,
-                        relay_data_addr,
-                    };
-                    if tx.send(incoming).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        
-        Ok(rx)
+        self.relay_client.take_incoming_receiver().await
+            .context("incoming receiver not available")
     }
     
+    /// Accept an incoming relay connection from a peer.
+    /// 
+    /// When a NAT-bound node receives an `IncomingConnection` notification
+    /// (from the receiver returned by `register_with_relay`), call this method
+    /// to complete the relay handshake and establish the tunnel.
+    /// 
+    /// After this returns successfully, the SmartSock is configured to route
+    /// traffic to/from `from_peer` through the relay tunnel. The connecting
+    /// peer's QUIC connection will arrive through the normal server accept loop.
+    /// 
+    /// # Flow
+    /// 1. Peer A calls `connect_peer(B)` → triggers relay session
+    /// 2. B receives `IncomingConnection` notification
+    /// 3. B calls `accept_incoming()` → configures tunnel, sends probe
+    /// 4. A's pending QUIC handshake now completes through the relay
+    /// 5. B receives A's connection via the server accept loop (RPC handler)
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let mut rx = node.register_with_relay("relay_id", "relay_addr").await?;
+    /// tokio::spawn(async move {
+    ///     while let Some(incoming) = rx.recv().await {
+    ///         node.accept_incoming(&incoming).await?;
+    ///         // A's connection will arrive via the server - nothing more to do
+    ///     }
+    /// });
+    /// ```
+    pub async fn accept_incoming(&self, incoming: &IncomingConnection) -> Result<()> {
+        self.relay_client.accept_incoming(incoming).await
+    }
+
     pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {
         self.dhtnode.resolve_peer(peer_id).await
     }
@@ -333,17 +350,18 @@ impl Node {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
-        let (record, path_nodes) = self.dhtnode.resolve_peer_with_path(&peer_identity).await?;
-        let record = record.context("peer not found in DHT")?;
+        let record = self.dhtnode.resolve_peer(&peer_identity).await?
+            .context("peer not found in DHT")?;
         
         debug!(
             peer = %identity,
             addrs = ?record.addrs,
-            path_nodes = path_nodes.len(),
+            relays = record.relays.len(),
+            is_relay = record.is_relay,
             "resolved peer endpoint, attempting smartconnect"
         );
         
-        let conn = self.rpcnode.smartconnect(&record, path_nodes).await?;
+        let conn = self.rpcnode.smartconnect(&record).await?;
         Ok(conn)
     }
     
@@ -436,5 +454,91 @@ impl Node {
     
     pub async fn telemetry(&self) -> TelemetrySnapshot {
         self.dhtnode.telemetry_snapshot().await
+    }
+
+    // =========================================================================
+    // NAT Detection and Relay Configuration
+    // =========================================================================
+
+    /// Check if this node is publicly reachable by asking a peer to connect back.
+    /// 
+    /// This performs a "self-probe" by requesting `helper` to attempt a connection
+    /// to our local address. Returns `true` if we are publicly reachable.
+    /// 
+    /// # Arguments
+    /// * `helper` - A known peer that will attempt to connect back to us
+    /// 
+    /// # Returns
+    /// * `Ok(true)` - We are publicly reachable (can serve as relay)
+    /// * `Ok(false)` - We are behind NAT (need to use a relay)
+    /// * `Err(_)` - Could not complete the probe (helper unreachable, etc.)
+    pub async fn probe_reachability(&self, helper: &Contact) -> Result<bool> {
+        self.relay_client.probe_reachability(helper).await
+    }
+
+    /// Discover relay-capable nodes in the network.
+    /// 
+    /// Searches for peers with `is_relay: true` in their published EndpointRecords.
+    /// This queries peers from the routing table and checks their relay capability.
+    /// 
+    /// # Returns
+    /// A list of contacts that can serve as relays.
+    pub async fn discover_relays(&self) -> Result<Vec<Contact>> {
+        self.relay_client.discover_relays().await
+    }
+
+    /// Select the best relay from a list by measuring RTT.
+    /// 
+    /// Pings each relay and returns the one with the lowest round-trip time.
+    /// 
+    /// # Arguments
+    /// * `candidates` - List of potential relay contacts
+    /// 
+    /// # Returns
+    /// The relay with the lowest RTT, or `None` if all candidates are unreachable.
+    pub async fn select_best_relay(&self, candidates: &[Contact]) -> Option<Contact> {
+        self.relay_client.select_best_relay(candidates).await
+    }
+
+    /// Automatically configure NAT traversal for this node.
+    /// 
+    /// This performs the complete NAT configuration flow:
+    /// 1. Probe reachability via a helper peer
+    /// 2. If publicly reachable: publish address with `is_relay: true`
+    /// 3. If NAT-bound: discover relays, select best one, register, and publish
+    /// 
+    /// # Arguments
+    /// * `helper` - A known peer to use for the reachability probe
+    /// * `addresses` - Our addresses to publish in the DHT
+    /// 
+    /// # Returns
+    /// Configuration result indicating our NAT status and relay (if applicable).
+    pub async fn configure_nat(
+        &self,
+        helper: &Contact,
+        addresses: Vec<String>,
+    ) -> Result<(bool, Option<Contact>, Option<tokio::sync::mpsc::Receiver<IncomingConnection>>)> {
+        let status = self.relay_client.configure(helper, addresses).await?;
+        
+        match status {
+            NatStatus::Public => Ok((true, None, None)),
+            NatStatus::NatBound { relay } => {
+                let incoming_rx = self.relay_client.take_incoming_receiver().await;
+                Ok((false, Some(relay), incoming_rx))
+            }
+            NatStatus::Unknown => {
+                anyhow::bail!("NAT configuration failed: status unknown")
+            }
+        }
+    }
+
+    /// Get the current NAT status.
+    pub async fn nat_status(&self) -> NatStatus {
+        self.relay_client.status().await
+    }
+
+    /// Get access to the relay client for advanced NAT management.
+    pub fn relay_client(&self) -> &RelayClient {
+        &self.relay_client
     }
 }

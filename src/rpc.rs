@@ -12,9 +12,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
 use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
-use crate::transport::SmartSock;
+use crate::transport::{SmartSock, Contact, DIRECT_CONNECT_TIMEOUT};
 use crate::crypto::{extract_verified_identity, identity_to_sni};
-use crate::transport::{self, Contact, generate_session_id, DIRECT_CONNECT_TIMEOUT, UdpRelay};
+use crate::relay::{Relay, generate_session_id, handle_relay_request};
 use crate::dht::DhtNode;
 use crate::storage::Key;
 use crate::identity::{EndpointRecord, Identity};
@@ -32,6 +32,10 @@ pub trait DhtNodeRpc: Send + Sync + 'static {
     async fn store(&self, to: &Contact, key: Key, value: Vec<u8>) -> Result<()>;
 
     async fn ping(&self, to: &Contact) -> Result<()>;
+    
+    /// Ask a peer to check if we are reachable by connecting back to the given address.
+    /// Returns true if the peer successfully connected back.
+    async fn check_reachability(&self, to: &Contact, probe_addr: &str) -> Result<bool>;
 }
 
 
@@ -401,6 +405,70 @@ impl RpcNode {
         Ok((relay_conn, response))
     }
 
+    /// Complete a relay session as the receiving peer (B).
+    /// 
+    /// When a NAT-bound node receives an `IncomingConnection` notification,
+    /// it calls this to complete the relay handshake with the relay server.
+    /// 
+    /// # Arguments
+    /// * `relay_addr` - The relay's data address (from IncomingConnection.relay_data_addr)
+    /// * `our_identity` - Our identity
+    /// * `from_peer` - The identity of the peer who initiated the connection
+    /// * `session_id` - The session ID (from IncomingConnection.session_id)
+    /// 
+    /// # Returns
+    /// The relay data address to use for the tunnel on success.
+    pub async fn complete_relay_session(
+        &self,
+        relay_addr: &str,
+        _our_identity: Identity,
+        from_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<String> {
+        // Parse relay address
+        let relay_socket: std::net::SocketAddr = relay_addr.parse()
+            .context("invalid relay address")?;
+        
+        // We just need to send an initial CRLY packet to the relay to register 
+        // our address. The relay will auto-complete the session when it sees 
+        // a packet from us.
+        
+        // Configure SmartSock to route traffic to from_peer through the relay
+        let smartsock = self.smartsock.as_ref()
+            .context("SmartSock not configured")?;
+        
+        // Register the peer (we may not know their direct addresses, use empty)
+        smartsock.register_peer(from_peer, vec![]).await;
+        
+        // Add relay tunnel
+        let added = smartsock
+            .add_relay_tunnel(&from_peer, session_id, relay_socket)
+            .await
+            .is_some();
+        if !added {
+            anyhow::bail!("failed to add relay tunnel");
+        }
+        
+        // Activate relay path
+        let switched = smartsock.use_relay_path(&from_peer, session_id).await;
+        if !switched {
+            anyhow::bail!("failed to activate relay path");
+        }
+        
+        // Send an initial probe packet to the relay to register our address
+        // This completes the relay session (relay learns our address)
+        smartsock.send_relay_probe(&from_peer, session_id).await?;
+        
+        debug!(
+            session = hex::encode(session_id),
+            from_peer = ?from_peer,
+            relay = %relay_addr,
+            "completed relay session as receiver"
+        );
+        
+        Ok(relay_addr.to_string())
+    }
+
     pub async fn configure_relay_path_for_peer(
         &self,
         peer_id: Identity,
@@ -456,7 +524,12 @@ impl RpcNode {
         Ok(conn)
     }
 
-    pub async fn smartconnect(&self, record: &EndpointRecord, path_nodes: Vec<Contact>) -> Result<Connection> {
+    /// Connect to a peer using their published EndpointRecord.
+    /// 
+    /// Strategy:
+    /// 1. Try direct connection to advertised addresses
+    /// 2. If direct fails and peer has designated relays, connect via relay
+    pub async fn smartconnect(&self, record: &EndpointRecord) -> Result<Connection> {
         let peer_id = &record.identity;
 
         // Try direct connection first (SmartSock handles path probing and fallback)
@@ -492,13 +565,12 @@ impl RpcNode {
             }
         }
 
-        // Use path nodes from DHT lookup as relay candidates (they are reachable by us
-        // and likely reachable by the target peer since they're in the DHT path)
-        if !path_nodes.is_empty() {
+        // Use the peer's designated relays from their published record
+        if !record.relays.is_empty() {
             debug!(
                 peer = ?peer_id,
-                path_node_count = path_nodes.len(),
-                "trying relay connection via DHT path nodes"
+                relay_count = record.relays.len(),
+                "trying connection via peer's designated relays"
             );
             
             let our_peer_id = self.our_peer_id.as_ref()
@@ -509,14 +581,9 @@ impl RpcNode {
                 anyhow::bail!("cannot use relay without at least one target address");
             }
             
-            // Try each path node as a potential relay
+            // Try each designated relay
             let mut last_error = None;
-            for relay in &path_nodes {
-                // Skip if the relay is the target peer itself
-                if relay.identity == *peer_id {
-                    continue;
-                }
-                
+            for relay in &record.relays {
                 let relay_peer_id = relay.identity;
                 let session_id = match generate_session_id() {
                     Ok(id) => id,
@@ -526,7 +593,7 @@ impl RpcNode {
                 debug!(
                     peer = ?peer_id,
                     relay = ?relay_peer_id,
-                    "attempting relay via DHT path node"
+                    "attempting connection via designated relay"
                 );
                 
                 let relay_result = self
@@ -556,7 +623,7 @@ impl RpcNode {
                             relay = ?relay_peer_id,
                             session = hex::encode(session_id),
                             relay_data = %relay_data_addr,
-                            "relay session pending via path node"
+                            "relay session pending"
                         );
                         (session_id, relay_data_addr)
                     }
@@ -569,7 +636,7 @@ impl RpcNode {
                             relay = ?relay_peer_id,
                             session = hex::encode(session_id),
                             relay_data = %relay_data_addr,
-                            "relay session established via path node"
+                            "relay session established"
                         );
                         (session_id, relay_data_addr)
                     }
@@ -583,13 +650,11 @@ impl RpcNode {
                         continue;
                     }
                     RelayResponse::Registered => {
-                        // Unexpected: we sent Connect, not Register
                         debug!(relay = ?relay_peer_id, "unexpected Registered response, trying next");
                         last_error = Some(anyhow::anyhow!("unexpected Registered response"));
                         continue;
                     }
                     RelayResponse::Incoming { .. } => {
-                        // Unexpected: Incoming is a push notification, not a response to Connect
                         debug!(relay = ?relay_peer_id, "unexpected Incoming response, trying next");
                         last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
                         continue;
@@ -624,12 +689,11 @@ impl RpcNode {
                         info!(
                             peer = ?peer_id,
                             relay = ?relay_peer_id,
-                            "relay connection successful via DHT path node"
+                            "connection successful via designated relay"
                         );
                         return Ok(conn);
                     }
                     Ok(Err(e)) => {
-                        // Clean up the relay tunnel we configured since connection failed
                         if let Some(smartsock) = &self.smartsock {
                             smartsock.remove_relay_tunnel(peer_id, &session_id).await;
                         }
@@ -642,7 +706,6 @@ impl RpcNode {
                         continue;
                     }
                     Err(_) => {
-                        // Clean up the relay tunnel we configured since connection timed out
                         if let Some(smartsock) = &self.smartsock {
                             smartsock.remove_relay_tunnel(peer_id, &session_id).await;
                         }
@@ -656,13 +719,13 @@ impl RpcNode {
                 }
             }
 
-            // All path nodes failed
+            // All designated relays failed
             if let Some(e) = last_error {
                 anyhow::bail!("all relay attempts failed, last error: {}", e);
             }
         }
 
-        anyhow::bail!("direct connection failed and no relay path nodes available");
+        anyhow::bail!("direct connection failed and peer has no designated relays");
     }
 
     async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
@@ -791,6 +854,17 @@ impl DhtNodeRpc for RpcNode {
         match self.rpc(to, request).await? {
             DhtNodeResponse::Ack => Ok(()),
             other => anyhow::bail!("unexpected response to Ping: {:?}", other),
+        }
+    }
+
+    async fn check_reachability(&self, to: &Contact, probe_addr: &str) -> Result<bool> {
+        let request = DhtNodeRequest::CheckReachability {
+            from: self.self_contact.clone(),
+            probe_addr: probe_addr.to_string(),
+        };
+        match self.rpc(to, request).await? {
+            DhtNodeResponse::Reachable { reachable } => Ok(reachable),
+            other => anyhow::bail!("unexpected response to CheckReachability: {:?}", other),
         }
     }
 }
@@ -957,13 +1031,15 @@ const MAX_REQUEST_SIZE: usize = 64 * 1024;
 pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync + 'static>(
     node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udprelay: Option<Arc<UdpRelay>>,
-    udprelay_addr: Option<SocketAddr>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
     hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
+    // Extract relay from smartsock
+    let udprelay = smartsock.as_ref().and_then(|ss| ss.relay());
+    let udprelay_addr = smartsock.as_ref().map(|ss| ss.local_address());
+
     debug!("handle_connection: accepting incoming connection");
     let connection = incoming.await.context("failed to accept connection")?;
     let remote = connection.remote_address();
@@ -1030,7 +1106,7 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
 async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udprelay: Option<Arc<UdpRelay>>,
+    udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
@@ -1233,7 +1309,7 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
     request: RpcRequest,
     remote_addr: SocketAddr,
     plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
-    udprelay: Option<Arc<UdpRelay>>,
+    udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
     hyparview: HyParView,
     direct_tx: Option<DirectMessageSender>,
@@ -1244,10 +1320,10 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
             RpcResponse::DhtNode(dht_response)
         }
         RpcRequest::Relay(relay_request) => {
-            let relay_response = transport::handle_relay_request(
+            let relay_response = handle_relay_request(
                 relay_request,
                 remote_addr,
-                udprelay.as_deref(),
+                udprelay.as_ref(),
                 udprelay_addr,
             ).await;
             RpcResponse::Relay(relay_response)
@@ -1320,6 +1396,38 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             );
             node.handle_store_request(&from, key, value).await;
             DhtNodeResponse::Ack
+        }
+        DhtNodeRequest::CheckReachability { from, probe_addr } => {
+            debug!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                probe_addr = %probe_addr,
+                "handling CHECK_REACHABILITY request"
+            );
+            
+            // Create a contact for the probe address
+            let probe_contact = Contact {
+                identity: from.identity,
+                addr: probe_addr.clone(),
+                addrs: vec![],
+            };
+            
+            // Attempt to ping back with a short timeout
+            let reachable = tokio::time::timeout(
+                Duration::from_secs(5),
+                node.network().ping(&probe_contact),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            
+            debug!(
+                from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                probe_addr = %probe_addr,
+                reachable = reachable,
+                "CHECK_REACHABILITY result"
+            );
+            
+            DhtNodeResponse::Reachable { reachable }
         }
     }
 }

@@ -49,6 +49,13 @@ pub enum DhtNodeRequest {
         key: Key,
         value: Vec<u8>,
     },
+    /// Request peer to check if we are reachable by connecting back to us.
+    /// Used for NAT detection (self-probe).
+    CheckReachability {
+        from: Contact,
+        /// Address we want the peer to try connecting to
+        probe_addr: String,
+    },
 }
 
 impl DhtNodeRequest {
@@ -58,6 +65,7 @@ impl DhtNodeRequest {
             DhtNodeRequest::FindNode { from, .. } => Some(from.identity),
             DhtNodeRequest::FindValue { from, .. } => Some(from.identity),
             DhtNodeRequest::Store { from, .. } => Some(from.identity),
+            DhtNodeRequest::CheckReachability { from, .. } => Some(from.identity),
         }
     }
 }
@@ -69,6 +77,11 @@ pub enum DhtNodeResponse {
     Value {
         value: Option<Vec<u8>>,
         closer: Vec<Contact>,
+    },
+    /// Response to CheckReachability
+    Reachable {
+        /// True if we successfully connected back to the requesting peer
+        reachable: bool,
     },
     Error {
         message: String,

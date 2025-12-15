@@ -53,14 +53,27 @@ impl Keypair {
         self.signing_key.verifying_key().verify(message, signature).is_ok()
     }
 
+    /// Create an endpoint record for a publicly reachable node (can serve as relay).
     pub fn create_endpoint_record(&self, addrs: Vec<String>) -> EndpointRecord {
-        self.create_endpoint_record_with_relays(addrs, vec![])
+        self.create_endpoint_record_full(addrs, vec![], true)
     }
 
+    /// Create an endpoint record for a NAT-bound node with designated relays.
     pub fn create_endpoint_record_with_relays(
         &self,
         addrs: Vec<String>,
         relays: Vec<Contact>,
+    ) -> EndpointRecord {
+        // NAT-bound nodes that need relays cannot serve as relays themselves
+        self.create_endpoint_record_full(addrs, relays, false)
+    }
+
+    /// Create an endpoint record with full control over all fields.
+    pub fn create_endpoint_record_full(
+        &self,
+        addrs: Vec<String>,
+        relays: Vec<Contact>,
+        is_relay: bool,
     ) -> EndpointRecord {
         let identity = self.identity();
         let timestamp = now_ms();
@@ -89,6 +102,8 @@ impl Keypair {
                 data.extend_from_slice(addr_bytes);
             }
         }
+        // Include is_relay in signature
+        data.push(if is_relay { 1 } else { 0 });
         data.extend_from_slice(&timestamp.to_le_bytes());
         
         let signature = self.sign(&data);
@@ -97,6 +112,7 @@ impl Keypair {
             identity,
             addrs,
             relays,
+            is_relay,
             timestamp,
             signature: signature.to_bytes().to_vec(),
         }
@@ -202,6 +218,9 @@ pub struct EndpointRecord {
     pub identity: Identity,
     pub addrs: Vec<String>,
     pub relays: Vec<Contact>,
+    /// Whether this node can serve as a relay for other nodes.
+    /// Nodes that are publicly reachable (passed self-probe) set this to true.
+    pub is_relay: bool,
     pub timestamp: u64,
     pub signature: Vec<u8>,
 }
@@ -232,6 +251,8 @@ impl EndpointRecord {
                 data.extend_from_slice(addr_bytes);
             }
         }
+        // Include is_relay in signature verification
+        data.push(if self.is_relay { 1 } else { 0 });
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         
         let Ok(verifying_key) = VerifyingKey::try_from(self.identity.as_bytes().as_slice()) else {
@@ -727,7 +748,9 @@ mod tests {
             data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(addr_bytes);
         }
-        data.extend_from_slice(&(0u32).to_le_bytes());        data.extend_from_slice(&old_timestamp.to_le_bytes());
+        data.extend_from_slice(&(0u32).to_le_bytes());        // Include is_relay in signature (false = 0)
+        data.push(0);
+        data.extend_from_slice(&old_timestamp.to_le_bytes());
 
         let signature = keypair.sign(&data);
 
@@ -735,6 +758,7 @@ mod tests {
             identity,
             addrs,
             relays: vec![],
+            is_relay: false,
             timestamp: old_timestamp,
             signature: signature.to_bytes().to_vec(),
         };
@@ -763,6 +787,8 @@ mod tests {
             data.extend_from_slice(addr_bytes);
         }
         data.extend_from_slice(&(0u32).to_le_bytes());
+        // Include is_relay in signature (false = 0)
+        data.push(0);
         data.extend_from_slice(&future_timestamp.to_le_bytes());
 
         let signature = keypair.sign(&data);
@@ -771,6 +797,7 @@ mod tests {
             identity,
             addrs,
             relays: vec![],
+            is_relay: false,
             timestamp: future_timestamp,
             signature: signature.to_bytes().to_vec(),
         };

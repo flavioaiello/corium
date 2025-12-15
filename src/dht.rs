@@ -140,12 +140,11 @@ impl AdaptiveParams {
 #[derive(Clone, Debug)]
 pub struct LookupResult {
     pub closest: Vec<Contact>,
-    pub path_nodes: Vec<Contact>,
 }
 
 impl LookupResult {
-    fn new(closest: Vec<Contact>, path_nodes: Vec<Contact>) -> Self {
-        Self { closest, path_nodes }
+    fn new(closest: Vec<Contact>) -> Self {
+        Self { closest }
     }
 }
 
@@ -640,6 +639,11 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         self.self_contact.clone()
     }
 
+    /// Get a reference to the network layer for making RPC calls.
+    pub fn network(&self) -> &N {
+        &self.network
+    }
+
     pub async fn observe_contact(&self, contact: Contact) {
         let _ = self.cmd_tx.send(Command::ObserveContact(contact)).await;
     }
@@ -730,13 +734,6 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         Ok(result.closest)
     }
 
-    /// Perform iterative lookup and return full result including path nodes.
-    /// Path nodes are contacts that successfully responded during the lookup
-    /// and are natural relay candidates.
-    pub async fn iterative_find_node_with_path(&self, target: Identity) -> Result<LookupResult> {
-        self.iterative_find_node_full(target, None).await
-    }
-
     async fn iterative_find_node_with_level(
         &self,
         target: Identity,
@@ -762,7 +759,6 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let mut seen: HashSet<Identity> = HashSet::new();
         let mut seen_addrs: HashSet<String> = HashSet::new();
         let mut queried: HashSet<Identity> = HashSet::new();
-        let mut queried_success: Vec<Contact> = Vec::new();
         let mut rpc_success = false;
         let mut rpc_failure = false;
         let mut iteration = 0;
@@ -824,7 +820,6 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 match result {
                     Ok(nodes) => {
                         rpc_success = true;
-                        queried_success.push(contact.clone());
                         self.record_rtt(&contact, elapsed).await;
                         self.observe_contact(contact.clone()).await;
                         let from_peer = contact.identity;
@@ -881,11 +876,10 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             target = ?hex::encode(&target.as_bytes()[..8]),
             found = shortlist.len(),
             queried = queried.len(),
-            path_nodes = queried_success.len(),
             "iterative lookup completed"
         );
 
-        Ok(LookupResult::new(shortlist, queried_success))
+        Ok(LookupResult::new(shortlist))
     }
 
     async fn store_local(&self, key: Key, value: Vec<u8>, stored_by: Identity) {
@@ -1051,26 +1045,6 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         Ok(None)
     }
 
-    /// Get a value from the DHT, also returning the path nodes contacted during lookup.
-    /// Path nodes are natural relay candidates since they were reachable during the lookup.
-    async fn get_with_path(&self, key: &Key) -> Result<(Option<Vec<u8>>, Vec<Contact>)> {
-        if let Some(value) = self.get_local(key).await {
-            return Ok((Some(value), Vec::new()));
-        }
-
-        let lookup_result = self.iterative_find_node_with_path(Identity::from_bytes(*key)).await?;
-
-        for contact in &lookup_result.closest {
-            match self.network.find_value(contact, *key).await {
-                Ok((Some(value), _)) => return Ok((Some(value), lookup_result.path_nodes)),
-                Ok((None, _)) => continue,
-                Err(_) => continue,
-            }
-        }
-
-        Ok((None, lookup_result.path_nodes))
-    }
-
     pub async fn publish_address(&self, keypair: &Keypair, addresses: Vec<String>) -> Result<()> {
         let record = keypair.create_endpoint_record(addresses);
         let serialized = bincode::serialize(&record)
@@ -1080,20 +1054,12 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         self.put_at(key, serialized).await
     }
 
+    /// Resolve a peer's endpoint record from the DHT.
     pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {
-        let (record, _path_nodes) = self.resolve_peer_with_path(peer_id).await?;
-        Ok(record)
-    }
-
-    /// Resolve a peer's endpoint record and return path nodes discovered during lookup.
-    /// Path nodes are contacts that successfully responded during the DHT lookup
-    /// and are natural relay candidates since they are reachable by both parties.
-    pub async fn resolve_peer_with_path(&self, peer_id: &Identity) -> Result<(Option<EndpointRecord>, Vec<Contact>)> {
         const MAX_RECORD_AGE_SECS: u64 = 24 * 60 * 60;
 
         let key: Key = *peer_id.as_bytes();
-
-        let (data_opt, path_nodes) = self.get_with_path(&key).await?;
+        let data_opt = self.get(&key).await?;
 
         match data_opt {
             Some(data) => {
@@ -1114,9 +1080,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                     ));
                 }
 
-                Ok((Some(record), path_nodes))
+                Ok(Some(record))
             }
-            None => Ok((None, path_nodes)),
+            None => Ok(None),
         }
     }
 
@@ -1415,6 +1381,15 @@ mod tests {
             } else {
                 Err(anyhow!("peer not reachable"))
             }
+        }
+
+        async fn check_reachability(&self, to: &Contact, _probe_addr: &str) -> anyhow::Result<bool> {
+            if self.should_fail(&to.identity).await {
+                return Err(anyhow!("injected network failure"));
+            }
+            self.maybe_sleep(&to.identity).await;
+            // In tests, assume we're always reachable if the peer exists
+            Ok(self.registry.get(&to.identity).await.is_some())
         }
     }
 

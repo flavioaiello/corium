@@ -11,12 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use quinn::udp::{RecvMeta, Transmit};
 use serde::{Deserialize, Serialize};
-use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::{debug, info, trace, warn};
+use tracing::debug;
 
 use crate::identity::Identity;
-use crate::messages::{RelayRequest, RelayResponse};
+use crate::relay::{Relay, RelayTunnel, RELAY_MAGIC, MAX_RELAY_FRAME_SIZE};
 
 
 /// Callback trait for path change notifications.
@@ -68,16 +67,10 @@ impl Hash for Contact {
 }
 
 
-pub const RELAY_MAGIC: [u8; 4] = *b"CRLY";
-pub const RELAY_HEADER_SIZE: usize = 20;
-pub const MAX_SESSIONS: usize = 10_000;
-pub const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
-pub const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+// Transport-specific constants (relay constants are in relay.rs)
 pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_SMARTSOCK_PEERS: usize = 10_000;
 
-pub const MAX_RELAY_FRAME_SIZE: usize = 1400;
 pub const PROBE_MAGIC: [u8; 4] = *b"SMPR";
 pub const PROBE_TYPE_REQUEST: u8 = 0x01;
 pub const PROBE_TYPE_RESPONSE: u8 = 0x02;
@@ -92,649 +85,6 @@ const RTT_EMA_NEW: f32 = 0.2;
 const MAX_PENDING_PROBES_PER_PEER: usize = 64;
 const MAX_CANDIDATES_PER_PEER: usize = 24;
 const MAX_DIRECT_ADDRS_PER_PEER: usize = 16;
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CryptoError {
-    pub code: Option<u32>,
-}
-
-impl std::fmt::Display for CryptoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.code {
-            Some(code) => write!(f, "CSPRNG unavailable (error code {})", code),
-            None => write!(f, "CSPRNG unavailable"),
-        }
-    }
-}
-
-impl std::error::Error for CryptoError {}
-
-impl From<getrandom::Error> for CryptoError {
-    fn from(err: getrandom::Error) -> Self {
-        Self { code: Some(err.code().get()) }
-    }
-}
-
-pub fn generate_session_id() -> Result<[u8; 16], CryptoError> {
-    let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id)?;
-    Ok(id)
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct RelaySession {
-    pub session_id: [u8; 16],
-    pub peer_a_identity: Identity,
-    pub peer_b_identity: Identity,
-    pub peer_a_addr: SocketAddr,
-    pub peer_b_addr: Option<SocketAddr>,
-    pub created_at: Instant,
-    pub last_activity: Instant,
-    pub bytes_relayed: u64,
-    pub packets_relayed: u64,
-    pub completion_locked: bool,
-}
-
-impl RelaySession {
-    pub fn new_pending(
-        session_id: [u8; 16],
-        peer_a_identity: Identity,
-        peer_b_identity: Identity,
-        peer_a_addr: SocketAddr,
-    ) -> Self {
-        let now = Instant::now();
-        Self {
-            session_id,
-            peer_a_identity,
-            peer_b_identity,
-            peer_a_addr,
-            peer_b_addr: None,
-            created_at: now,
-            last_activity: now,
-            bytes_relayed: 0,
-            packets_relayed: 0,
-            completion_locked: false,
-        }
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.peer_b_addr.is_some()
-    }
-
-    pub fn is_expired(&self) -> bool {
-        if self.is_complete() {
-            self.last_activity.elapsed() > SESSION_TIMEOUT
-        } else {
-            self.last_activity.elapsed() > PENDING_SESSION_TIMEOUT
-        }
-    }
-
-    pub fn get_destination(&self, from: SocketAddr) -> Option<SocketAddr> {
-        if from == self.peer_a_addr {
-            self.peer_b_addr
-        } else if self.peer_b_addr == Some(from) {
-            Some(self.peer_a_addr)
-        } else {
-            None
-        }
-    }
-
-    pub fn record_activity(&mut self, bytes: usize) {
-        self.last_activity = Instant::now();
-        self.bytes_relayed += bytes as u64;
-        self.packets_relayed += 1;
-    }
-}
-
-/// Sender for pushing signaling notifications to registered NAT nodes.
-pub type SignalingSender = tokio::sync::mpsc::Sender<RelayResponse>;
-
-/// Maximum number of pending signaling notifications per channel.
-pub const SIGNALING_CHANNEL_CAPACITY: usize = 16;
-
-/// Maximum number of registered signaling channels.
-pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
-
-#[derive(Debug)]
-pub struct UdpRelay {
-    socket: Arc<UdpSocket>,
-    sessions: RwLock<HashMap<[u8; 16], RelaySession>>,
-    addr_to_session: RwLock<HashMap<SocketAddr, [u8; 16]>>,
-    /// Signaling channels for NAT-bound nodes. Maps peer identity to channel sender.
-    signaling_channels: RwLock<HashMap<Identity, SignalingSender>>,
-}
-
-impl UdpRelay {
-    #[allow(dead_code)]
-    pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(addr).await?;
-        info!(addr = %socket.local_addr()?, "UDP relay server started");
-        
-        Ok(Self {
-            socket: Arc::new(socket),
-            sessions: RwLock::new(HashMap::new()),
-            addr_to_session: RwLock::new(HashMap::new()),
-            signaling_channels: RwLock::new(HashMap::new()),
-        })
-    }
-
-    pub fn with_socket(socket: Arc<UdpSocket>) -> Arc<Self> {
-        let server = Arc::new(Self {
-            socket,
-            sessions: RwLock::new(HashMap::new()),
-            addr_to_session: RwLock::new(HashMap::new()),
-            signaling_channels: RwLock::new(HashMap::new()),
-        });
-        server.clone().spawn_cleanup();
-        server
-    }
-
-    #[allow(dead_code)]
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-
-    pub async fn register_session(
-        &self,
-        session_id: [u8; 16],
-        peer_a_addr: SocketAddr,
-        peer_a_identity: Identity,
-        peer_b_identity: Identity,
-    ) -> Result<(), &'static str> {
-        let mut sessions = self.sessions.write().await;
-        
-        if sessions.len() >= MAX_SESSIONS {
-            return Err("max sessions reached");
-        }
-        
-        if sessions.contains_key(&session_id) {
-            return Err("session already exists");
-        }
-        
-        let session = RelaySession::new_pending(
-            session_id,
-            peer_a_identity,
-            peer_b_identity,
-            peer_a_addr,
-        );
-        sessions.insert(session_id, session);
-        
-        let mut addr_map = self.addr_to_session.write().await;
-        addr_map.insert(peer_a_addr, session_id);
-        
-        debug!(
-            session = hex::encode(session_id),
-            peer_a = %peer_a_addr,
-            "registered relay session (waiting for peer B)"
-        );
-        
-        Ok(())
-    }
-
-    pub async fn complete_session(
-        &self,
-        session_id: [u8; 16],
-        peer_b_addr: SocketAddr,
-        from_peer: Identity,
-        target_peer: Identity,
-    ) -> Result<(), &'static str> {
-        let mut sessions = self.sessions.write().await;
-        
-        let session = sessions.get_mut(&session_id)
-            .ok_or("session not found")?;
-
-        if session.peer_b_identity != from_peer || session.peer_a_identity != target_peer {
-            return Err("peer identity mismatch");
-        }
-        
-        if session.peer_b_addr.is_some() {
-            return Err("session already complete");
-        }
-        
-        session.completion_locked = true;
-        session.peer_b_addr = Some(peer_b_addr);
-        session.last_activity = Instant::now();
-        
-        let mut addr_map = self.addr_to_session.write().await;
-        addr_map.insert(peer_b_addr, session_id);
-        
-        debug!(
-            session = hex::encode(session_id),
-            peer_a = %session.peer_a_addr,
-            peer_b = %peer_b_addr,
-            "relay session complete"
-        );
-        
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn remove_session(&self, session_id: &[u8; 16]) {
-        let mut sessions = self.sessions.write().await;
-        
-        if let Some(session) = sessions.remove(session_id) {
-            let mut addr_map = self.addr_to_session.write().await;
-            addr_map.remove(&session.peer_a_addr);
-            if let Some(peer_b) = session.peer_b_addr {
-                addr_map.remove(&peer_b);
-            }
-            
-            debug!(
-                session = hex::encode(session_id),
-                packets = session.packets_relayed,
-                bytes = session.bytes_relayed,
-                "removed relay session"
-            );
-        }
-    }
-
-    pub async fn session_count(&self) -> usize {
-        self.sessions.read().await.len()
-    }
-
-    /// Register a signaling channel for a NAT-bound peer.
-    /// Returns the receiver end of the channel for the caller to listen on.
-    pub async fn register_signaling(
-        &self,
-        peer_identity: Identity,
-    ) -> Result<tokio::sync::mpsc::Receiver<RelayResponse>, &'static str> {
-        let mut channels = self.signaling_channels.write().await;
-        
-        if channels.len() >= MAX_SIGNALING_CHANNELS {
-            return Err("max signaling channels reached");
-        }
-        
-        // Remove stale channel if exists (peer reconnecting)
-        channels.remove(&peer_identity);
-        
-        let (tx, rx) = tokio::sync::mpsc::channel(SIGNALING_CHANNEL_CAPACITY);
-        channels.insert(peer_identity, tx);
-        
-        debug!(
-            peer = ?peer_identity,
-            "registered signaling channel"
-        );
-        
-        Ok(rx)
-    }
-
-    /// Remove a signaling channel (called when connection closes).
-    pub async fn unregister_signaling(&self, peer_identity: &Identity) {
-        let mut channels = self.signaling_channels.write().await;
-        if channels.remove(peer_identity).is_some() {
-            debug!(
-                peer = ?peer_identity,
-                "unregistered signaling channel"
-            );
-        }
-    }
-
-    /// Notify a registered NAT peer about an incoming connection request.
-    /// Returns true if notification was sent, false if peer not registered.
-    pub async fn notify_incoming(
-        &self,
-        target_peer: Identity,
-        from_peer: Identity,
-        session_id: [u8; 16],
-        relay_data_addr: String,
-    ) -> bool {
-        let channels = self.signaling_channels.read().await;
-        
-        if let Some(tx) = channels.get(&target_peer) {
-            let notification = RelayResponse::Incoming {
-                from_peer,
-                session_id,
-                relay_data_addr,
-            };
-            
-            match tx.try_send(notification) {
-                Ok(()) => {
-                    debug!(
-                        target = ?target_peer,
-                        from = ?from_peer,
-                        session = hex::encode(session_id),
-                        "sent incoming connection notification"
-                    );
-                    true
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        target = ?target_peer,
-                        "signaling channel full, dropping notification"
-                    );
-                    false
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    debug!(
-                        target = ?target_peer,
-                        "signaling channel closed"
-                    );
-                    false
-                }
-            }
-        } else {
-            debug!(
-                target = ?target_peer,
-                "no signaling channel registered"
-            );
-            false
-        }
-    }
-
-    /// Check if a peer has a registered signaling channel.
-    pub async fn has_signaling_channel(&self, peer_identity: &Identity) -> bool {
-        self.signaling_channels.read().await.contains_key(peer_identity)
-    }
-
-    /// Count of registered signaling channels.
-    pub async fn signaling_channel_count(&self) -> usize {
-        self.signaling_channels.read().await.len()
-    }
-
-    pub async fn cleanup_expired(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let mut addr_map = self.addr_to_session.write().await;
-        
-        let before = sessions.len();
-        
-        sessions.retain(|session_id, session| {
-            if session.is_expired() {
-                addr_map.remove(&session.peer_a_addr);
-                if let Some(peer_b) = session.peer_b_addr {
-                    addr_map.remove(&peer_b);
-                }
-                trace!(
-                    session = hex::encode(session_id),
-                    "expired relay session"
-                );
-                false
-            } else {
-                true
-            }
-        });
-        
-        let removed = before - sessions.len();
-        if removed > 0 {
-            debug!(removed = removed, remaining = sessions.len(), "cleaned up expired sessions");
-        }
-        removed
-    }
-
-    pub async fn process_packet(&self, data: &[u8], from: SocketAddr) -> usize {
-        if data.len() < RELAY_HEADER_SIZE {
-            trace!(from = %from, len = data.len(), "dropping undersized packet");
-            return 0;
-        }
-        
-        if data[0..4] != RELAY_MAGIC {
-            trace!(from = %from, "dropping non-CRLY packet");
-            return 0;
-        }
-        
-        let mut session_id = [0u8; 16];
-        session_id.copy_from_slice(&data[4..20]);
-        
-        // Hold both locks atomically to prevent race conditions during session completion.
-        // This ensures addr_to_session stays consistent with session state.
-        let dest = {
-            let mut sessions = self.sessions.write().await;
-            let mut addr_map = self.addr_to_session.write().await;
-            
-            let session = match sessions.get_mut(&session_id) {
-                Some(s) => s,
-                None => {
-                    trace!(
-                        session = hex::encode(session_id),
-                        from = %from,
-                        "dropping packet for unknown session"
-                    );
-                    return 0;
-                }
-            };
-            
-            if !session.is_complete() && !session.completion_locked && from != session.peer_a_addr {
-                session.completion_locked = true;
-                session.peer_b_addr = Some(from);
-                addr_map.insert(from, session_id);
-
-                let dest = session.get_destination(from);
-                if dest.is_some() {
-                    session.record_activity(data.len());
-                }
-                dest
-            } else {
-                let dest = session.get_destination(from);
-                if dest.is_some() {
-                    session.record_activity(data.len());
-                }
-                dest
-            }
-        };
-        
-        let dest = match dest {
-            Some(d) => d,
-            None => {
-                trace!(
-                    session = hex::encode(session_id),
-                    from = %from,
-                    "dropping packet from non-participant"
-                );
-                return 0;
-            }
-        };
-        
-        match self.socket.send_to(data, dest).await {
-            Ok(sent) => {
-                trace!(
-                    session = hex::encode(&session_id[..4]),
-                    from = %from,
-                    to = %dest,
-                    len = sent,
-                    "forwarded relay packet"
-                );
-                sent
-            }
-            Err(e) => {
-                warn!(
-                    session = hex::encode(session_id),
-                    dest = %dest,
-                    error = %e,
-                    "failed to forward relay packet"
-                );
-                0
-            }
-        }
-    }
-
-    pub async fn run_cleanup(&self) {
-        let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
-        
-        loop {
-            cleanup_interval.tick().await;
-            self.cleanup_expired().await;
-        }
-    }
-
-    pub fn spawn_cleanup(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            self.run_cleanup().await;
-        })
-    }
-}
-
-pub async fn handle_relay_request(
-    request: RelayRequest,
-    remote_addr: SocketAddr,
-    udprelay: Option<&UdpRelay>,
-    udprelay_addr: Option<SocketAddr>,
-) -> RelayResponse {
-    match request {
-        RelayRequest::Connect {
-            from_peer,
-            target_peer,
-            session_id,
-        } => {
-            debug!(
-                from = ?from_peer,
-                target = ?target_peer,
-                session = hex::encode(session_id),
-                "handling RELAY_CONNECT request"
-            );
-
-            let udprelay = match udprelay {
-                Some(s) => s,
-                None => {
-                    return RelayResponse::Rejected {
-                        reason: "relay not available".to_string(),
-                    };
-                }
-            };
-
-            let relay_data_addr = match udprelay_addr {
-                Some(addr) => addr.to_string(),
-                None => {
-                    return RelayResponse::Rejected {
-                        reason: "relay address not configured".to_string(),
-                    };
-                }
-            };
-
-            let session_count = udprelay.session_count().await;
-            if session_count >= MAX_SESSIONS {
-                return RelayResponse::Rejected {
-                    reason: "relay server at capacity".to_string(),
-                };
-            }
-
-            match udprelay
-                .register_session(session_id, remote_addr, from_peer, target_peer)
-                .await
-            {
-                Ok(()) => {
-                    debug!(
-                        session = hex::encode(session_id),
-                        peer = %remote_addr,
-                        "relay session pending (waiting for peer B)"
-                    );
-                    
-                    // Notify target peer via signaling channel if registered
-                    udprelay.notify_incoming(
-                        target_peer,
-                        from_peer,
-                        session_id,
-                        relay_data_addr.clone(),
-                    ).await;
-                    
-                    RelayResponse::Accepted {
-                        session_id,
-                        relay_data_addr,
-                    }
-                }
-                Err("session already exists") => {
-                    match udprelay
-                        .complete_session(session_id, remote_addr, from_peer, target_peer)
-                        .await
-                    {
-                        Ok(()) => {
-                            debug!(
-                                session = hex::encode(session_id),
-                                peer = %remote_addr,
-                                "relay session established"
-                            );
-                            RelayResponse::Connected {
-                                session_id,
-                                relay_data_addr,
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                session = hex::encode(session_id),
-                                error = e,
-                                "failed to complete relay session"
-                            );
-                            RelayResponse::Rejected {
-                                reason: e.to_string(),
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        session = hex::encode(session_id),
-                        error = e,
-                        "failed to register relay session"
-                    );
-                    RelayResponse::Rejected {
-                        reason: e.to_string(),
-                    }
-                }
-            }
-        }
-        
-        RelayRequest::Register { from_peer } => {
-            debug!(
-                from = ?from_peer,
-                "handling RELAY_REGISTER request"
-            );
-
-            // Note: Actual registration happens in handle_stream, not here.
-            // This response is just the initial acknowledgment.
-            // The stream handler will call register_signaling() and keep the stream open.
-            RelayResponse::Registered
-        }
-    }
-}
-
-
-#[derive(Debug, Clone)]
-pub struct RelayTunnel {
-    pub session_id: [u8; 16],
-    pub relay_addr: SocketAddr,
-    /// The identity of the peer at the other end of this tunnel. Used for logging/debugging.
-    #[allow(dead_code)]
-    pub peer_identity: Identity,
-    /// When this tunnel was established. Used for diagnostics.
-    #[allow(dead_code)]
-    pub established_at: Instant,
-}
-
-impl RelayTunnel {
-    pub fn new(session_id: [u8; 16], relay_addr: SocketAddr, peer_identity: Identity) -> Self {
-        Self {
-            session_id,
-            relay_addr,
-            peer_identity,
-            established_at: Instant::now(),
-        }
-    }
-    
-    pub fn encode_frame(&self, quic_packet: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(RELAY_HEADER_SIZE + quic_packet.len());
-        frame.extend_from_slice(&RELAY_MAGIC);
-        frame.extend_from_slice(&self.session_id);
-        frame.extend_from_slice(quic_packet);
-        frame
-    }
-    
-    pub fn decode_frame(data: &[u8]) -> Option<([u8; 16], &[u8])> {
-        if data.len() < RELAY_HEADER_SIZE {
-            return None;
-        }
-        
-        if data[0..4] != RELAY_MAGIC {
-            return None;
-        }
-        
-        let mut session_id = [0u8; 16];
-        session_id.copy_from_slice(&data[4..20]);
-        
-        let payload = &data[RELAY_HEADER_SIZE..];
-        
-        Some((session_id, payload))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PathProbeRequest {
@@ -1032,10 +382,27 @@ impl PeerPathState {
         let identity_hash = blake3::hash(identity.as_bytes());
         let identity_probe_prefix = u64::from_le_bytes(identity_hash.as_bytes()[0..8].try_into().unwrap());
         
-        let mut counter_bytes = [0u8; 8];
-        getrandom::getrandom(&mut counter_bytes)
-            .expect("CSPRNG failure: system random number generator unavailable");
-        let next_probe_counter = u64::from_le_bytes(counter_bytes);
+        // Use CSPRNG for probe counter initialization, with deterministic fallback
+        // if system RNG is unavailable (early boot, containers, etc.)
+        let next_probe_counter = {
+            let mut counter_bytes = [0u8; 8];
+            if getrandom::getrandom(&mut counter_bytes).is_ok() {
+                u64::from_le_bytes(counter_bytes)
+            } else {
+                // Fallback: derive from identity hash + high-resolution timestamp
+                // This is less random but avoids panic in degraded environments
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let timestamp_bytes = timestamp.to_le_bytes();
+                let mut fallback_input = Vec::with_capacity(40);
+                fallback_input.extend_from_slice(identity_hash.as_bytes());
+                fallback_input.extend_from_slice(&timestamp_bytes);
+                let fallback_hash = blake3::hash(&fallback_input);
+                u64::from_le_bytes(fallback_hash.as_bytes()[8..16].try_into().unwrap())
+            }
+        };
         
         Self {
             identity,
@@ -1275,7 +642,7 @@ pub struct SmartSock {
     
     local_addr: SocketAddr,
 
-    udprelay: StdRwLock<Option<Arc<UdpRelay>>>,
+    udprelay: StdRwLock<Option<Relay>>,
     
     /// Optional handler for path change events (uses tokio RwLock for async safety)
     path_event_handler: RwLock<Option<Arc<dyn PathEventHandler>>>,
@@ -1296,10 +663,20 @@ impl SmartSock {
         })
     }
 
-    pub fn set_udprelay(&self, udprelay: Arc<UdpRelay>) {
+    pub fn set_udprelay(&self, relay: Relay) {
         if let Ok(mut guard) = self.udprelay.write() {
-            *guard = Some(udprelay);
+            *guard = Some(relay);
         }
+    }
+
+    /// Get the relay handle, if configured.
+    pub fn relay(&self) -> Option<Relay> {
+        self.udprelay.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Get the local address this socket is bound to.
+    pub fn local_address(&self) -> SocketAddr {
+        self.local_addr
     }
     
     /// Set the path event handler to receive notifications when paths change.
@@ -1598,6 +975,56 @@ impl SmartSock {
         }
     }
     
+    /// Send a probe packet through a relay tunnel to complete the relay session.
+    /// 
+    /// This is called by the receiving peer (B) after getting an IncomingConnection
+    /// notification. The probe packet is a minimal CRLY-framed message that:
+    /// 1. Registers B's UDP address with the relay
+    /// 2. Triggers the relay to complete the session (learn B's address)
+    /// 
+    /// # Arguments
+    /// * `peer` - The peer identity we're establishing the relay tunnel with
+    /// * `session_id` - The relay session ID
+    pub async fn send_relay_probe(
+        &self,
+        peer: &Identity,
+        session_id: [u8; 16],
+    ) -> io::Result<()> {
+        let smart_addr = SmartAddr::from_identity(peer);
+        
+        let relay_addr = {
+            let peers = self.peers.read().await;
+            let state = peers.get(&smart_addr).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "peer not registered")
+            })?;
+            
+            let tunnel = state.relay_tunnels.get(&session_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "relay tunnel not found")
+            })?;
+            
+            tunnel.relay_addr
+        };
+        
+        // Build a minimal CRLY probe packet: magic + session_id + minimal payload
+        // The payload can be empty or contain a small marker - the relay just needs
+        // to see the CRLY header to identify it as a relay packet
+        let probe_payload = b"PROBE";
+        let mut frame = Vec::with_capacity(crate::relay::RELAY_HEADER_SIZE + probe_payload.len());
+        frame.extend_from_slice(&RELAY_MAGIC);
+        frame.extend_from_slice(&session_id);
+        frame.extend_from_slice(probe_payload);
+        
+        self.inner.send_to(&frame, relay_addr).await?;
+        
+        tracing::debug!(
+            peer = ?peer,
+            session = hex::encode(session_id),
+            relay = %relay_addr,
+            "sent relay probe to complete session"
+        );
+        
+        Ok(())
+    }
     
     pub async fn add_direct_candidate(&self, identity: &Identity, addr: SocketAddr) {
         let smart_addr = SmartAddr::from_identity(identity);
@@ -2038,101 +1465,7 @@ impl AsyncUdpSocket for SmartSock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-
-    fn test_addr(port: u16) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
-    }
-
-    fn test_identity(seed: u8) -> Identity {
-        Identity::from([seed; 32])
-    }
-
-    #[test]
-    fn test_relay_session_pending() {
-        let session_id = [0xAB; 16];
-        let session = RelaySession::new_pending(
-            session_id,
-            test_identity(1),
-            test_identity(2),
-            test_addr(1000),
-        );
-        
-        assert!(!session.is_complete());
-        assert_eq!(session.peer_a_addr.port(), 1000);
-        assert!(session.peer_b_addr.is_none());
-    }
-
-    #[test]
-    fn test_relay_session_destination() {
-        let session_id = [0xAB; 16];
-        let mut session = RelaySession::new_pending(
-            session_id,
-            test_identity(1),
-            test_identity(2),
-            test_addr(1000),
-        );
-        session.peer_b_addr = Some(test_addr(2000));
-        
-        assert!(session.is_complete());
-        
-        assert_eq!(session.get_destination(test_addr(1000)), Some(test_addr(2000)));
-        
-        assert_eq!(session.get_destination(test_addr(2000)), Some(test_addr(1000)));
-        
-        assert_eq!(session.get_destination(test_addr(9999)), None);
-    }
-
-    #[tokio::test]
-    async fn test_register_and_complete_session() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let udprelay = UdpRelay::with_socket(Arc::new(socket));
-        
-        let session_id = [0xCD; 16];
-        let peer_a = test_addr(3000);
-        let peer_b = test_addr(4000);
-
-        let peer_a_id = test_identity(10);
-        let peer_b_id = test_identity(20);
-        
-        udprelay
-            .register_session(session_id, peer_a, peer_a_id, peer_b_id)
-            .await
-            .unwrap();
-        assert_eq!(udprelay.session_count().await, 1);
-        
-        udprelay
-            .complete_session(session_id, peer_b, peer_b_id, peer_a_id)
-            .await
-            .unwrap();
-        
-        let sessions = udprelay.sessions.read().await;
-        let session = sessions.get(&session_id).unwrap();
-        assert!(session.is_complete());
-        assert_eq!(session.peer_b_addr, Some(peer_b));
-    }
-
-    #[tokio::test]
-    async fn test_remove_session() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let udprelay = UdpRelay::with_socket(Arc::new(socket));
-        
-        let session_id = [0xEF; 16];
-        udprelay
-            .register_session(session_id, test_addr(5000), test_identity(10), test_identity(20))
-            .await
-            .unwrap();
-        assert_eq!(udprelay.session_count().await, 1);
-        
-        udprelay.remove_session(&session_id).await;
-        assert_eq!(udprelay.session_count().await, 0);
-    }
-
-    #[test]
-    fn test_crly_frame_format() {
-        assert_eq!(RELAY_MAGIC, *b"CRLY");
-        assert_eq!(RELAY_HEADER_SIZE, 20);
-    }
+    use crate::relay::{RelayTunnel, RELAY_MAGIC, RELAY_HEADER_SIZE};
 
     #[test]
     fn test_smart_addr_from_identity() {
@@ -2353,31 +1686,6 @@ mod tests {
             PathChoice::Relay { relay_addr, .. } => assert_eq!(relay_addr, relay),
             _ => panic!("Expected relay path"),
         }
-    }
-
-    #[test]
-    fn relay_session_fields() {
-        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let session = RelaySession::new_pending(
-            [0u8; 16],
-            Identity::from_bytes([1u8; 32]),
-            Identity::from_bytes([2u8; 32]),
-            addr,
-        );
-        
-        assert_eq!(session.session_id, [0u8; 16]);
-        let _ = session.peer_a_identity;
-        let _ = session.peer_b_identity;
-        let _ = session.peer_a_addr;
-        assert!(session.peer_b_addr.is_none());
-        let _ = session.created_at;
-        let _ = session.last_activity;
-        assert_eq!(session.bytes_relayed, 0);
-        assert_eq!(session.packets_relayed, 0);
-        assert!(!session.completion_locked);
-        
-        let cloned = session.clone();
-        let _debug = format!("{:?}", cloned);
     }
 
     #[test]
