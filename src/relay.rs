@@ -39,27 +39,47 @@ use crate::rpc::DhtNodeRpc;  // For check_reachability and ping;
 // Constants
 // ============================================================================
 
+/// Magic bytes identifying relay protocol frames.
 pub const RELAY_MAGIC: [u8; 4] = *b"CRLY";
+
+/// Size of the relay frame header: magic(4) + session_id(16).
 pub const RELAY_HEADER_SIZE: usize = 20;
+
+/// Maximum total sessions the relay server will manage.
+/// SCALABILITY: 10K sessions per relay server (see README Scaling Boundaries).
+/// SECURITY: Prevents memory exhaustion from session table growth.
 pub const MAX_SESSIONS: usize = 10_000;
+
+/// Duration after which inactive sessions are garbage collected.
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for sessions awaiting peer B completion.
+/// Shorter than SESSION_TIMEOUT to free half-open sessions quickly.
 pub const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval for the cleanup task that removes expired sessions.
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum relay frame size (fits in UDP MTU with headroom).
 pub const MAX_RELAY_FRAME_SIZE: usize = 1400;
 
 /// Maximum number of pending signaling notifications per channel.
+/// SECURITY: Bounds queue growth for slow/unresponsive receivers.
 pub const SIGNALING_CHANNEL_CAPACITY: usize = 16;
 
 /// Maximum number of registered signaling channels.
+/// SECURITY: Prevents memory exhaustion from channel registration spam.
 pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
 
 /// Maximum sessions per IP address (rate limiting).
+/// SECURITY: Limits session table pollution from a single IP.
 pub const MAX_SESSIONS_PER_IP: usize = 50;
 
 /// Rate limit window for session registration.
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 /// Maximum entries in addr_to_session map (bounded to prevent memory exhaustion).
+/// SECURITY: Secondary bound on address lookup table.
 pub const MAX_ADDR_TO_SESSION_ENTRIES: usize = 20_000;
 
 /// Sender for pushing signaling notifications to registered NAT nodes.
@@ -461,6 +481,9 @@ pub struct RelayClient {
     local_addr: std::net::SocketAddr,
     status: tokio::sync::RwLock<NatStatus>,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingConnection>>>,
+    /// The relay we are currently registered with, if any.
+    /// Used to validate incoming connection notifications.
+    registered_relay: tokio::sync::RwLock<Option<crate::identity::Contact>>,
 }
 
 impl RelayClient {
@@ -478,6 +501,7 @@ impl RelayClient {
             local_addr,
             status: tokio::sync::RwLock::new(NatStatus::Unknown),
             incoming_rx: tokio::sync::Mutex::new(None),
+            registered_relay: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -573,6 +597,10 @@ impl RelayClient {
             .register_for_signaling(relay, self.keypair.identity())
             .await?;
         
+        // SECURITY: Store the registered relay for later validation of incoming connections.
+        // This prevents malicious actors from spoofing relay notifications.
+        *self.registered_relay.write().await = Some(relay.clone());
+        
         // Transform RelayResponse into IncomingConnection
         let (tx, rx) = mpsc::channel::<IncomingConnection>(16);
         
@@ -604,15 +632,43 @@ impl RelayClient {
         let from_peer = crate::identity::Identity::from_hex(&incoming.from_peer)
             .context("invalid from_peer identity in IncomingConnection")?;
         
-        // SECURITY: Validate relay_data_addr before using it.
-        // This prevents malicious relays from directing us to arbitrary addresses.
-        let _relay_addr: std::net::SocketAddr = incoming.relay_data_addr
+        // SECURITY: Validate relay_data_addr format.
+        let relay_addr: std::net::SocketAddr = incoming.relay_data_addr
             .parse()
             .context("invalid relay_data_addr format")?;
         
-        // Note: In production, you might want to validate that the relay address
-        // is a known/trusted relay. For now we just ensure it's a valid socket address.
-        // Loopback addresses are allowed for testing purposes.
+        // SECURITY: Validate that the relay address matches our registered relay.
+        // This prevents malicious relays or MITM attacks from directing us to send
+        // UDP traffic to arbitrary third-party addresses (amplification vector).
+        {
+            let registered = self.registered_relay.read().await;
+            let registered_relay = registered.as_ref()
+                .context("cannot accept incoming connection: not registered with any relay")?;
+            
+            // Verify the relay_data_addr matches one of the registered relay's addresses
+            let relay_addr_str = relay_addr.to_string();
+            let is_trusted = registered_relay.addrs.iter().any(|addr| {
+                // Compare normalized addresses (both as SocketAddr to handle port variations)
+                if let Ok(registered_addr) = addr.parse::<std::net::SocketAddr>() {
+                    // Same IP is sufficient - port may vary for data vs signaling
+                    registered_addr.ip() == relay_addr.ip()
+                } else {
+                    addr == &relay_addr_str
+                }
+            });
+            
+            if !is_trusted {
+                warn!(
+                    relay_data_addr = %relay_addr,
+                    registered_relay = ?registered_relay.addrs,
+                    "rejecting incoming connection: relay address not from registered relay"
+                );
+                anyhow::bail!(
+                    "relay address {} does not match registered relay addresses",
+                    relay_addr
+                );
+            }
+        }
         
         self.rpc
             .complete_relay_session(
@@ -1146,6 +1202,14 @@ impl RelayServerActor {
             } else {
                 true
             }
+        });
+        
+        // SECURITY: Clean up stale ip_session_count entries to prevent unbounded growth.
+        // Entries are stale if their rate limit window has expired.
+        let now = Instant::now();
+        self.ip_session_count.retain(|_ip, (count, window_start)| {
+            // Keep if window is still active and has non-zero count
+            now.duration_since(*window_start) <= RATE_LIMIT_WINDOW && *count > 0
         });
         
         let removed = before - self.sessions.len();

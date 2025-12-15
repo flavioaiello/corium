@@ -1,3 +1,30 @@
+//! # Wire Protocol Messages
+//!
+//! This module defines all serializable message types used in Corium's wire protocols.
+//! Messages are serialized using bincode with size limits to prevent memory exhaustion.
+//!
+//! ## Protocol Types
+//!
+//! | Protocol | Request Type | Response Type |
+//! |----------|--------------|---------------|
+//! | DHT | `DhtNodeRequest` | `DhtNodeResponse` |
+//! | PubSub | `PlumTreeRequest` | (fire-and-forget) |
+//! | Membership | `HyParViewRequest` | (fire-and-forget) |
+//! | Relay | `RelayRequest` | `RelayResponse` |
+//! | Direct | `DirectRequest` | (application-defined) |
+//!
+//! ## Security Limits
+//!
+//! - `MAX_VALUE_SIZE`: Maximum size of stored values (1 MiB)
+//! - `MAX_DESERIALIZE_SIZE`: Maximum deserialization buffer (prevents OOM)
+//! - All deserialization uses `deserialize_bounded()` with size limits
+//!
+//! ## Message IDs
+//!
+//! PubSub messages are identified by a 32-byte `MessageId` computed as:
+//! `blake3(topic || source_identity || seqno || data)`
+//!
+//! This provides content-addressing and deduplication.
 
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -5,18 +32,27 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::storage::Key;
 use crate::identity::{Contact, Identity};
 
+/// Channel sender for direct (non-PubSub) messages between peers.
 pub type DirectMessageSender = tokio::sync::mpsc::Sender<(Identity, Vec<u8>)>;
 
+/// Maximum size of a stored value in the DHT (1 MiB).
+/// Larger values should be chunked or stored externally.
 pub const MAX_VALUE_SIZE: usize = 1024 * 1024;
 
+/// Maximum buffer size for deserialization.
+/// Set slightly larger than MAX_VALUE_SIZE to allow for message framing overhead.
 pub const MAX_DESERIALIZE_SIZE: u64 = (MAX_VALUE_SIZE as u64) + 4096;
 
+/// Returns bincode options with size limits enforced.
+/// SECURITY: Always use this for deserialization to prevent OOM attacks.
 fn bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(MAX_DESERIALIZE_SIZE)
     .with_fixint_encoding()
 }
 
+/// Deserialize with size bounds enforced.
+/// SECURITY: Use this instead of raw bincode::deserialize.
 pub fn deserialize_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
     bincode_options().deserialize(bytes)
 }

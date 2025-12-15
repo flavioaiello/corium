@@ -1,3 +1,44 @@
+//! # PlumTree Epidemic Broadcast
+//!
+//! This module implements the PlumTree protocol for reliable pub/sub messaging.
+//! PlumTree builds an efficient broadcast tree while maintaining reliability
+//! through lazy push repair.
+//!
+//! ## Protocol Overview
+//!
+//! PlumTree maintains two peer sets per topic:
+//!
+//! | Set | Purpose | Message Type |
+//! |-----|---------|-------------|
+//! | Eager | Immediate message forwarding | Full messages |
+//! | Lazy | Backup for missed messages | IHave announcements |
+//!
+//! ## Message Flow
+//!
+//! 1. **Publish**: Message sent to all eager peers
+//! 2. **IHave**: Lazy peers receive message ID announcements
+//! 3. **IWant**: Peer requests missing message
+//! 4. **Graft**: Promotes lazy peer to eager after repair
+//! 5. **Prune**: Demotes eager peer to lazy (tree optimization)
+//!
+//! ## Tree Optimization
+//!
+//! The eager peer set naturally forms a spanning tree:
+//! - First peer to deliver message becomes/stays eager
+//! - Duplicate deliveries trigger Prune (demote to lazy)
+//! - Missing messages trigger Graft (promote to eager)
+//!
+//! ## Security Measures
+//!
+//! - Message signatures verified before forwarding
+//! - Per-peer and global rate limiting
+//! - Bounded caches with LRU eviction
+//! - Sequence number tracking for replay detection
+//!
+//! ## References
+//!
+//! Leitão, J., Pereira, J., & Rodrigues, L. (2007). "Epidemic Broadcast Trees"
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -13,23 +54,57 @@ use crate::identity::{Identity, Keypair};
 use crate::messages::{MessageId, PlumTreeMessage};
 use crate::rpc::PlumTreeRpc;
 
+// ============================================================================
+// Configuration Constants
+// ============================================================================
 
+/// Default number of eager peers per topic (tree fanout).
 pub const DEFAULT_EAGER_PEERS: usize = 6;
+
+/// Default number of lazy peers per topic (reliability mesh).
 pub const DEFAULT_LAZY_PEERS: usize = 6;
+
+/// Timeout for IWant requests before trying another peer.
 pub const DEFAULT_IHAVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Interval between lazy push rounds (IHave announcements).
 pub const DEFAULT_LAZY_PUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Default message cache size (number of messages).
 pub const DEFAULT_MESSAGE_CACHE_SIZE: usize = 10_000;
+
+/// Time-to-live for cached messages.
 pub const DEFAULT_MESSAGE_CACHE_TTL: Duration = Duration::from_secs(120);
+
+/// Interval between heartbeat rounds (maintenance tasks).
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum IHave message IDs per announcement.
 pub const DEFAULT_MAX_IHAVE_LENGTH: usize = 100;
 
+// ============================================================================
+// Security Limits
+// ============================================================================
+
+/// Maximum message payload size (64 KiB).
+/// SECURITY: Prevents memory exhaustion from large messages.
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Rate limit for local publishes per second.
 pub const DEFAULT_PUBLISH_RATE_LIMIT: usize = 100;
+
+/// Rate limit for messages received per peer per second.
 pub const DEFAULT_PER_PEER_RATE_LIMIT: usize = 50;
+
+/// Time window for rate limiting.
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 
+/// Maximum topic name length.
 pub const MAX_TOPIC_LENGTH: usize = 256;
+
+/// Maximum number of topics a node can track.
+/// SCALABILITY: 10K topics is the per-node limit (see README Scaling Boundaries).
+/// SECURITY: Prevents memory exhaustion from topic proliferation.
 pub const MAX_TOPICS: usize = 10_000;
 
 #[inline]
@@ -40,22 +115,51 @@ pub fn is_valid_topic(topic: &str) -> bool {
 }
 
 pub const MAX_SUBSCRIPTIONS_PER_PEER: usize = 100;
+
+/// Maximum peers tracked per topic.
+/// SCALABILITY: 1,000 peers/topic maintains gossip efficiency (see README).
+/// SECURITY: Bounds topic data structure growth.
 pub const MAX_PEERS_PER_TOPIC: usize = 1000;
 
+/// Maximum pending IWant requests per peer.
 pub const DEFAULT_MAX_IWANT_MESSAGES: usize = 10;
+
+/// Rate limit for IWant requests per peer per second.
 pub const DEFAULT_IWANT_RATE_LIMIT: usize = 5;
+
+/// Maximum bytes in an IWant batch response.
 pub const MAX_IWANT_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// Maximum outbound queue size per peer.
+/// SECURITY: Prevents memory exhaustion from slow receivers.
 pub const MAX_OUTBOUND_PER_PEER: usize = 100;
+
+/// Maximum total outbound messages across all peers.
+/// SECURITY: Global memory bound for outbound queues.
 pub const MAX_TOTAL_OUTBOUND_MESSAGES: usize = 50_000;
+
+/// Maximum peers in the outbound queue map.
 pub const MAX_OUTBOUND_PEERS: usize = 1000;
 
-pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
-pub const RATE_LIMIT_ENTRY_MAX_AGE: Duration = Duration::from_secs(300);
+/// Maximum number of known peers to track.
+/// This bounds memory usage even if HyParView misbehaves.
+pub const MAX_KNOWN_PEERS: usize = 1000;
 
+/// Maximum entries in the rate limit tracker.
+/// SECURITY: Bounds the rate limiter itself to prevent memory leaks.
+pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
+
+/// Maximum message sources to track sequence numbers for.
+/// SCALABILITY: 10K sources × 128-bit window = ~2 MB (constant, not O(N)).
+/// SECURITY: Limits replay tracking table size.
 pub const MAX_SEQNO_TRACKING_SOURCES: usize = 10_000;
+
+/// Window size for sequence number tracking (replay detection).
+/// A sliding window allows out-of-order delivery within bounds.
 pub const SEQNO_WINDOW_SIZE: usize = 128;
 
+/// Maximum total bytes for message cache (64 MiB).
+/// SECURITY: Hard limit on message cache memory usage.
 pub const MAX_MESSAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -157,6 +261,9 @@ fn verify_plumtree_signature(
 
 
 const MAX_PENDING_IWANTS: usize = 100;
+
+/// Global limit on pending IWants across all topics to prevent memory exhaustion.
+const MAX_GLOBAL_PENDING_IWANTS: usize = 1000;
 
 #[derive(Clone, Debug, Default)]
 struct SeqnoTracker {
@@ -334,7 +441,16 @@ impl TopicState {
         self.last_lazy_push.elapsed() >= lazy_push_interval && !self.lazy_peers.is_empty()
     }
 
-    pub fn record_iwant(&mut self, msg_id: MessageId, peer: Identity) {
+    /// Record a pending IWant for a message. Returns the delta to apply to the global count:
+    /// +1 if a new entry was added, 0 if updated existing, -1 if an old entry was evicted.
+    pub fn record_iwant(&mut self, msg_id: MessageId, peer: Identity) -> i32 {
+        let mut delta = 0i32;
+        
+        // If entry already exists, just return 0 (no change to global count)
+        if self.pending_iwants.contains_key(&msg_id) {
+            return 0;
+        }
+        
         if self.pending_iwants.len() >= MAX_PENDING_IWANTS {
             if let Some(oldest) = self.pending_iwants
                 .iter()
@@ -342,12 +458,18 @@ impl TopicState {
                 .map(|(id, _)| *id)
             {
                 self.pending_iwants.remove(&oldest);
+                delta -= 1; // Evicted one
             }
         }
         self.pending_iwants.insert(msg_id, (Instant::now(), vec![peer]));
+        delta += 1; // Added one
+        delta
     }
 
-    pub fn check_iwant_timeouts(&mut self, ihave_timeout: Duration) -> Vec<(MessageId, Identity)> {
+    /// Check for timed out IWant requests and retry with different peers.
+    /// Returns (retries, completed_count) where completed_count is the number of
+    /// IWants that exhausted all retry options and were removed.
+    pub fn check_iwant_timeouts(&mut self, ihave_timeout: Duration) -> (Vec<(MessageId, Identity)>, usize) {
         let now = Instant::now();
         let mut retries = Vec::new();
         let mut completed = Vec::new();
@@ -367,15 +489,17 @@ impl TopicState {
             }
         }
 
+        let completed_count = completed.len();
         for msg_id in completed {
             self.pending_iwants.remove(&msg_id);
         }
 
-        retries
+        (retries, completed_count)
     }
 
-    pub fn message_received(&mut self, msg_id: &MessageId) {
-        self.pending_iwants.remove(msg_id);
+    /// Remove a pending IWant when message is received. Returns true if an entry was removed.
+    pub fn message_received(&mut self, msg_id: &MessageId) -> bool {
+        self.pending_iwants.remove(msg_id).is_some()
     }
 }
 
@@ -439,10 +563,6 @@ impl PeerRateLimit {
         
         self.publish_times.push_back(now);
         false
-    }
-    
-    pub fn is_stale(&self, now: Instant) -> bool {
-        now.duration_since(self.last_active) > RATE_LIMIT_ENTRY_MAX_AGE
     }
 }
 
@@ -610,11 +730,19 @@ struct PlumTreeActor<N: PlumTreeRpc> {
     message_cache: LruCache<MessageId, CachedMessage>,
     message_cache_bytes: usize,
     seqno: u64,
-    seqno_tracker: HashMap<Identity, SeqnoTracker>,
+    /// Per-source sequence number tracking to detect replays.
+    /// Uses LruCache to enforce MAX_SEQNO_TRACKING_SOURCES bound.
+    seqno_tracker: LruCache<Identity, SeqnoTracker>,
     message_tx: mpsc::Sender<ReceivedMessage>,
     outbound: HashMap<Identity, Vec<PlumTreeMessage>>,
-    rate_limits: HashMap<Identity, PeerRateLimit>,
-    known_peers: HashSet<Identity>,
+    /// Per-peer rate limiting.
+    /// Uses LruCache to enforce MAX_RATE_LIMIT_ENTRIES bound.
+    rate_limits: LruCache<Identity, PeerRateLimit>,
+    /// Known peers from HyParView membership.
+    /// Uses LruCache to enforce MAX_KNOWN_PEERS bound as defense-in-depth.
+    known_peers: LruCache<Identity, ()>,
+    /// Global count of pending IWants across all topics.
+    global_pending_iwants: usize,
 }
 
 impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
@@ -628,6 +756,14 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             .unwrap_or(NonZeroUsize::new(1).expect("1 is non-zero"));
         let local_identity = keypair.identity();
         
+        // SECURITY: Bounded LRU caches to prevent memory exhaustion attacks
+        let seqno_tracker_cap = NonZeroUsize::new(MAX_SEQNO_TRACKING_SOURCES)
+            .expect("MAX_SEQNO_TRACKING_SOURCES must be non-zero");
+        let rate_limits_cap = NonZeroUsize::new(MAX_RATE_LIMIT_ENTRIES)
+            .expect("MAX_RATE_LIMIT_ENTRIES must be non-zero");
+        let known_peers_cap = NonZeroUsize::new(MAX_KNOWN_PEERS)
+            .expect("MAX_KNOWN_PEERS must be non-zero");
+        
         Self {
             network,
             keypair,
@@ -638,11 +774,12 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             message_cache: LruCache::new(cache_size),
             message_cache_bytes: 0,
             seqno: 0,
-            seqno_tracker: HashMap::new(),
+            seqno_tracker: LruCache::new(seqno_tracker_cap),
             message_tx,
             outbound: HashMap::new(),
-            rate_limits: HashMap::new(),
-            known_peers: HashSet::new(),
+            rate_limits: LruCache::new(rate_limits_cap),
+            known_peers: LruCache::new(known_peers_cap),
+            global_pending_iwants: 0,
         }
     }
 
@@ -725,7 +862,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
 
         let state = self.topics.entry(topic.to_string()).or_default();
         
-        for peer in self.known_peers.iter() {
+        for (peer, _) in self.known_peers.iter() {
             if *peer != self.local_identity {
                 state.add_peer_with_limits(*peer, self.config.eager_peers, self.config.lazy_peers);
             }
@@ -782,7 +919,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
 
         // Check local publish rate limit
         {
-            let limiter = self.rate_limits.entry(self.local_identity).or_default();
+            let limiter = self.rate_limits.get_or_insert_mut(self.local_identity, PeerRateLimit::default);
             if limiter.check_and_record(self.config.publish_rate_limit) {
                 return Err(MessageRejection::RateLimited.into());
             }
@@ -926,9 +1063,9 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
         
-        // known_peers is transitively bounded by HyParView's active_view_capacity,
-        // since neighbor_up/neighbor_down events mirror active_view membership.
-        self.known_peers.insert(peer);
+        // known_peers is bounded by LruCache with MAX_KNOWN_PEERS capacity.
+        // LRU eviction provides defense-in-depth against HyParView bugs.
+        self.known_peers.put(peer, ());
         
         if self.subscriptions.is_empty() {
             return;
@@ -951,7 +1088,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
         
-        self.known_peers.remove(peer);
+        self.known_peers.pop(peer);
         self.outbound.remove(peer);
         
         for (topic, state) in self.topics.iter_mut() {
@@ -1050,16 +1187,9 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         {
-            if self.seqno_tracker.len() >= MAX_SEQNO_TRACKING_SOURCES && !self.seqno_tracker.contains_key(&source) {
-                let oldest = self.seqno_tracker.iter()
-                    .min_by_key(|(_, t)| t.highest_seen)
-                    .map(|(id, _)| *id);
-                if let Some(id) = oldest {
-                    self.seqno_tracker.remove(&id);
-                }
-            }
-            
-            let source_tracker = self.seqno_tracker.entry(source).or_default();
+            // LruCache automatically enforces MAX_SEQNO_TRACKING_SOURCES bound
+            // by evicting least-recently-used entries when capacity is reached.
+            let source_tracker = self.seqno_tracker.get_or_insert_mut(source, SeqnoTracker::default);
             if !source_tracker.check_and_record(seqno) {
                 debug!(
                     from = %hex::encode(&from.as_bytes()[..8]),
@@ -1072,11 +1202,9 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         {
-            if self.rate_limits.len() >= MAX_RATE_LIMIT_ENTRIES {
-                let now = Instant::now();
-                self.rate_limits.retain(|_, limiter| !limiter.is_stale(now));
-            }
-            let limiter = self.rate_limits.entry(*from).or_default();
+            // LruCache automatically enforces MAX_RATE_LIMIT_ENTRIES bound
+            // by evicting least-recently-used entries when capacity is reached.
+            let limiter = self.rate_limits.get_or_insert_mut(*from, PeerRateLimit::default);
             if limiter.check_and_record(self.config.per_peer_rate_limit) {
                 debug!(from = %hex::encode(&from.as_bytes()[..8]), "peer rate limited");
                 return Ok(());
@@ -1114,7 +1242,10 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         });
 
         if let Some(state) = self.topics.get_mut(topic) {
-            state.message_received(&msg_id);
+            // Update global pending IWant counter when message is received
+            if state.message_received(&msg_id) {
+                self.global_pending_iwants = self.global_pending_iwants.saturating_sub(1);
+            }
             
             state.recent_messages.push_back(msg_id);
             if state.recent_messages.len() > self.config.max_ihave_length {
@@ -1184,7 +1315,17 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             state.promote_to_eager_with_limit(*from, self.config.eager_peers);
             
             for msg_id in &missing {
-                state.record_iwant(*msg_id, *from);
+                // SECURITY: Enforce global pending IWant limit to prevent memory exhaustion
+                if self.global_pending_iwants >= MAX_GLOBAL_PENDING_IWANTS {
+                    debug!(
+                        global_pending = self.global_pending_iwants,
+                        max = MAX_GLOBAL_PENDING_IWANTS,
+                        "global pending IWant limit reached, dropping IWant request"
+                    );
+                    break;
+                }
+                let delta = state.record_iwant(*msg_id, *from);
+                self.global_pending_iwants = (self.global_pending_iwants as i32 + delta).max(0) as usize;
             }
         }
 
@@ -1215,7 +1356,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
 
         {
-            let limiter = self.rate_limits.entry(*from).or_default();
+            let limiter = self.rate_limits.get_or_insert_mut(*from, PeerRateLimit::default);
             if limiter.check_and_record_iwant(DEFAULT_IWANT_RATE_LIMIT) {
                 warn!(peer = %hex::encode(&from.as_bytes()[..8]), "IWant rate limited");
                 return;
@@ -1306,11 +1447,14 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
     }
 
     async fn check_timeouts(&mut self, topic: &str) {
-        let retries: Vec<(MessageId, Identity)> = if let Some(state) = self.topics.get_mut(topic) {
+        let (retries, completed_count): (Vec<(MessageId, Identity)>, usize) = if let Some(state) = self.topics.get_mut(topic) {
             state.check_iwant_timeouts(self.config.ihave_timeout)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
+        
+        // Update global pending IWant count for completed (timed out) entries
+        self.global_pending_iwants = self.global_pending_iwants.saturating_sub(completed_count);
 
         for (msg_id, peer) in retries {
             self.queue_message(&peer, PlumTreeMessage::IWant {
@@ -1325,8 +1469,9 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
     }
 
     fn cleanup_stale_state(&mut self) {
-        let now = Instant::now();
-        self.rate_limits.retain(|_, limiter| !limiter.is_stale(now));
+        // Note: rate_limits is now an LruCache that auto-evicts oldest entries.
+        // We don't need to explicitly clean stale entries as the LRU policy
+        // handles memory bounding, but we clear outbound buffers and cache.
         self.outbound.retain(|_, msgs| !msgs.is_empty());
         self.evict_expired_cache_entries();
     }
@@ -1668,7 +1813,7 @@ mod tests {
         
         let _ = state.should_lazy_push(DEFAULT_LAZY_PUSH_INTERVAL);
         
-        let retries = state.check_iwant_timeouts(DEFAULT_IHAVE_TIMEOUT);
+        let (retries, _completed) = state.check_iwant_timeouts(DEFAULT_IHAVE_TIMEOUT);
         assert!(retries.is_empty());
     }
 

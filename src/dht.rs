@@ -1,3 +1,38 @@
+//! # Kademlia-style Distributed Hash Table
+//!
+//! This module implements a Kademlia-inspired DHT with several enhancements:
+//!
+//! - **Adaptive Parameters**: k and α adjust based on network conditions
+//! - **Tiered Routing**: Contacts are grouped by latency for faster lookups
+//! - **Pressure-based Storage**: Values are evicted under resource pressure
+//! - **Eclipse Resistance**: Rate limiting prevents routing table poisoning
+//!
+//! ## Key Operations
+//!
+//! | Operation | Description |
+//! |-----------|-------------|
+//! | `put(key, value)` | Store a value (content-addressed or identity record) |
+//! | `get(key)` | Retrieve a value via iterative lookup |
+//! | `find_node(id)` | Find contacts closest to an identity |
+//! | `bootstrap(contact)` | Join the network via a known peer |
+//!
+//! ## Routing Table
+//!
+//! The routing table uses 256 k-buckets indexed by XOR distance prefix.
+//! Each bucket holds up to k contacts, with LRU eviction when full.
+//!
+//! ## Actor Architecture
+//!
+//! - `DhtNode`: Public handle for DHT operations
+//! - `DhtActor`: Internal actor owning routing table and storage
+//! - Commands are sent via async channels for thread-safe access
+//!
+//! ## Security
+//!
+//! - Per-peer insertion rate limiting (see `RoutingInsertionLimiter`)
+//! - Content verification: `hash(value) == key` or signed identity record
+//! - Bounded storage with automatic eviction
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -22,8 +57,14 @@ use crate::rpc::DhtNodeRpc;
 // Re-export Key for backward compatibility
 pub use crate::storage::Key;
 
+/// Maximum age for endpoint records before they're considered stale (24 hours).
+/// Records older than this are not propagated during lookups.
 const ENDPOINT_RECORD_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Maximum retries when offloading values during graceful shutdown.
 const OFFLOAD_MAX_RETRIES: usize = 3;
+
+/// Base delay between offload retry attempts (exponential backoff).
 const OFFLOAD_BASE_DELAY_MS: u64 = 100;
 
 pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
@@ -73,8 +114,14 @@ pub(crate) fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
 }
 
 
+/// Window size for query statistics used in adaptive parameter tuning.
 const QUERY_STATS_WINDOW: usize = 100;
 
+/// Adaptive Kademlia parameters that adjust to network conditions.
+/// 
+/// Tracks query success/failure history to dynamically adjust:
+/// - `k`: Replication factor (number of contacts per bucket)
+/// - `alpha`: Concurrency factor (parallel queries during lookup)
 pub(crate) struct AdaptiveParams {
     k: usize,
     alpha: usize,
@@ -162,21 +209,40 @@ pub struct TelemetrySnapshot {
 }
 
 
+// ============================================================================
+// Tiering Configuration (Latency-Aware Routing)
+// ============================================================================
+
+/// Interval for recomputing tier centroids via k-means clustering.
 const TIERING_RECOMPUTE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Maximum RTT samples kept per /16 prefix.
+/// Older samples are evicted to adapt to network changes.
 const MAX_RTT_SAMPLES_PER_PREFIX: usize = 32;
 
+/// Minimum number of latency tiers (at least 1 tier always exists).
 const MIN_LATENCY_TIERS: usize = 1;
 
+/// Maximum number of latency tiers for contact grouping.
 const MAX_LATENCY_TIERS: usize = 7;
 
+/// Iterations for k-means clustering when computing tier boundaries.
 const KMEANS_ITERATIONS: usize = 20;
 
+/// Penalty factor applied to higher tiers during contact selection.
+/// Biases toward lower-latency peers.
 const TIERING_PENALTY_FACTOR: f32 = 1.5;
 
-/// Maximum /16 prefixes to track (65536 possible, we track active ones)
+/// Maximum /16 prefixes to track (65536 possible, we track active ones).
+/// SCALABILITY: O(65K) prefixes vs O(N) per-peer tracking (~1 MB at 10M nodes).
+/// SECURITY: Bounds memory for RTT tracking tables.
 const MAX_TIERING_TRACKED_PREFIXES: usize = 10_000;
 
+/// Tiering level for latency-based contact grouping.
+/// 
+/// Contacts are grouped into tiers based on their /16 IP prefix's RTT.
+/// Tier 0 = fastest, higher tiers = progressively slower.
+/// This enables latency-aware routing during lookups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TieringLevel(usize);
 
@@ -190,13 +256,19 @@ impl TieringLevel {
     }
 }
 
+/// Statistics about latency tiers for telemetry/debugging.
 #[derive(Clone, Debug, Default)]
 pub struct TieringStats {
+    /// Centroid latency (ms) for each tier, sorted ascending.
     pub centroids: Vec<f32>,
+    /// Number of /16 prefixes in each tier.
     pub counts: Vec<usize>,
 }
 
-/// /16 prefix key: first two octets of IPv4 or first segment of IPv6
+/// /16 prefix key: first two octets of IPv4 or first segment of IPv6.
+/// 
+/// Used for latency-based grouping - all IPs in the same /16 typically
+/// have similar latency (same ISP/region).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Prefix16(u16);
 
@@ -280,9 +352,11 @@ impl PrefixRttStats {
 /// - Immediate RTT estimates for unseen peers in known prefixes
 /// - Linear scaling to millions of nodes
 pub(crate) struct TieringManager {
-    /// /16 prefix → RTT statistics (LRU cache)
+    /// /16 prefix → RTT statistics (LRU cache, bounded by MAX_TIERING_TRACKED_PREFIXES)
     prefix_rtt: LruCache<Prefix16, PrefixRttStats>,
-    /// /16 prefix → tier assignment
+    /// /16 prefix → tier assignment.
+    /// BOUNDED: Only populated from prefix_rtt.iter() during recompute_if_needed(),
+    /// so size is transitively bounded by MAX_TIERING_TRACKED_PREFIXES.
     prefix_tiers: HashMap<Prefix16, TieringLevel>,
     /// Tier centroids (sorted by latency)
     centroids: Vec<f32>,
@@ -579,7 +653,13 @@ fn nearest_center_scalar(value: f32, centers: &[f32]) -> usize {
 }
 
 
+/// Default Kademlia replication factor (bucket size).
+/// At 10M+ nodes: 256 buckets × 20 contacts = 5,120 routing contacts (~640 KB).
+/// Adaptive range: 10-30 based on observed churn.
 pub const DEFAULT_K: usize = 20;
+
+/// Default Kademlia concurrency factor (parallel queries).
+/// Adaptive range: 2-5 based on network congestion.
 pub const DEFAULT_ALPHA: usize = 3;
 
 

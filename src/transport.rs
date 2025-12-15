@@ -1,3 +1,51 @@
+//! # SmartSock Multi-Path Transport Layer
+//!
+//! This module provides intelligent path selection for peer communication,
+//! automatically choosing between direct UDP and relay tunnels based on
+//! availability and measured latency.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────┐
+//! │  SmartSock  │──────► QUIC Endpoint
+//! └──────┬──────┘
+//!        │
+//!   ┌────┴────┐
+//!   │         │
+//!   ▼         ▼
+//! Direct    Relay
+//!  UDP     Tunnel
+//! ```
+//!
+//! ## Path Selection
+//!
+//! SmartSock continuously probes available paths and selects the best one:
+//!
+//! 1. **Direct paths** preferred when reachable (lower latency)
+//! 2. **Relay tunnels** used when direct is blocked (NAT/firewall)
+//! 3. **RTT-based selection** when multiple paths available
+//!
+//! ## Probing Protocol
+//!
+//! - `SMPR` magic prefix identifies probe packets
+//! - Request contains transaction ID and timestamp
+//! - Response echoes timestamp for RTT calculation
+//! - Exponential moving average smooths RTT measurements
+//!
+//! ## Relay Integration
+//!
+//! SmartSock integrates with the relay system:
+//! - Relay tunnels registered via `add_relay_tunnel()`
+//! - CRLY-prefixed packets routed through relay
+//! - Stale tunnels cleaned up automatically
+//!
+//! ## QUIC Integration
+//!
+//! SmartSock implements Quinn's `AsyncUdpSocket` trait, allowing it to be
+//! used as the underlying transport for QUIC connections. The QUIC layer
+//! is unaware of path switching happening below.
+
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::hash::Hash;
@@ -28,27 +76,76 @@ pub trait PathEventHandler: Send + Sync {
 }
 
 
-// Transport-specific constants (relay constants are in relay.rs)
+// ============================================================================
+// SmartSock Transport Constants
+// ============================================================================
+
+/// Timeout for direct connection attempts before falling back.
 pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum peers tracked by SmartSock.
+/// SECURITY: Bounds peer state table size.
 pub const MAX_SMARTSOCK_PEERS: usize = 10_000;
 
+// ----------------------------------------------------------------------------
+// Path Probing Protocol
+// ----------------------------------------------------------------------------
+
+/// Magic bytes identifying SmartSock probe packets.
 pub const PROBE_MAGIC: [u8; 4] = *b"SMPR";
+
+/// Probe type: request (expects response).
 pub const PROBE_TYPE_REQUEST: u8 = 0x01;
+
+/// Probe type: response (echoes request tx_id).
 pub const PROBE_TYPE_RESPONSE: u8 = 0x02;
+
+/// Size of probe header: magic(4) + type(1) + tx_id(8) + timestamp(8).
 pub const PROBE_HEADER_SIZE: usize = 21;
+
+/// Interval between path quality probes.
 pub const PATH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Timeout after which an unprobed path is considered stale.
 pub const PATH_STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Consecutive probe failures before marking path as down.
 pub const MAX_PROBE_FAILURES: u32 = 3;
+
+// ----------------------------------------------------------------------------
+// RTT Estimation and Path Selection
+// ----------------------------------------------------------------------------
+
 /// Relay tunnels are cleaned up if idle longer than this.
 /// Matches the server-side SESSION_TIMEOUT in relay.rs.
 const RELAY_TUNNEL_STALE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// RTT bonus (ms) required for relay to beat direct path selection.
+/// Bias toward direct paths to reduce relay load.
 const RELAY_RTT_ADVANTAGE_MS: f32 = 50.0;
+
+/// EMA smoothing factor for old RTT samples (higher = more smoothing).
 const RTT_EMA_OLD: f32 = 0.8;
+
+/// EMA smoothing factor for new RTT samples.
 const RTT_EMA_NEW: f32 = 0.2;
 
+// ----------------------------------------------------------------------------
+// Per-Peer Limits
+// ----------------------------------------------------------------------------
+
+/// Maximum pending probe requests per peer.
 const MAX_PENDING_PROBES_PER_PEER: usize = 64;
+
+/// Maximum path candidates tracked per peer.
 const MAX_CANDIDATES_PER_PEER: usize = 24;
+
+/// Maximum direct addresses stored per peer.
 const MAX_DIRECT_ADDRS_PER_PEER: usize = 16;
+
+/// Maximum relay tunnels per peer to prevent memory exhaustion.
+/// SECURITY: Bounds relay tunnel state per peer.
+const MAX_RELAY_TUNNELS_PER_PEER: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct PathProbeRequest {
@@ -605,8 +702,13 @@ impl PeerPathState {
 pub struct SmartSock {
     inner: Arc<tokio::net::UdpSocket>,
     
+    /// Peer tracking map, bounded by MAX_SMARTSOCK_PEERS with LRU eviction.
     peers: RwLock<HashMap<SmartAddr, PeerPathState>>,
     
+    /// Reverse lookup: SocketAddr → SmartAddr.
+    /// BOUNDED: Transitively bounded by MAX_SMARTSOCK_PEERS × 
+    /// (MAX_DIRECT_ADDRS_PER_PEER + MAX_RELAY_TUNNELS_PER_PEER + MAX_CANDIDATES_PER_PEER).
+    /// Entries are cleaned when peers are evicted or tunnels are removed.
     reverse_map: RwLock<HashMap<SocketAddr, SmartAddr>>,
     
     local_addr: SocketAddr,
@@ -751,6 +853,18 @@ impl SmartSock {
         
         let mut peers = self.peers.write().await;
         let state = peers.get_mut(&smart_addr)?;
+        
+        // SECURITY: Enforce per-peer relay tunnel limit to prevent memory exhaustion
+        if state.relay_tunnels.len() >= MAX_RELAY_TUNNELS_PER_PEER 
+            && !state.relay_tunnels.contains_key(&session_id) 
+        {
+            tracing::warn!(
+                peer = ?identity,
+                limit = MAX_RELAY_TUNNELS_PER_PEER,
+                "relay tunnel limit reached for peer, rejecting new tunnel"
+            );
+            return None;
+        }
         
         state.relay_tunnels.insert(session_id, tunnel);
         

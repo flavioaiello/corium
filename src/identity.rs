@@ -1,8 +1,46 @@
+//! # Identity and Cryptographic Primitives
+//!
+//! This module defines the core identity types used throughout Corium:
+//!
+//! - [`Keypair`]: Ed25519 signing keypair (secret + public key)
+//! - [`Identity`]: 32-byte public key serving as the peer's unique identifier
+//! - [`Contact`]: Signed endpoint record containing addresses and relay information
+//!
+//! ## Identity Model
+//!
+//! Corium uses a simple identity model: **Identity = Ed25519 Public Key**.
+//! This provides:
+//!
+//! - **Sybil resistance**: Creating identities requires cryptographic work
+//! - **Self-certifying**: No external CA needed; possession of private key proves identity
+//! - **XOR-metric routing**: Identities can be used directly in Kademlia-style DHT
+//!
+//! ## Contact Records
+//!
+//! A [`Contact`] is a signed record containing:
+//! - The peer's identity (public key)
+//! - Network addresses (IP:port)
+//! - Relay identities for NAT-bound nodes
+//! - Timestamp and signature for freshness verification
+//!
+//! Contacts are stored in the DHT under key = identity bytes, allowing
+//! any peer to discover how to reach a given identity.
+//!
+//! ## Security Invariants
+//!
+//! - P1: `Identity::from_bytes(bytes).as_bytes() == bytes` (round-trip preservation)
+//! - P2: XOR distance is symmetric and satisfies triangle inequality
+//! - P3: Only valid Ed25519 points are accepted as identities
+//! - P4: Contact signatures bind addresses to identity cryptographically
+//! - P5: Timestamps prevent replay of stale contact records
+
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Returns current time as milliseconds since Unix epoch.
+/// Used for timestamp generation in signed records.
 #[inline]
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -258,12 +296,22 @@ impl Contact {
         self.addrs.iter().map(|s| s.as_str())
     }
 
+    /// Verify the cryptographic signature of this Contact record.
+    /// 
+    /// This verifies that:
+    /// 1. The record has both timestamp and signature
+    /// 2. The signature was created by the identity's private key
+    /// 3. The signature covers: identity + addresses + relays + is_relay + timestamp
+    /// 
+    /// SECURITY: Signature verification ensures addresses are bound to the identity.
+    /// An attacker cannot forge a Contact pointing to their own address.
     pub fn verify(&self) -> bool {
         // Unsigned records cannot be verified
         let (Some(timestamp), Some(sig)) = (self.timestamp, self.signature.as_ref()) else {
             return false;
         };
 
+        // Reconstruct the signed data exactly as it was created
         let mut data = Vec::new();
         data.extend_from_slice(self.identity.as_bytes());
         data.extend_from_slice(&(self.addrs.len() as u32).to_le_bytes());
@@ -291,6 +339,15 @@ impl Contact {
         verifying_key.verify_strict(&data, &signature).is_ok()
     }
 
+    /// Verify the signature AND freshness of this Contact record.
+    /// 
+    /// SECURITY: This is the recommended verification method for DHT records.
+    /// It prevents replay attacks by rejecting records older than max_age_secs.
+    /// 
+    /// Rejects records that are:
+    /// - Not cryptographically valid (via verify())
+    /// - Older than max_age_secs (stale)
+    /// - More than 10 seconds in the future (clock skew tolerance)
     pub fn verify_fresh(&self, max_age_secs: u64) -> bool {
         if !self.verify() {
             return false;
@@ -302,11 +359,14 @@ impl Contact {
         
         let max_age_ms = max_age_secs * 1000;
         
+        // SECURITY: Allow small clock skew (10s) for future timestamps,
+        // but reject anything too far in the future to prevent pre-dated attacks.
         const FUTURE_TOLERANCE_MS: u64 = 10_000;
         if timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
         }
         
+        // Reject stale records to prevent replay of old addresses
         if current_time.saturating_sub(timestamp) > max_age_ms {
             return false;
         }
@@ -322,7 +382,20 @@ impl Contact {
         !self.addrs.is_empty()
     }
 
+    /// Validate the structural integrity of a Contact record.
+    /// 
+    /// SECURITY: This validates bounds and format, NOT cryptographic signatures.
+    /// Always call `verify()` or `verify_fresh()` for untrusted data.
+    /// 
+    /// Checks:
+    /// - Address count ≤ MAX_ADDRS (16)
+    /// - Relay count ≤ MAX_RELAYS (8)  
+    /// - Each address ≤ MAX_ADDR_LEN (256) and non-empty
+    /// - Each relay identity is a valid Ed25519 point
+    /// - Signature length is exactly 64 bytes if present
     pub fn validate_structure(&self) -> bool {
+        // SECURITY: These limits prevent memory exhaustion attacks when
+        // deserializing untrusted Contact records from the network.
         const MAX_ADDRS: usize = 16;
         const MAX_RELAYS: usize = 8;
         const MAX_ADDR_LEN: usize = 256;

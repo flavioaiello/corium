@@ -1,3 +1,38 @@
+//! # HyParView Membership Protocol
+//!
+//! This module implements the HyParView protocol for maintaining partial mesh views
+//! in large-scale distributed systems. HyParView provides:
+//!
+//! - **Scalability**: Each node maintains O(log N) active connections
+//! - **Reliability**: Partial views heal automatically after failures
+//! - **Symmetry**: If A has B in active view, B has A in active view
+//!
+//! ## View Types
+//!
+//! | View | Size | Purpose |
+//! |------|------|--------|
+//! | Active | ~5 | Bidirectional connections for message passing |
+//! | Passive | ~30 | Backup candidates for active view repair |
+//!
+//! ## Protocol Messages
+//!
+//! - `Join`: Request to join the overlay (forwarded with TTL)
+//! - `ForwardJoin`: Propagated join request
+//! - `Neighbor`: Request to add to active view
+//! - `Shuffle`: Periodic view exchange for discovery
+//! - `Disconnect`: Graceful removal from active view
+//!
+//! ## Integration with PlumTree
+//!
+//! HyParView provides the membership layer for PlumTree PubSub:
+//! - `neighbor_up`: Called when peer joins active view
+//! - `neighbor_down`: Called when peer leaves active view
+//!
+//! ## References
+//!
+//! Leitão, J., Pereira, J., & Rodrigues, L. (2007). "HyParView: A Membership
+//! Protocol for Reliable Gossip-Based Broadcast"
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,13 +51,32 @@ use crate::rpc::HyParViewRpc;
 
 #[derive(Clone, Debug)]
 pub struct HyParViewConfig {
+    /// Maximum peers in active (connected) view.
+    /// SCALABILITY: O(log N) connections; at 10M nodes ≈ 5 peers.
+    /// Paper recommends log(N) + 1 ≈ 5 for reasonable network sizes.
     pub active_view_capacity: usize,
+    
+    /// Maximum peers in passive (backup) view.
+    /// SCALABILITY: 100 candidates × 128 bytes = ~13 KB (constant, not O(N)).
+    /// Larger passive view improves resilience but costs memory.
     pub passive_view_capacity: usize,
+    
+    /// Number of active peers included in shuffle requests.
     pub shuffle_active_count: usize,
+    
+    /// Number of passive peers included in shuffle requests.
     pub shuffle_passive_count: usize,
+    
+    /// TTL for forwarded join requests (limits hop count).
     pub forward_join_ttl: u8,
+    
+    /// Random walk length when selecting passive view candidates.
     pub passive_random_walk_length: u8,
+    
+    /// Interval between shuffle operations for view maintenance.
     pub shuffle_interval: Duration,
+    
+    /// Timeout for neighbor request acknowledgment.
     pub neighbor_timeout: Duration,
 }
 

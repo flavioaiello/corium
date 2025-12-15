@@ -1,3 +1,26 @@
+//! # Cryptographic Infrastructure
+//!
+//! This module provides TLS certificate generation and verification for the
+//! identity-based authentication system. All peer connections use mutual TLS
+//! with Ed25519 certificates where:
+//!
+//! - **Identity = Public Key**: The 32-byte Ed25519 public key IS the peer's identity
+//! - **Self-Signed Certs**: Each node generates its own certificate from its keypair
+//! - **Mutual Auth**: Both client and server verify each other's certificates
+//!
+//! ## Security Properties
+//!
+//! - No PKI/CA required - trust is based on knowing the peer's identity (public key)
+//! - Certificate CN contains hex-encoded public key for debugging
+//! - ALPN protocol "corium" prevents cross-protocol attacks
+//! - Only Ed25519 signatures are accepted (no RSA, ECDSA fallback)
+//!
+//! ## SECURITY WARNING
+//!
+//! The `dangerous()` APIs are used intentionally - we implement our own
+//! certificate verification that binds identity to public key, not to
+//! traditional CA-signed certificate chains.
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,9 +29,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::identity::{Identity, Keypair};
 
+/// Lazily-initialized crypto provider for rustls.
+/// Uses ring as the underlying cryptographic implementation.
 static CRYPTO_PROVIDER: std::sync::LazyLock<Arc<rustls::crypto::CryptoProvider>> =
     std::sync::LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
 
+/// ALPN protocol identifier. All Corium connections use this to prevent
+/// accidental cross-protocol connections.
 pub const ALPN: &[u8] = b"corium";
 
 pub fn generate_ed25519_cert(

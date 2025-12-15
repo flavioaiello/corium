@@ -1,3 +1,35 @@
+//! # RPC Layer
+//!
+//! This module provides the QUIC-based RPC infrastructure for all Corium protocols.
+//! It handles connection management, request/response routing, and multiplexing
+//! of different protocol types over a single QUIC endpoint.
+//!
+//! ## Architecture
+//!
+//! The RPC layer uses the **Actor Pattern**:
+//! - [`RpcNode`]: Public handle (cheap to clone) for making RPC calls
+//! - `RpcActor`: Internal actor owning connection cache and state
+//!
+//! ## Protocol Traits
+//!
+//! Each protocol defines its own RPC trait:
+//! - [`DhtNodeRpc`]: DHT operations (ping, find_node, find_value, store)
+//! - [`PlumTreeRpc`]: PubSub message forwarding
+//! - [`HyParViewRpc`]: Membership protocol messages
+//!
+//! ## Connection Management
+//!
+//! - Connections are cached in an LRU cache (bounded by `MAX_CACHED_CONNECTIONS`)
+//! - Stale connections are cleaned up periodically
+//! - Failed connections trigger cache invalidation
+//! - Contact records are cached for identity → address resolution
+//!
+//! ## Security
+//!
+//! - All connections use mutual TLS with Ed25519 certificates
+//! - Peer identity is verified from the TLS certificate
+//! - Request/response sizes are bounded to prevent memory exhaustion
+
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -60,22 +92,37 @@ pub trait HyParViewRpc: Send + Sync {
     ) -> Result<()>;
 }
 
+// ============================================================================
+// Security Limits
+// ============================================================================
 
+/// Maximum size of RPC response payload (1 MiB).
+/// SECURITY: Prevents memory exhaustion from oversized responses.
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
+/// Maximum contacts returned in a single find_node/find_value response.
+/// SECURITY: Limits routing table pollution from a single response.
 const MAX_CONTACTS_PER_RESPONSE: usize = 100;
 
+/// Maximum stored value size (matches messages::MAX_VALUE_SIZE).
 const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 
+/// Maximum number of cached QUIC connections.
+/// SCALABILITY: 1,000 connections × ~200 bytes = ~200 KB (constant, not O(N)).
+/// SECURITY: Bounded LruCache prevents connection table DoS.
 const MAX_CACHED_CONNECTIONS: usize = 1_000;
 
+/// Timeout after which idle connections are considered stale.
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Timeout for individual RPC stream operations.
 const RPC_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout when attempting relay-assisted connection establishment.
 const RELAY_ASSISTED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Command channel capacity for the RPC actor.
+/// Back-pressure applied when full to prevent unbounded queue growth.
 const RPC_COMMAND_CHANNEL_SIZE: usize = 256;
 
 /// Interval for cleaning up stale connections.

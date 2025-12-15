@@ -18,16 +18,26 @@ use crate::identity::Identity;
 /// Key type for DHT storage (32-byte hash).
 pub type Key = [u8; 32];
 
-/// Default time-to-live for stored entries.
+// ============================================================================
+// Storage Configuration Constants
+// ============================================================================
+
+/// Default time-to-live for stored entries (24 hours).
 pub(crate) const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often to check for expired entries.
 const EXPIRATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Soft limit for total storage bytes (used in pressure calculation).
+// ============================================================================
+// Pressure-Based Eviction Configuration
+// ============================================================================
+
+/// Soft limit for total storage bytes (8 MiB).
+/// Exceeding this contributes to storage pressure score.
 const PRESSURE_DISK_SOFT_LIMIT: usize = 8 * 1024 * 1024;
 
-/// Soft limit for memory usage (used in pressure calculation).
+/// Soft limit for memory usage (4 MiB).
+/// Used in pressure calculation alongside disk limit.
 const PRESSURE_MEMORY_SOFT_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Time window for counting storage requests.
@@ -36,34 +46,48 @@ const PRESSURE_REQUEST_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum requests per window before pressure increases.
 const PRESSURE_REQUEST_LIMIT: usize = 200;
 
-/// Pressure threshold that triggers eviction.
+/// Pressure threshold (0.0-1.0) that triggers proactive eviction.
+/// At 0.75, eviction starts before hard limits are reached.
 const PRESSURE_THRESHOLD: f32 = 0.75;
 
+// ============================================================================
+// Value Size and Quota Limits
+// ============================================================================
+
 /// Maximum size of a single stored value.
+/// SECURITY: Prevents memory exhaustion from large value storage.
 const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 
-/// Maximum bytes a single peer can store.
+/// Maximum bytes a single peer can store (1 MiB per-peer quota).
+/// SECURITY: Prevents a single peer from monopolizing storage.
 const PER_PEER_STORAGE_QUOTA: usize = 1024 * 1024;
 
 /// Maximum entries a single peer can store.
+/// SECURITY: Complements byte quota to limit entry count attacks.
 const PER_PEER_ENTRY_LIMIT: usize = 100;
 
 /// Maximum store requests per peer per window.
+/// SECURITY: Rate limits storage operations per peer.
 const PER_PEER_RATE_LIMIT: usize = 20;
 
 /// Time window for per-peer rate limiting.
 const PER_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Access count below which entries are considered unpopular for eviction.
+/// Low-popularity entries are evicted first under pressure.
 const POPULARITY_THRESHOLD: u32 = 3;
 
 /// Maximum number of peers to track storage stats for.
+/// SECURITY: Bounded LruCache prevents quota tracking table growth.
 const MAX_TRACKED_PEERS: usize = 10_000;
 
 /// Maximum entries in the local store.
+/// SCALABILITY: 100K entries is the per-node DHT storage limit (see README).
+/// SECURITY: Hard cap on DHT storage entry count.
 const LOCAL_STORE_MAX_ENTRIES: usize = 100_000;
 
 /// Safety limit on eviction loop iterations.
+/// Prevents runaway eviction loops from blocking the actor.
 const MAX_EVICTION_ITERATIONS: usize = 10_000;
 
 /// Monitors resource pressure to trigger eviction when limits are approached.

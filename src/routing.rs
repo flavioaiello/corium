@@ -1,3 +1,32 @@
+//! # XOR-Metric Routing Table
+//!
+//! This module implements the Kademlia routing table with XOR-based distance metric.
+//!
+//! ## Key Concepts
+//!
+//! - **XOR Distance**: `distance(a, b) = a XOR b` (bitwise)
+//! - **Bucket Index**: Number of leading zero bits in XOR distance
+//! - **k-Buckets**: Each bucket holds up to k contacts at similar distances
+//!
+//! ## Bucket Organization
+//!
+//! ```text
+//! Bucket 0: Contacts where distance has 0 leading zeros (furthest, 50% of keyspace)
+//! Bucket 1: Contacts where distance has 1 leading zero (25% of keyspace)
+//! ...
+//! Bucket 255: Contacts where distance has 255 leading zeros (closest)
+//! ```
+//!
+//! ## Anti-Eclipse Protection
+//!
+//! The [`RoutingInsertionLimiter`] uses token-bucket rate limiting to prevent
+//! a single peer from flooding the routing table with contacts (Sybil/Eclipse attack).
+//!
+//! ## Bucket Refresh
+//!
+//! Stale buckets (no activity for `BUCKET_STALE_THRESHOLD`) trigger random lookups
+//! within that bucket's keyspace to discover new contacts.
+
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 
@@ -7,15 +36,23 @@ use tokio::time::{Duration, Instant};
 use crate::dht::{distance_cmp, xor_distance};
 use crate::identity::{Contact, Identity};
 
-
+/// Interval between bucket refresh checks.
+/// Buckets without activity for this long will trigger random lookups.
 pub(crate) const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// Threshold after which a bucket is considered stale and needs refresh.
 pub(crate) const BUCKET_STALE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 
+/// Maximum routing insertions per peer per rate window.
+/// SECURITY: Prevents eclipse attacks by limiting how fast any peer can
+/// populate the routing table with (potentially Sybil) contacts.
 const ROUTING_INSERTION_PER_PEER_LIMIT: usize = 50;
 
+/// Time window for insertion rate limiting.
 const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum peers to track for insertion rate limiting.
+/// Uses LRU eviction when full.
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
 
 

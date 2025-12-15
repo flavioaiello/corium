@@ -1,3 +1,39 @@
+//! # High-Level Node API
+//!
+//! This module provides the main entry point for using Corium. A [`Node`] combines
+//! all the underlying components (DHT, PubSub, Membership, Relay) into a single
+//! unified interface.
+//!
+//! ## Quick Start
+//!
+//! ```ignore
+//! // Create a new node on a random port
+//! let node = Node::bind("0.0.0.0:0").await?;
+//!
+//! // Bootstrap by connecting to a known peer
+//! node.add_peer(&bootstrap_contact).await?;
+//!
+//! // Subscribe to a topic and publish messages
+//! node.subscribe("my-topic").await?;
+//! node.publish("my-topic", b"hello world").await?;
+//!
+//! // Receive messages via the messages() receiver
+//! let mut rx = node.messages().await?;
+//! while let Some(msg) = rx.recv().await {
+//!     println!("Got message: {:?}", msg);
+//! }
+//! ```
+//!
+//! ## Component Integration
+//!
+//! The Node orchestrates these components:
+//! - **SmartSock**: Multi-path transport (direct UDP, relay tunnels)
+//! - **RpcNode**: QUIC-based RPC for all protocol messages
+//! - **DhtNode**: Kademlia DHT for peer/value lookup
+//! - **HyParView**: Membership protocol maintaining active/passive views
+//! - **PlumTree**: Epidemic broadcast tree for PubSub
+//! - **RelayClient**: NAT traversal via relay servers
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -17,6 +53,7 @@ use crate::transport::SmartSock;
 use crate::rpc::{self, RpcNode};
 
 /// A receiver that can be taken exactly once via `.take()`.
+/// Used for message receivers that should only have one consumer.
 type TakeOnce<T> = tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<T>>>;
 
 pub struct Node {
