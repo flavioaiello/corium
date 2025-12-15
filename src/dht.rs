@@ -92,7 +92,10 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
     }
 
     if let Ok(record) = crate::messages::deserialize_bounded::<Contact>(value) {
-        if record.identity.as_bytes() == key
+        // SECURITY: validate_structure() prevents malformed Contact records
+        // with excessive addresses/relays from being accepted into the DHT.
+        if record.validate_structure()
+            && record.identity.as_bytes() == key
             && record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS)
         {
             return true;
