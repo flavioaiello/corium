@@ -1225,7 +1225,6 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
         let node = node.clone();
         let plumtree_h = plumtree_handler.clone();
         let udprelay = udprelay.clone();
-        let udprelay_addr = udprelay_addr;
         let remote_addr = remote;
         let verified_id = verified_identity;
         let hv = hyparview.clone();

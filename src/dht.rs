@@ -1112,12 +1112,10 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             })
             .collect();
         
-        // Wait for all futures, check if any succeeded
+        // Wait for all futures, return first success
         let results = futures::future::join_all(futures).await;
-        for result in results {
-            if let Ok(value) = result {
-                return Ok(Some(value));
-            }
+        if let Some(value) = results.into_iter().flatten().next() {
+            return Ok(Some(value));
         }
 
         Ok(None)
@@ -1297,10 +1295,7 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
             let network = self.network.clone();
             let tx = self.cmd_tx.clone();
             tokio::spawn(async move {
-                let alive = match network.ping(&update.oldest).await {
-                    Ok(_) => true,
-                    Err(_) => false,
-                };
+                let alive = network.ping(&update.oldest).await.is_ok();
                 let _ = tx.send(Command::ApplyPingResult(update, alive)).await;
             });
         }

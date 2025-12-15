@@ -12,13 +12,12 @@ use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{EndpointRecord, Identity, Keypair};
 use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
-use crate::relay::{Relay, RelayClient, NatStatus};
+use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection};
 use crate::transport::{Contact, SmartSock};
 use crate::rpc::{self, RpcNode};
 
-// Re-export from relay module for backwards compatibility
-pub use crate::relay::IncomingConnection;
-
+/// A receiver that can be taken exactly once via `.take()`.
+type TakeOnce<T> = tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<T>>>;
 
 pub struct Node {
     keypair: Keypair,
@@ -30,8 +29,8 @@ pub struct Node {
     hyparview: HyParView,
     plumtree: PlumTree<RpcNode>,
     relay_client: RelayClient,
-    plumtree_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ReceivedMessage>>>,
-    direct_receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(Identity, Vec<u8>)>>>,
+    plumtree_receiver: TakeOnce<ReceivedMessage>,
+    direct_receiver: TakeOnce<(Identity, Vec<u8>)>,
     server_handle: tokio::task::JoinHandle<Result<()>>,
 }
 
