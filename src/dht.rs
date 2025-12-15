@@ -34,7 +34,7 @@
 //! - Bounded storage with automatic eviction
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -51,11 +51,8 @@ use crate::routing::{
     random_id_for_bucket, PendingBucketUpdate, RoutingInsertionLimiter, RoutingTable,
     BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
 };
-use crate::storage::LocalStore;
+use crate::storage::{Key, LocalStore};
 use crate::rpc::DhtNodeRpc;
-
-// Re-export Key for backward compatibility
-pub use crate::storage::Key;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
 /// Records older than this are not propagated during lookups.
@@ -276,23 +273,6 @@ pub struct TieringStats {
 struct Prefix16(u16);
 
 impl Prefix16 {
-    /// Create a Prefix16 from a SocketAddr.
-    /// Useful when you have a parsed address.
-    #[allow(dead_code)]
-    fn from_addr(addr: &SocketAddr) -> Self {
-        match addr.ip() {
-            IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                Self(((octets[0] as u16) << 8) | (octets[1] as u16))
-            }
-            IpAddr::V6(v6) => {
-                // Use /32 (first two segments) for ISP-level granularity
-                let segs = v6.segments();
-                Self(segs[0].wrapping_add(segs[1]))
-            }
-        }
-    }
-
     fn from_addr_str(addr: &str) -> Option<Self> {
         // Parse "host:port" or just "host" format
         let host = if let Some(bracket_end) = addr.find(']') {
@@ -430,16 +410,6 @@ impl TieringManager {
             centroids: self.centroids.clone(),
             counts,
         }
-    }
-
-    /// Estimate RTT for a contact based on /16 prefix.
-    /// Returns the smoothed RTT if we have data, otherwise None.
-    #[allow(dead_code)]
-    pub fn estimate_rtt(&mut self, contact: &Contact) -> Option<f32> {
-        contact.primary_addr()
-            .and_then(Prefix16::from_addr_str)
-            .and_then(|prefix| self.prefix_rtt.get(&prefix))
-            .map(|stats| stats.smoothed)
     }
 
     fn recompute_if_needed(&mut self) {
