@@ -187,6 +187,10 @@ impl HyParView {
     }
 }
 
+/// Maximum entries in the alive_disconnecting set.
+/// SECURITY: Bounds memory growth from Disconnect { alive: true } flooding.
+const MAX_ALIVE_DISCONNECTING: usize = 100;
+
 struct HyParViewActor<N: HyParViewRpc> {
     me: Identity,
     config: HyParViewConfig,
@@ -196,7 +200,9 @@ struct HyParViewActor<N: HyParViewRpc> {
     active_view: HashSet<Identity>,
     passive_view: HashSet<Identity>,
     pending_neighbors: HashMap<Identity, Instant>,
-    alive_disconnecting: HashSet<Identity>,
+    /// Tracks peers that sent Disconnect { alive: true } for graceful handling.
+    /// SECURITY: Bounded to MAX_ALIVE_DISCONNECTING entries with timestamp-based eviction.
+    alive_disconnecting: HashMap<Identity, Instant>,
     last_shuffle: Instant,
     rng: rand::rngs::StdRng,
 }
@@ -211,7 +217,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             active_view: HashSet::new(),
             passive_view: HashSet::new(),
             pending_neighbors: HashMap::new(),
-            alive_disconnecting: HashSet::new(),
+            alive_disconnecting: HashMap::new(),
             last_shuffle: Instant::now(),
             rng: rand::rngs::StdRng::from_entropy(),
         }
@@ -310,7 +316,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         let removed = self.active_view.remove(&peer);
 
         if removed {
-            let was_alive = self.alive_disconnecting.remove(&peer);
+            let was_alive = self.alive_disconnecting.remove(&peer).is_some();
 
             if was_alive {
                 self.add_to_passive(peer).await;
@@ -521,7 +527,21 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
 
     async fn on_disconnect(&mut self, from: Identity, alive: bool) {
         if alive {
-            self.alive_disconnecting.insert(from);
+            // SECURITY: Bound the alive_disconnecting map to prevent memory exhaustion.
+            // If at capacity, evict oldest entries before inserting.
+            if !self.alive_disconnecting.contains_key(&from)
+                && self.alive_disconnecting.len() >= MAX_ALIVE_DISCONNECTING
+            {
+                // Evict the oldest entry (by timestamp)
+                let oldest = self.alive_disconnecting
+                    .iter()
+                    .min_by_key(|(_, ts)| *ts)
+                    .map(|(id, _)| *id);
+                if let Some(oldest_id) = oldest {
+                    self.alive_disconnecting.remove(&oldest_id);
+                }
+            }
+            self.alive_disconnecting.insert(from, Instant::now());
         }
 
         let removed = self.active_view.remove(&from);
@@ -552,6 +572,19 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             self.pending_neighbors.remove(&peer);
             debug!(peer = %hex::encode(&peer.as_bytes()[..8]), "neighbor request timed out");
             self.try_promote_passive().await;
+        }
+        
+        // SECURITY: Clean up stale alive_disconnecting entries.
+        // Entries older than 2x neighbor_timeout are removed to prevent unbounded growth.
+        let stale_timeout = timeout * 2;
+        let stale_alive: Vec<Identity> = self.alive_disconnecting
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) > stale_timeout)
+            .map(|(peer, _)| *peer)
+            .collect();
+        
+        for peer in stale_alive {
+            self.alive_disconnecting.remove(&peer);
         }
     }
 
@@ -656,7 +689,7 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         }
 
         let peer = self.passive_view.iter()
-            .filter(|p| !self.alive_disconnecting.contains(*p))
+            .filter(|p| !self.alive_disconnecting.contains_key(*p))
             .choose(&mut self.rng)
             .copied();
 

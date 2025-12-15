@@ -6,7 +6,7 @@
 //! - Per-peer storage quotas and rate limiting to prevent abuse
 //! - Automatic expiration of stale entries
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -234,7 +234,10 @@ pub enum StoreRejection {
 pub(crate) struct LocalStore {
     cache: LruCache<Key, StoredEntry>,
     pub(crate) pressure: PressureMonitor,
-    peer_stats: HashMap<Identity, PeerStorageStats>,
+    /// Per-peer storage statistics for quota enforcement.
+    /// SECURITY: Bounded by MAX_TRACKED_PEERS to prevent memory exhaustion
+    /// from attackers using many identities.
+    peer_stats: LruCache<Identity, PeerStorageStats>,
     ttl: Duration,
     last_expiration_check: Instant,
     last_peer_cleanup: Instant,
@@ -243,10 +246,11 @@ pub(crate) struct LocalStore {
 impl LocalStore {
     pub fn new() -> Self {
         let cap = NonZeroUsize::new(LOCAL_STORE_MAX_ENTRIES).expect("capacity must be non-zero");
+        let peer_stats_cap = NonZeroUsize::new(MAX_TRACKED_PEERS).expect("peer stats capacity must be non-zero");
         Self {
             cache: LruCache::new(cap),
             pressure: PressureMonitor::new(),
-            peer_stats: HashMap::new(),
+            peer_stats: LruCache::new(peer_stats_cap),
             ttl: DEFAULT_TTL,
             last_expiration_check: Instant::now(),
             last_peer_cleanup: Instant::now(),
@@ -274,7 +278,7 @@ impl LocalStore {
             return Err(StoreRejection::ValueTooLarge);
         }
 
-        let stats = self.peer_stats.entry(*peer_id).or_default();
+        let stats = self.peer_stats.get_or_insert_mut(*peer_id, PeerStorageStats::default);
 
         if stats.is_rate_limited() {
             debug!(
@@ -330,7 +334,7 @@ impl LocalStore {
             stored_at: now,
         };
 
-        let stats = self.peer_stats.entry(stored_by).or_default();
+        let stats = self.peer_stats.get_or_insert_mut(stored_by, PeerStorageStats::default);
         stats.record_store(entry.value.len());
 
         self.pressure.record_store(entry.value.len());
@@ -427,29 +431,26 @@ impl LocalStore {
     }
 
     /// Periodically clean up stale peer stats to bound memory.
+    /// With LruCache, old entries are automatically evicted when capacity is reached,
+    /// so this just ensures we don't have excessively stale entries.
     fn maybe_cleanup_peer_stats(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.last_peer_cleanup) < Duration::from_secs(300)
-            && self.peer_stats.len() <= MAX_TRACKED_PEERS
-        {
+        if now.duration_since(self.last_peer_cleanup) < Duration::from_secs(300) {
             return;
         }
         self.last_peer_cleanup = now;
 
-        self.peer_stats.retain(|_, stats| {
-            stats.entry_count > 0 || !stats.store_requests.is_empty()
-        });
+        // LruCache automatically evicts when at capacity, so we just need to
+        // identify and remove truly empty entries. Collect keys first to avoid
+        // borrow issues.
+        let empty_peers: Vec<Identity> = self.peer_stats
+            .iter()
+            .filter(|(_, stats)| stats.entry_count == 0 && stats.store_requests.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
         
-        while self.peer_stats.len() > MAX_TRACKED_PEERS {
-            let smallest = self.peer_stats
-                .iter()
-                .min_by_key(|(_, stats)| (stats.entry_count, stats.bytes_stored))
-                .map(|(id, _)| *id);
-            if let Some(peer_id) = smallest {
-                self.peer_stats.remove(&peer_id);
-            } else {
-                break;
-            }
+        for peer_id in empty_peers {
+            self.peer_stats.pop(&peer_id);
         }
     }
 

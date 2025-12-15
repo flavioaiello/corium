@@ -1641,11 +1641,57 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             DhtNodeResponse::Ack
         }
         DhtNodeRequest::CheckReachability { from, probe_addr } => {
+            const MAX_PROBE_ADDR_LOG_BYTES: usize = 128;
+            let probe_addr_log = {
+                use std::borrow::Cow;
+
+                let s = probe_addr.as_str();
+                if s.len() <= MAX_PROBE_ADDR_LOG_BYTES {
+                    Cow::Borrowed(s)
+                } else {
+                    let mut end = MAX_PROBE_ADDR_LOG_BYTES;
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end = end.saturating_sub(1);
+                    }
+                    Cow::Owned(format!("{}…", &s[..end]))
+                }
+            };
+
             debug!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                probe_addr = %probe_addr,
+                probe_addr = %probe_addr_log.as_ref(),
+                probe_addr_len = probe_addr.len(),
                 "handling CHECK_REACHABILITY request"
             );
+            
+            // SECURITY: Validate probe_addr is a valid socket address to prevent
+            // this node being used as an amplification vector against arbitrary targets.
+            let probe_socket: SocketAddr = match probe_addr.parse() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    warn!(
+                        from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                        probe_addr = %probe_addr_log.as_ref(),
+                        probe_addr_len = probe_addr.len(),
+                        "CHECK_REACHABILITY rejected: invalid socket address"
+                    );
+                    return DhtNodeResponse::Reachable { reachable: false };
+                }
+            };
+            
+            // SECURITY: Only allow probing addresses that share the same IP as the
+            // connection's remote address. This prevents attackers from using us
+            // to probe arbitrary third-party addresses (amplification attack vector).
+            if probe_socket.ip() != _remote_addr.ip() {
+                warn!(
+                    from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                    probe_addr = %probe_addr_log.as_ref(),
+                    probe_addr_len = probe_addr.len(),
+                    remote_addr = %_remote_addr,
+                    "CHECK_REACHABILITY rejected: probe IP does not match connection IP"
+                );
+                return DhtNodeResponse::Reachable { reachable: false };
+            }
             
             // Create a contact for the probe address
             let probe_contact = Contact::single(from.identity, probe_addr.clone());
@@ -1661,7 +1707,8 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             
             debug!(
                 from = ?hex::encode(&from.identity.as_bytes()[..8]),
-                probe_addr = %probe_addr,
+                probe_addr = %probe_addr_log.as_ref(),
+                probe_addr_len = probe_addr.len(),
                 reachable = reachable,
                 "CHECK_REACHABILITY result"
             );
