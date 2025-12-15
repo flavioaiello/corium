@@ -67,7 +67,7 @@ const MAX_CONTACTS_PER_RESPONSE: usize = 100;
 
 const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 
-const MAX_CACHED_CONNECTIONS: usize = 1000;
+const MAX_CACHED_CONNECTIONS: usize = 1_000;
 
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 

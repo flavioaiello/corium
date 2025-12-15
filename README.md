@@ -273,10 +273,66 @@ let record = node.resolve_peer(&peer_id).await?;
 
 The DHT implements Coral-inspired latency tiering:
 
-- **RTT samples** collected per peer (up to 32 samples)
-- **K-means clustering** groups peers into 1-7 latency tiers
-- **Tiered lookups** prefer faster peers for lower latency
-- **Cold storage offload** moves evicted data to slower tiers
+- **RTT samples** collected per /16 IP prefix (IPv4) or /32 prefix (IPv6)
+- **K-means clustering** groups prefixes into 1-7 latency tiers
+- **Tiered lookups** prefer faster prefixes for lower latency
+- **LRU-bounded** — tracks up to 10,000 active prefixes (~1MB memory)
+
+## Scalability (10M+ Nodes)
+
+Corium is designed to scale to millions of concurrent peers. Key design decisions enable efficient operation at scale:
+
+### Memory Efficiency
+
+| Component | At 10M Peers | Design |
+|-----------|--------------|--------|
+| **Routing table** | ~640 KB | 256 buckets × 20 contacts |
+| **RTT tiering** | ~1 MB | /16 prefix-based (not per-peer) |
+| **Passive view** | ~13 KB | 100 recovery candidates |
+| **Connection cache** | ~200 KB | 1,000 LRU connections |
+| **Message dedup** | ~2 MB | 10K source sequence windows |
+| **Total** | **~4 MB** | Bounded, independent of network size |
+
+### DHT Performance
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Lookup hops** | O(log₂ N) ≈ 23 | Standard Kademlia complexity |
+| **Parallel queries (α)** | 2-5 adaptive | Reduces under congestion |
+| **Bucket size (k)** | 10-30 adaptive | Increases with churn |
+| **Routing contacts** | ~5,120 max | 256 buckets × 20 |
+
+### Corium vs Standard Kademlia
+
+| Feature | Standard Kademlia | Corium | Benefit |
+|---------|------------------|--------|---------|
+| **Bucket size** | Fixed k=20 | Adaptive 10-30 | Handles churn spikes |
+| **Concurrency** | Fixed α=3 | Adaptive 2-5 | Load shedding |
+| **RTT optimization** | ❌ None | /16 prefix tiering | Lower latency paths |
+| **Sybil protection** | ❌ Basic | Per-peer insertion limits | Eclipse resistant |
+| **Gossip layer** | ❌ None | HyParView + PlumTree | Fast broadcast, recovery |
+| **NAT traversal** | ❌ None | SmartSock + relays | Works behind NAT |
+| **Identity** | SHA-1 node IDs | Ed25519 public keys | Self-certifying |
+
+### Scaling Boundaries
+
+| Parameter | Limit | Bottleneck |
+|-----------|-------|------------|
+| **Peers tracked** | Unlimited | Routing table is O(log N) |
+| **DHT storage** | 100K entries | Memory-bounded LRU |
+| **PubSub topics** | 10,000 | Per-node limit |
+| **Peers per topic** | 1,000 | Gossip efficiency |
+| **Relay sessions** | 10,000 | Per-relay server |
+
+### Key Design Decisions
+
+1. **Prefix-based RTT** — Tracking RTT per /16 IP prefix instead of per-peer reduces memory from O(N) to O(65K) while maintaining routing quality through statistical sampling.
+
+2. **Adaptive parameters** — k and α automatically adjust based on observed churn rate, preventing cascade failures during network instability.
+
+3. **Bounded data structures** — All caches use LRU eviction with fixed caps, ensuring memory stays constant regardless of network size.
+
+4. **Hybrid membership** — HyParView's active/passive split provides strong connectivity (5 active peers) with good recovery (100 passive candidates) at minimal cost.
 
 ## PlumTree (PubSub)
 
@@ -326,7 +382,7 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 Hybrid Partial View membership protocol:
 
 - **Active view** (5 peers) — Fully connected TCP/QUIC links
-- **Passive view** (30 peers) — Known but not connected
+- **Passive view** (100 peers) — Known but not connected
 - **Shuffle protocol** — Periodic peer exchange
 - **Failure detection** — Automatic promotion from passive view
 

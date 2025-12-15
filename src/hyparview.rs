@@ -30,7 +30,7 @@ impl Default for HyParViewConfig {
     fn default() -> Self {
         Self {
             active_view_capacity: 5,
-            passive_view_capacity: 30,
+            passive_view_capacity: 100,
             shuffle_active_count: 3,
             shuffle_passive_count: 4,
             forward_join_ttl: 4,
