@@ -567,11 +567,21 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 #[async_trait::async_trait]
 impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
     async fn neighbor_up(&self, peer: Identity) {
-        let _ = self.cmd_tx.send(Command::NeighborUp(peer)).await;
+        if self.cmd_tx.send(Command::NeighborUp(peer)).await.is_err() {
+            warn!(
+                peer = %hex::encode(&peer.as_bytes()[..8]),
+                "failed to notify PlumTree of neighbor_up - actor closed"
+            );
+        }
     }
 
     async fn neighbor_down(&self, peer: &Identity) {
-        let _ = self.cmd_tx.send(Command::NeighborDown(*peer)).await;
+        if self.cmd_tx.send(Command::NeighborDown(*peer)).await.is_err() {
+            warn!(
+                peer = %hex::encode(&peer.as_bytes()[..8]),
+                "failed to notify PlumTree of neighbor_down - actor closed"
+            );
+        }
     }
 }
 
@@ -916,6 +926,8 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
         
+        // known_peers is transitively bounded by HyParView's active_view_capacity,
+        // since neighbor_up/neighbor_down events mirror active_view membership.
         self.known_peers.insert(peer);
         
         if self.subscriptions.is_empty() {

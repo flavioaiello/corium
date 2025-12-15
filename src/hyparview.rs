@@ -389,6 +389,15 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
                 self.add_to_active_unchecked(from).await;
             }
         } else {
+            // If peer was prematurely added to active view (neighbor_up already emitted),
+            // we must emit neighbor_down to keep PlumTree in sync
+            if self.active_view.remove(&from) {
+                self.emit_neighbor_down(&from).await;
+                debug!(
+                    peer = %hex::encode(&from.as_bytes()[..8]),
+                    "neighbor request rejected, removed from active view"
+                );
+            }
             self.add_to_passive(from).await;
         }
     }
