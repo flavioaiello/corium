@@ -9,11 +9,11 @@ use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_c
 use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::storage::Key;
 use crate::hyparview::{HyParView, HyParViewConfig};
-use crate::identity::{EndpointRecord, Identity, Keypair};
+use crate::identity::{Contact, Identity, Keypair};
 use crate::messages::Message;
 use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
 use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection};
-use crate::transport::{Contact, SmartSock};
+use crate::transport::SmartSock;
 use crate::rpc::{self, RpcNode};
 
 /// A receiver that can be taken exactly once via `.take()`.
@@ -61,10 +61,7 @@ impl Node {
             .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
-        let contact = Contact {
-            identity,
-            addrs: vec![local_addr.to_string()],
-        };
+        let contact = Contact::single(identity, local_addr.to_string());
         
         let rpcnode = RpcNode::with_identity(
             endpoint.clone(),
@@ -148,9 +145,14 @@ impl Node {
         })
     }
     
-    
+    /// Returns the node's identity as a hex-encoded string.
     pub fn identity(&self) -> String {
-        hex::encode(self.keypair.identity())
+        self.keypair.identity().to_hex()
+    }
+    
+    /// Returns the node's identity as an Identity struct.
+    pub fn peer_identity(&self) -> Identity {
+        self.keypair.identity()
     }
     
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -207,7 +209,7 @@ impl Node {
     pub async fn publish_address_with_relays(
         &self,
         addresses: Vec<String>,
-        relays: Vec<Contact>,
+        relays: Vec<Identity>,
     ) -> Result<()> {
         self.dhtnode
             .republish_on_network_change(&self.keypair, addresses, relays)
@@ -217,10 +219,7 @@ impl Node {
     pub async fn relay_endpoint(&self) -> Option<Contact> {
         let local_addr = self.endpoint.local_addr().ok()?;
         
-        Some(Contact {
-            identity: self.keypair.identity(),
-            addrs: vec![local_addr.to_string()],
-        })
+        Some(Contact::single(self.keypair.identity(), local_addr.to_string()))
     }
     
     /// Register with a relay node for incoming connection notifications.
@@ -260,10 +259,7 @@ impl Node {
         let record = self.dhtnode.resolve_peer(&relay_id).await?
             .context("relay not found in DHT")?;
         
-        let relay_contact = Contact {
-            identity: relay_id,
-            addrs: record.addrs,
-        };
+        let relay_contact = Contact::unsigned(relay_id, record.addrs);
         
         self.relay_client.register_with_relay(&relay_contact).await?;
         
@@ -302,7 +298,7 @@ impl Node {
         self.relay_client.accept_incoming(incoming).await
     }
 
-    pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {
+    pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<Contact>> {
         self.dhtnode.resolve_peer(peer_id).await
     }
     
@@ -319,10 +315,7 @@ impl Node {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
-        let contact = Contact {
-            identity: peer_identity,
-            addrs: vec![addr.to_string()],
-        };
+        let contact = Contact::single(peer_identity, addr.to_string());
         
         self.rpcnode.cache_contact(&contact).await;
         self.dhtnode.observe_contact(contact.clone()).await;
@@ -337,7 +330,7 @@ impl Node {
     
     /// Connect to a peer by identity using DHT-based address resolution.
     /// 
-    /// This resolves the peer's published `EndpointRecord` from the DHT and uses
+    /// This resolves the peer's published `Contact` from the DHT and uses
     /// `smartconnect` which tries direct connection first, then falls back to
     /// relay-assisted connection if the peer has designated relays.
     /// 
@@ -377,10 +370,7 @@ impl Node {
         let record = self.dhtnode.resolve_peer(&peer_identity).await?
             .context("peer not found in DHT")?;
         
-        let contact = Contact {
-            identity: peer_identity,
-            addrs: record.addrs.clone(),
-        };
+        let contact = Contact::unsigned(peer_identity, record.addrs.clone());
         
         self.rpcnode.send_direct(&contact, self.keypair.identity(), data).await
     }
@@ -494,10 +484,7 @@ impl Node {
         let record = self.dhtnode.resolve_peer(&helper_id).await?
             .context("helper not found in DHT")?;
         
-        let helper = Contact {
-            identity: helper_id,
-            addrs: record.addrs,
-        };
+        let helper = Contact::unsigned(helper_id, record.addrs);
         
         self.relay_client.probe_reachability(&helper).await
     }
@@ -545,17 +532,14 @@ impl Node {
         &self,
         helper_identity: &str,
         addresses: Vec<String>,
-    ) -> Result<(bool, Option<Contact>, Option<tokio::sync::mpsc::Receiver<IncomingConnection>>)> {
+    ) -> Result<(bool, Option<Identity>, Option<tokio::sync::mpsc::Receiver<IncomingConnection>>)> {
         let helper_id = Identity::from_hex(helper_identity)
             .context("invalid helper identity: must be 64 hex characters")?;
         
         let record = self.dhtnode.resolve_peer(&helper_id).await?
             .context("helper not found in DHT")?;
         
-        let helper = Contact {
-            identity: helper_id,
-            addrs: record.addrs,
-        };
+        let helper = Contact::unsigned(helper_id, record.addrs);
         
         let status = self.relay_client.configure(&helper, addresses).await?;
         

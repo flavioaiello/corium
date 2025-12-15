@@ -280,7 +280,7 @@ async fn node_add_peer() {
     node2.add_peer(contact1).await;
     
     // Should be able to find the peer now
-    let peers = node2.find_peers(node1.keypair().identity()).await;
+    let peers = node2.find_peers(node1.peer_identity()).await;
     assert!(peers.is_ok());
 }
 
@@ -299,11 +299,11 @@ async fn node_publish_address_with_relays() {
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
     
-    let relay_contact = node2.peer_endpoint().clone();
+    let relay_identity = node2.peer_identity();
     let addrs = vec!["192.168.1.100:5000".to_string()];
     
     // Should succeed with relay info
-    node1.publish_address_with_relays(addrs, vec![relay_contact])
+    node1.publish_address_with_relays(addrs, vec![relay_identity])
         .await
         .expect("publish_address_with_relays failed");
 }
@@ -342,7 +342,7 @@ async fn three_node_find_peers() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node3 should be able to find peers near node2's identity
-    let peers = node3.find_peers(node2.keypair().identity()).await;
+    let peers = node3.find_peers(node2.peer_identity()).await;
     assert!(peers.is_ok(), "find_peers should succeed");
 }
 

@@ -207,8 +207,8 @@ pub enum NatStatus {
     Public,
     /// Node is behind NAT and using a relay.
     NatBound {
-        /// The relay node we're registered with.
-        relay: crate::transport::Contact,
+        /// The identity of the relay node we're registered with.
+        relay: Identity,
     },
     /// NAT status hasn't been determined yet.
     Unknown,
@@ -489,13 +489,13 @@ impl RelayClient {
     /// Check if this node is publicly reachable by asking a peer to connect back.
     pub async fn probe_reachability(
         &self,
-        helper: &crate::transport::Contact,
+        helper: &crate::identity::Contact,
     ) -> anyhow::Result<bool> {
         self.rpc.check_reachability(helper, &self.local_addr.to_string()).await
     }
 
     /// Discover relay-capable nodes in the network.
-    pub async fn discover_relays(&self) -> anyhow::Result<Vec<crate::transport::Contact>> {
+    pub async fn discover_relays(&self) -> anyhow::Result<Vec<crate::identity::Contact>> {
         let our_id = self.keypair.identity();
         let candidates = self.dht.iterative_find_node(our_id).await?;
         
@@ -524,9 +524,9 @@ impl RelayClient {
     /// Select the best relay from a list by measuring RTT.
     pub async fn select_best_relay(
         &self,
-        candidates: &[crate::transport::Contact],
-    ) -> Option<crate::transport::Contact> {
-        let mut best: Option<(crate::transport::Contact, std::time::Duration)> = None;
+        candidates: &[crate::identity::Contact],
+    ) -> Option<crate::identity::Contact> {
+        let mut best: Option<(crate::identity::Contact, std::time::Duration)> = None;
         
         for relay in candidates {
             let start = std::time::Instant::now();
@@ -567,7 +567,7 @@ impl RelayClient {
     /// Register with a relay for incoming connection notifications.
     pub async fn register_with_relay(
         &self,
-        relay: &crate::transport::Contact,
+        relay: &crate::identity::Contact,
     ) -> anyhow::Result<()> {
         let response_rx = self.rpc
             .register_for_signaling(relay, self.keypair.identity())
@@ -646,7 +646,7 @@ impl RelayClient {
     /// Returns the resulting NAT status.
     pub async fn configure(
         &self,
-        helper: &crate::transport::Contact,
+        helper: &crate::identity::Contact,
         addresses: Vec<String>,
     ) -> anyhow::Result<NatStatus> {
         use anyhow::Context;
@@ -694,10 +694,10 @@ impl RelayClient {
         
         // Step 5: Publish our address with relay info
         self.dht
-            .republish_on_network_change(&self.keypair, addresses, vec![best_relay.clone()])
+            .republish_on_network_change(&self.keypair, addresses, vec![best_relay.identity])
             .await?;
         
-        let status = NatStatus::NatBound { relay: best_relay };
+        let status = NatStatus::NatBound { relay: best_relay.identity };
         *self.status.write().await = status.clone();
         
         info!("NAT configuration complete");

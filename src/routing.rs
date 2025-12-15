@@ -5,7 +5,7 @@ use lru::LruCache;
 use tokio::time::{Duration, Instant};
 
 use crate::dht::{distance_cmp, xor_distance};
-use crate::identity::Identity;
+use crate::identity::{Contact, Identity};
 
 
 pub(crate) const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -17,8 +17,6 @@ const ROUTING_INSERTION_PER_PEER_LIMIT: usize = 50;
 const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
-
-use crate::transport::Contact;
 
 
 #[derive(Debug, Clone, Copy)]
@@ -585,10 +583,7 @@ mod tests {
     }
 
     fn make_test_contact(byte: u8) -> Contact {
-        Contact {
-            identity: make_test_identity(byte),
-            addrs: vec![format!("node-{byte}")],
-        }
+        Contact::single(make_test_identity(byte), format!("node-{byte}"))
     }
 
     #[test]

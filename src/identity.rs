@@ -3,8 +3,6 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::transport::Contact;
-
 #[inline]
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -54,27 +52,27 @@ impl Keypair {
     }
 
     /// Create an endpoint record for a publicly reachable node (can serve as relay).
-    pub fn create_endpoint_record(&self, addrs: Vec<String>) -> EndpointRecord {
-        self.create_endpoint_record_full(addrs, vec![], true)
+    pub fn create_contact(&self, addrs: Vec<String>) -> Contact {
+        self.create_contact_full(addrs, vec![], true)
     }
 
     /// Create an endpoint record for a NAT-bound node with designated relays.
-    pub fn create_endpoint_record_with_relays(
+    pub fn create_contact_with_relays(
         &self,
         addrs: Vec<String>,
-        relays: Vec<Contact>,
-    ) -> EndpointRecord {
+        relays: Vec<Identity>,
+    ) -> Contact {
         // NAT-bound nodes that need relays cannot serve as relays themselves
-        self.create_endpoint_record_full(addrs, relays, false)
+        self.create_contact_full(addrs, relays, false)
     }
 
     /// Create an endpoint record with full control over all fields.
-    pub fn create_endpoint_record_full(
+    pub fn create_contact_full(
         &self,
         addrs: Vec<String>,
-        relays: Vec<Contact>,
+        relays: Vec<Identity>,
         is_relay: bool,
-    ) -> EndpointRecord {
+    ) -> Contact {
         let identity = self.identity();
         let timestamp = now_ms();
         
@@ -88,14 +86,7 @@ impl Keypair {
         }
         data.extend_from_slice(&(relays.len() as u32).to_le_bytes());
         for relay in &relays {
-            data.extend_from_slice(relay.identity.as_bytes());
-            data.extend_from_slice(&(relay.addrs.len() as u32).to_le_bytes());
-
-            for addr in &relay.addrs {
-                let addr_bytes = addr.as_bytes();
-                data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
-                data.extend_from_slice(addr_bytes);
-            }
+            data.extend_from_slice(relay.as_bytes());
         }
         // Include is_relay in signature
         data.push(if is_relay { 1 } else { 0 });
@@ -103,13 +94,13 @@ impl Keypair {
         
         let signature = self.sign(&data);
         
-        EndpointRecord {
+        Contact {
             identity,
             addrs,
             relays,
             is_relay,
-            timestamp,
-            signature: signature.to_bytes().to_vec(),
+            timestamp: Some(timestamp),
+            signature: Some(signature.to_bytes().to_vec()),
         }
     }
 }
@@ -219,19 +210,60 @@ impl AsRef<[u8]> for Identity {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EndpointRecord {
+pub struct Contact {
     pub identity: Identity,
     pub addrs: Vec<String>,
-    pub relays: Vec<Contact>,
+    /// Identities of relay nodes this peer uses for NAT traversal.
+    /// When connecting, resolve each identity via DHT to get addresses.
+    pub relays: Vec<Identity>,
     /// Whether this node can serve as a relay for other nodes.
     /// Nodes that are publicly reachable (passed self-probe) set this to true.
     pub is_relay: bool,
-    pub timestamp: u64,
-    pub signature: Vec<u8>,
+    /// Timestamp when record was created (only for signed records).
+    pub timestamp: Option<u64>,
+    /// Ed25519 signature (only for signed records published to DHT).
+    pub signature: Option<Vec<u8>>,
 }
 
-impl EndpointRecord {
+impl Contact {
+    /// Create an unsigned endpoint record (lightweight peer reference).
+    pub fn unsigned(identity: Identity, addrs: Vec<String>) -> Self {
+        Self {
+            identity,
+            addrs,
+            relays: vec![],
+            is_relay: false,
+            timestamp: None,
+            signature: None,
+        }
+    }
+
+    /// Create an unsigned endpoint record with a single address.
+    pub fn single(identity: Identity, addr: impl Into<String>) -> Self {
+        Self::unsigned(identity, vec![addr.into()])
+    }
+
+    /// Check if this record is signed.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some() && self.timestamp.is_some()
+    }
+
+    /// Get the primary address (first in the list).
+    pub fn primary_addr(&self) -> Option<&str> {
+        self.addrs.first().map(|s| s.as_str())
+    }
+
+    /// Iterate over all addresses.
+    pub fn all_addrs(&self) -> impl Iterator<Item = &str> {
+        self.addrs.iter().map(|s| s.as_str())
+    }
+
     pub fn verify(&self) -> bool {
+        // Unsigned records cannot be verified
+        let (Some(timestamp), Some(sig)) = (self.timestamp, self.signature.as_ref()) else {
+            return false;
+        };
+
         let mut data = Vec::new();
         data.extend_from_slice(self.identity.as_bytes());
         data.extend_from_slice(&(self.addrs.len() as u32).to_le_bytes());
@@ -242,23 +274,16 @@ impl EndpointRecord {
         }
         data.extend_from_slice(&(self.relays.len() as u32).to_le_bytes());
         for relay in &self.relays {
-            data.extend_from_slice(relay.identity.as_bytes());
-            data.extend_from_slice(&(relay.addrs.len() as u32).to_le_bytes());
-
-            for addr in &relay.addrs {
-                let addr_bytes = addr.as_bytes();
-                data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
-                data.extend_from_slice(addr_bytes);
-            }
+            data.extend_from_slice(relay.as_bytes());
         }
         // Include is_relay in signature verification
         data.push(if self.is_relay { 1 } else { 0 });
-        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data.extend_from_slice(&timestamp.to_le_bytes());
         
         let Ok(verifying_key) = VerifyingKey::try_from(self.identity.as_bytes().as_slice()) else {
             return false;
         };
-        let Ok(sig_bytes): Result<[u8; 64], _> = self.signature.clone().try_into() else {
+        let Ok(sig_bytes): Result<[u8; 64], _> = sig.clone().try_into() else {
             return false;
         };
         let signature = Signature::from_bytes(&sig_bytes);
@@ -271,16 +296,18 @@ impl EndpointRecord {
             return false;
         }
         
+        // Already verified that timestamp exists in verify()
+        let timestamp = self.timestamp.unwrap();
         let current_time = now_ms();
         
         let max_age_ms = max_age_secs * 1000;
         
         const FUTURE_TOLERANCE_MS: u64 = 10_000;
-        if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
+        if timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
         }
         
-        if current_time.saturating_sub(self.timestamp) > max_age_ms {
+        if current_time.saturating_sub(timestamp) > max_age_ms {
             return false;
         }
         
@@ -315,37 +342,33 @@ impl EndpointRecord {
         }
         
         for relay in &self.relays {
-            if !relay.identity.is_valid() {
+            if !relay.is_valid() {
                 return false;
-            }
-            
-            if relay.addrs.is_empty() {
-                return false;
-            }
-
-            if relay.addrs.len() > MAX_ADDRS {
-                return false;
-            }
-
-            {
-                use std::collections::HashSet;
-                let mut seen = HashSet::new();
-                for addr in &relay.addrs {
-                    if addr.len() > MAX_ADDR_LEN || addr.is_empty() {
-                        return false;
-                    }
-                    if !seen.insert(addr) {
-                        return false;
-                    }
-                }
             }
         }
         
-        if self.signature.len() != 64 {
-            return false;
+        // If signed, signature must be exactly 64 bytes
+        if let Some(ref sig) = self.signature {
+            if sig.len() != 64 {
+                return false;
+            }
         }
         
         true
+    }
+}
+
+impl PartialEq for Contact {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for Contact {}
+
+impl std::hash::Hash for Contact {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
     }
 }
 
@@ -389,77 +412,77 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_record_verify_fresh_accepts_recent() {
+    fn test_contact_verify_fresh_accepts_recent() {
         let kp = Keypair::generate();
-        let record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
         assert!(record.verify_fresh(3600));    }
 
     #[test]
-    fn test_endpoint_record_verify_fresh_rejects_old() {
+    fn test_contact_verify_fresh_rejects_old() {
         let kp = Keypair::generate();
-        let mut record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.timestamp = std::time::SystemTime::now()
+        record.timestamp = Some(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64 - (2 * 60 * 60 * 1000);
+            .as_millis() as u64 - (2 * 60 * 60 * 1000));
         
         assert!(!record.verify_fresh(3600));    }
 
     #[test]
-    fn test_endpoint_record_verify_fresh_rejects_future() {
+    fn test_contact_verify_fresh_rejects_future() {
         let kp = Keypair::generate();
-        let mut record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.timestamp = std::time::SystemTime::now()
+        record.timestamp = Some(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64 + (5 * 60 * 1000);
+            .as_millis() as u64 + (5 * 60 * 1000));
         
         assert!(!record.verify_fresh(3600));
     }
 
     #[test]
-    fn test_endpoint_record_validate_structure_valid() {
+    fn test_contact_validate_structure_valid() {
         let kp = Keypair::generate();
-        let record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
         assert!(record.validate_structure());
     }
 
     #[test]
-    fn test_endpoint_record_validate_structure_too_many_addrs() {
+    fn test_contact_validate_structure_too_many_addrs() {
         let kp = Keypair::generate();
         let addrs: Vec<String> = (0..20).map(|i| format!("192.168.1.{}:8080", i)).collect();
-        let record = kp.create_endpoint_record(addrs);
+        let record = kp.create_contact(addrs);
         
         assert!(!record.validate_structure());
     }
 
     #[test]
-    fn test_endpoint_record_validate_structure_empty_addr() {
+    fn test_contact_validate_structure_empty_addr() {
         let kp = Keypair::generate();
-        let record = kp.create_endpoint_record(vec!["".to_string()]);
+        let record = kp.create_contact(vec!["".to_string()]);
         
         assert!(!record.validate_structure());
     }
 
     #[test]
-    fn test_endpoint_record_validate_structure_addr_too_long() {
+    fn test_contact_validate_structure_addr_too_long() {
         let kp = Keypair::generate();
         let long_addr = "x".repeat(300);
-        let record = kp.create_endpoint_record(vec![long_addr]);
+        let record = kp.create_contact(vec![long_addr]);
         
         assert!(!record.validate_structure());
     }
 
     #[test]
-    fn test_endpoint_record_validate_structure_bad_signature_length() {
+    fn test_contact_validate_structure_bad_signature_length() {
         let kp = Keypair::generate();
-        let mut record = kp.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.signature = vec![0u8; 32];        
+        record.signature = Some(vec![0u8; 32]);        
         assert!(!record.validate_structure());
     }
 
@@ -555,10 +578,10 @@ mod tests {
     }
     
     #[test]
-    fn test_p5_endpoint_record_binding() {
+    fn test_p5_contact_binding() {
         let kp = Keypair::generate();
         let addrs = vec!["192.168.1.1:8080".to_string()];
-        let record = kp.create_endpoint_record(addrs);
+        let record = kp.create_contact(addrs);
         
         assert!(record.verify(), "P5 violation: valid record rejected");
         
@@ -573,11 +596,15 @@ mod tests {
         assert!(!tampered.verify(), "P5 violation: address tampering not detected");
         
         let mut tampered = record.clone();
-        tampered.timestamp += 1;
+        if let Some(ref mut ts) = tampered.timestamp {
+            *ts += 1;
+        }
         assert!(!tampered.verify(), "P5 violation: timestamp tampering not detected");
         
         let mut tampered = record.clone();
-        tampered.signature[0] ^= 1;
+        if let Some(ref mut sig) = tampered.signature {
+            sig[0] ^= 1;
+        }
         assert!(!tampered.verify(), "P5 violation: signature tampering not detected");
     }
 
@@ -669,7 +696,7 @@ mod tests {
         let keypair = Keypair::generate();
         let addrs = vec!["192.168.1.1:8080".to_string()];
 
-        let record = keypair.create_endpoint_record(addrs);
+        let record = keypair.create_contact(addrs);
 
         assert!(record.verify());
         assert!(record.verify_fresh(3600));    }
@@ -679,13 +706,10 @@ mod tests {
         let keypair = Keypair::generate();
         let relay_keypair = Keypair::generate();
 
-        let relays = vec![Contact {
-            identity: relay_keypair.identity(),
-            addrs: vec!["10.0.0.1:9000".to_string()],
-        }];
+        let relays = vec![relay_keypair.identity()];
 
         let record =
-            keypair.create_endpoint_record_with_relays(vec!["192.168.1.1:8080".to_string()], relays);
+            keypair.create_contact_with_relays(vec!["192.168.1.1:8080".to_string()], relays);
 
         assert!(record.verify());
         assert!(record.has_relays());
@@ -695,7 +719,7 @@ mod tests {
     #[test]
     fn tampered_addresses_fail_verification() {
         let keypair = Keypair::generate();
-        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
 
         record.addrs = vec!["attacker.com:8080".to_string()];
 
@@ -707,10 +731,10 @@ mod tests {
         let keypair = Keypair::generate();
         let attacker_keypair = Keypair::generate();
 
-        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
 
         let attacker_record =
-            attacker_keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+            attacker_keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
         record.signature = attacker_record.signature;
 
         assert!(!record.verify());
@@ -743,13 +767,13 @@ mod tests {
 
         let signature = keypair.sign(&data);
 
-        let old_record = EndpointRecord {
+        let old_record = Contact {
             identity,
             addrs,
             relays: vec![],
             is_relay: false,
-            timestamp: old_timestamp,
-            signature: signature.to_bytes().to_vec(),
+            timestamp: Some(old_timestamp),
+            signature: Some(signature.to_bytes().to_vec()),
         };
 
         assert!(old_record.verify());        assert!(!old_record.verify_fresh(3600));    }
@@ -782,13 +806,13 @@ mod tests {
 
         let signature = keypair.sign(&data);
 
-        let future_record = EndpointRecord {
+        let future_record = Contact {
             identity,
             addrs,
             relays: vec![],
             is_relay: false,
-            timestamp: future_timestamp,
-            signature: signature.to_bytes().to_vec(),
+            timestamp: Some(future_timestamp),
+            signature: Some(signature.to_bytes().to_vec()),
         };
 
         assert!(!future_record.verify_fresh(3600));    }
@@ -798,23 +822,23 @@ mod tests {
         let keypair = Keypair::generate();
 
         let too_many_addrs: Vec<String> = (0..20).map(|i| format!("10.0.0.{}:8080", i)).collect();
-        let record = keypair.create_endpoint_record(too_many_addrs);
+        let record = keypair.create_contact(too_many_addrs);
         assert!(!record.validate_structure());
 
         let long_addr = "a".repeat(300);
-        let record = keypair.create_endpoint_record(vec![long_addr]);
+        let record = keypair.create_contact(vec![long_addr]);
         assert!(!record.validate_structure());
 
-        let record = keypair.create_endpoint_record(vec!["".to_string()]);
+        let record = keypair.create_contact(vec!["".to_string()]);
         assert!(!record.validate_structure());
     }
 
     #[test]
     fn invalid_signature_length_rejected() {
         let keypair = Keypair::generate();
-        let mut record = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let mut record = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
 
-        record.signature = record.signature[..32].to_vec();
+        record.signature = record.signature.map(|s| s[..32].to_vec());
 
         assert!(!record.validate_structure());
         assert!(!record.verify());
@@ -824,12 +848,12 @@ mod tests {
     fn address_concatenation_attack_prevented() {
         let keypair = Keypair::generate();
 
-        let record1 = keypair.create_endpoint_record(vec![
+        let record1 = keypair.create_contact(vec![
             "192.168.1.1".to_string(),
             ":8080".to_string(),
         ]);
 
-        let record2 = keypair.create_endpoint_record(vec!["192.168.1.1:8080".to_string()]);
+        let record2 = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
 
         assert_ne!(record1.signature, record2.signature);
 

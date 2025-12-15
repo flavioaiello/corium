@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -10,13 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quinn::{AsyncUdpSocket, UdpPoller};
 use quinn::udp::{RecvMeta, Transmit};
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::identity::Identity;
+use crate::identity::{Contact, Identity};
 use crate::relay::{Relay, RelayTunnel, RELAY_MAGIC, MAX_RELAY_FRAME_SIZE};
-
 
 /// Callback trait for path change notifications.
 /// Implementors receive notifications when SmartSock detects better paths to peers.
@@ -27,45 +25,6 @@ pub trait PathEventHandler: Send + Sync {
     
     /// Called when a peer becomes unreachable (all paths failed).
     async fn on_peer_unreachable(&self, peer: Identity);
-}
-
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Contact {
-    pub identity: Identity,
-    pub addrs: Vec<String>,
-}
-
-impl Contact {
-    pub fn single(identity: Identity, addr: impl Into<String>) -> Self {
-        Self {
-            identity,
-            addrs: vec![addr.into()],
-        }
-    }
-    
-    /// Get the primary address (first in the list).
-    pub fn primary_addr(&self) -> Option<&str> {
-        self.addrs.first().map(|s| s.as_str())
-    }
-
-    pub fn all_addrs(&self) -> impl Iterator<Item = &str> {
-        self.addrs.iter().map(|s| s.as_str())
-    }
-}
-
-impl PartialEq for Contact {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-    }
-}
-
-impl Eq for Contact {}
-
-impl Hash for Contact {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.identity.hash(state);
-    }
 }
 
 
@@ -886,10 +845,7 @@ impl SmartSock {
             .map(|a| a.to_string())
             .collect();
         
-        Some(Contact {
-            identity: state.identity,
-            addrs,
-        })
+        Some(Contact::unsigned(state.identity, addrs))
     }
     
     /// Get contact information for a peer from SmartSock's peer registry (async version).
@@ -903,10 +859,7 @@ impl SmartSock {
             .map(|a| a.to_string())
             .collect();
         
-        Some(Contact {
-            identity: state.identity,
-            addrs,
-        })
+        Some(Contact::unsigned(state.identity, addrs))
     }
     
     pub async fn use_relay_path(

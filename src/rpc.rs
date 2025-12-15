@@ -12,12 +12,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
 use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
-use crate::transport::{SmartSock, Contact, DIRECT_CONNECT_TIMEOUT};
+use crate::transport::{SmartSock, DIRECT_CONNECT_TIMEOUT};
 use crate::crypto::{extract_verified_identity, identity_to_sni};
 use crate::relay::{Relay, generate_session_id, handle_relay_request};
 use crate::dht::DhtNode;
 use crate::storage::Key;
-use crate::identity::{EndpointRecord, Identity};
+use crate::identity::{Contact, Identity};
 use crate::hyparview::HyParView;
 use crate::messages::HyParViewMessage;
 use crate::plumtree::PlumTreeHandler;
@@ -386,6 +386,15 @@ impl RpcNode {
         reply_rx.await.ok().flatten()
     }
 
+    /// Resolve an identity to its addresses via cache/DHT lookup.
+    pub async fn resolve_peer_addrs(&self, identity: &Identity) -> Result<Vec<String>> {
+        let contact = self
+            .resolve_identity_to_contact(identity)
+            .await
+            .context("failed to resolve relay identity")?;
+        Ok(contact.addrs)
+    }
+
     pub async fn cache_contact(&self, contact: &Contact) {
         let _ = self.cmd_tx.send(RpcCommand::CacheContact {
             contact: contact.clone(),
@@ -521,13 +530,14 @@ impl RpcNode {
 
     pub async fn request_relay_session(
         &self,
-        relay: &Contact,
+        relay_identity: &Identity,
+        relay_addrs: &[String],
         from_peer: Identity,
         target_peer: Identity,
         session_id: [u8; 16],
     ) -> Result<(Connection, RelayResponse)> {
         let relay_conn = self
-            .connect_to_peer(&relay.identity, &relay.addrs)
+            .connect_to_peer(relay_identity, relay_addrs)
             .await
             .context("failed to connect to relay")?;
 
@@ -665,12 +675,12 @@ impl RpcNode {
         Ok(conn)
     }
 
-    /// Connect to a peer using their published EndpointRecord.
+    /// Connect to a peer using their published Contact.
     /// 
     /// Strategy:
     /// 1. Try direct connection to advertised addresses
     /// 2. If direct fails and peer has designated relays, connect via relay
-    pub async fn smartconnect(&self, record: &EndpointRecord) -> Result<Connection> {
+    pub async fn smartconnect(&self, record: &Contact) -> Result<Connection> {
         let peer_id = &record.identity;
 
         // Try direct connection first (SmartSock handles path probing and fallback)
@@ -722,10 +732,9 @@ impl RpcNode {
                 anyhow::bail!("cannot use relay without at least one target address");
             }
             
-            // Try each designated relay
+            // Try each designated relay (resolve identity to get addresses)
             let mut last_error = None;
-            for relay in &record.relays {
-                let relay_peer_id = relay.identity;
+            for relay_id in &record.relays {
                 let session_id = match generate_session_id() {
                     Ok(id) => id,
                     Err(_) => continue,
@@ -733,19 +742,34 @@ impl RpcNode {
                 
                 debug!(
                     peer = ?peer_id,
-                    relay = ?relay_peer_id,
+                    relay = ?relay_id,
                     "attempting connection via designated relay"
                 );
                 
+                // Resolve relay identity to get its addresses
+                let relay_addrs = match self.resolve_peer_addrs(relay_id).await {
+                    Ok(addrs) if !addrs.is_empty() => addrs,
+                    Ok(_) => {
+                        debug!(relay = ?relay_id, "relay has no addresses, trying next");
+                        last_error = Some(anyhow::anyhow!("relay has no addresses"));
+                        continue;
+                    }
+                    Err(e) => {
+                        debug!(relay = ?relay_id, error = %e, "failed to resolve relay, trying next");
+                        last_error = Some(e);
+                        continue;
+                    }
+                };
+                
                 let relay_result = self
-                    .request_relay_session(relay, *our_peer_id, *peer_id, session_id)
+                    .request_relay_session(relay_id, &relay_addrs, *our_peer_id, *peer_id, session_id)
                     .await;
 
                 let (relay_conn, response) = match relay_result {
                     Ok((conn, resp)) => (conn, resp),
                     Err(e) => {
                         debug!(
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             error = %e,
                             "failed to request relay session, trying next"
                         );
@@ -761,7 +785,7 @@ impl RpcNode {
                     } => {
                         debug!(
                             peer = ?peer_id,
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             session = hex::encode(session_id),
                             relay_data = %relay_data_addr,
                             "relay session pending"
@@ -774,7 +798,7 @@ impl RpcNode {
                     } => {
                         debug!(
                             peer = ?peer_id,
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             session = hex::encode(session_id),
                             relay_data = %relay_data_addr,
                             "relay session established"
@@ -783,7 +807,7 @@ impl RpcNode {
                     }
                     RelayResponse::Rejected { reason } => {
                         debug!(
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             reason = %reason,
                             "relay rejected, trying next"
                         );
@@ -791,12 +815,12 @@ impl RpcNode {
                         continue;
                     }
                     RelayResponse::Registered => {
-                        debug!(relay = ?relay_peer_id, "unexpected Registered response, trying next");
+                        debug!(relay = ?relay_id, "unexpected Registered response, trying next");
                         last_error = Some(anyhow::anyhow!("unexpected Registered response"));
                         continue;
                     }
                     RelayResponse::Incoming { .. } => {
-                        debug!(relay = ?relay_peer_id, "unexpected Incoming response, trying next");
+                        debug!(relay = ?relay_id, "unexpected Incoming response, trying next");
                         last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
                         continue;
                     }
@@ -809,7 +833,7 @@ impl RpcNode {
                     &relay_data_addr,
                 ).await {
                     debug!(
-                        relay = ?relay_peer_id,
+                        relay = ?relay_id,
                         error = %e,
                         "failed to configure relay path, trying next"
                     );
@@ -829,7 +853,7 @@ impl RpcNode {
                     Ok(Ok(conn)) => {
                         info!(
                             peer = ?peer_id,
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             "connection successful via designated relay"
                         );
                         return Ok(conn);
@@ -839,7 +863,7 @@ impl RpcNode {
                             smartsock.remove_relay_tunnel(peer_id, &session_id).await;
                         }
                         debug!(
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             error = %e,
                             "relay-assisted connect failed, trying next"
                         );
@@ -851,7 +875,7 @@ impl RpcNode {
                             smartsock.remove_relay_tunnel(peer_id, &session_id).await;
                         }
                         debug!(
-                            relay = ?relay_peer_id,
+                            relay = ?relay_id,
                             "relay-assisted connect timed out, trying next"
                         );
                         last_error = Some(anyhow::anyhow!("relay-assisted connect timed out"));
@@ -1577,10 +1601,7 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             );
             
             // Create a contact for the probe address
-            let probe_contact = Contact {
-                identity: from.identity,
-                addrs: vec![probe_addr.clone()],
-            };
+            let probe_contact = Contact::single(from.identity, probe_addr.clone());
             
             // Attempt to ping back with a short timeout
             let reachable = tokio::time::timeout(

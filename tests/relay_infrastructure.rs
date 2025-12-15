@@ -96,7 +96,7 @@ async fn publish_address_with_relay_info() {
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
     
     // Node2 acts as a potential relay
-    let relay_contact = node2.peer_endpoint().clone();
+    let relay_identity = node2.peer_identity();
     
     // Node1 publishes its address with relay info
     let addrs = vec![
@@ -104,11 +104,11 @@ async fn publish_address_with_relay_info() {
         "192.168.1.1:5000".to_string(),
     ];
     
-    let result = node1.publish_address_with_relays(addrs.clone(), vec![relay_contact.clone()]).await;
+    let result = node1.publish_address_with_relays(addrs.clone(), vec![relay_identity]).await;
     assert!(result.is_ok(), "publish_address_with_relays should succeed");
     
     // Publish again to verify idempotency
-    let result = node1.publish_address_with_relays(addrs, vec![relay_contact]).await;
+    let result = node1.publish_address_with_relays(addrs, vec![relay_identity]).await;
     assert!(result.is_ok(), "second publish should also succeed");
 }
 
@@ -119,8 +119,8 @@ async fn publish_address_with_multiple_relays() {
     let relay2 = Node::bind(&test_addr()).await.expect("relay2 bind failed");
     
     let relays = vec![
-        relay1.peer_endpoint().clone(),
-        relay2.peer_endpoint().clone(),
+        relay1.peer_identity(),
+        relay2.peer_identity(),
     ];
     
     let addrs = vec!["10.0.0.1:5000".to_string()];
@@ -197,11 +197,11 @@ async fn three_node_with_relay_bootstrap() {
     // Node2 bootstraps and publishes with node1 as relay
     node2.bootstrap(&node1_id, &node1_addr).await.expect("node2 bootstrap failed");
     
-    if let Some(relay_ep) = node1.relay_endpoint().await {
-        let addrs = vec![node2.local_addr().unwrap().to_string()];
-        node2.publish_address_with_relays(addrs, vec![relay_ep]).await
-            .expect("node2 publish failed");
-    }
+    let relay_id = node1.peer_identity();
+    let addrs = vec![node2.local_addr().unwrap().to_string()];
+    node2.publish_address_with_relays(addrs, vec![relay_id])
+        .await
+        .expect("node2 publish failed");
     
     // Node3 bootstraps
     node3.bootstrap(&node1_id, &node1_addr).await.expect("node3 bootstrap failed");
@@ -210,7 +210,7 @@ async fn three_node_with_relay_bootstrap() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node3 should be able to find node2's peers
-    let peers = node3.find_peers(node2.keypair().identity()).await;
+    let peers = node3.find_peers(node2.peer_identity()).await;
     assert!(peers.is_ok());
 }
 
@@ -317,15 +317,14 @@ async fn connect_with_relay_available() {
     node2.bootstrap(&relay_id, &relay_addr).await.expect("node2 bootstrap failed");
     progress(start, "Node2 bootstrap complete");
     
-    // Node1 publishes with relay info if available
-    progress(start, "Getting relay endpoint...");
-    if let Some(relay_ep) = relay.relay_endpoint().await {
-        let addrs = vec![node1.local_addr().unwrap().to_string()];
-        progress(start, "Publishing address with relays...");
-        node1.publish_address_with_relays(addrs, vec![relay_ep]).await
-            .expect("publish failed");
-        progress(start, "Publish complete");
-    }
+    // Node1 publishes with relay info
+    progress(start, "Getting relay identity...");
+    let relay_identity = relay.peer_identity();
+    let addrs = vec![node1.local_addr().unwrap().to_string()];
+    progress(start, "Publishing address with relays...");
+    node1.publish_address_with_relays(addrs, vec![relay_identity]).await
+        .expect("publish failed");
+    progress(start, "Publish complete");
     
     tokio::time::sleep(Duration::from_millis(100)).await;
     
@@ -405,12 +404,12 @@ async fn sequential_relay_operations() {
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
     
-    let relay_contact = node2.peer_endpoint().clone();
+    let relay_identity = node2.peer_identity();
     
     // Sequential publish operations (Node is not Clone)
     for i in 0..5 {
         let addrs = vec![format!("10.0.0.{}:5000", i)];
-        let _ = node1.publish_address_with_relays(addrs, vec![relay_contact.clone()]).await;
+        let _ = node1.publish_address_with_relays(addrs, vec![relay_identity]).await;
     }
 }
 
@@ -434,10 +433,10 @@ async fn invalid_relay_address_handling() {
 
 #[tokio::test]
 async fn relay_with_closed_node() {
-    let relay_contact;
+    let relay_identity;
     {
         let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
-        relay_contact = relay.peer_endpoint().clone();
+        relay_identity = relay.peer_identity();
         // relay goes out of scope and is dropped
     }
     
@@ -447,7 +446,7 @@ async fn relay_with_closed_node() {
     
     // Publishing with closed relay should still succeed (stored locally)
     let addrs = vec!["10.0.0.1:5000".to_string()];
-    let result = node.publish_address_with_relays(addrs, vec![relay_contact]).await;
+    let result = node.publish_address_with_relays(addrs, vec![relay_identity]).await;
     
     // May succeed or fail depending on whether connection attempt is made
     let _ = result;

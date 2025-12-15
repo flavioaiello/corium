@@ -3,8 +3,7 @@ use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::storage::Key;
-use crate::identity::Identity;
-use crate::transport::Contact;
+use crate::identity::{Contact, Identity};
 
 pub type DirectMessageSender = tokio::sync::mpsc::Sender<(Identity, Vec<u8>)>;
 
@@ -289,8 +288,7 @@ pub enum RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::Contact;
-    use crate::identity::{Identity, Keypair};
+    use crate::identity::{Contact, Identity, Keypair};
     use bincode::Options;
 
     const MAX_MESSAGE_SIZE: u64 = 64 * 1024;
@@ -325,14 +323,14 @@ mod tests {
     }
 
     fn test_contact() -> Contact {
-        Contact { identity: test_identity(), addrs: vec!["127.0.0.1:4433".to_string()] }
+        Contact::single(test_identity(), "127.0.0.1:4433")
     }
 
 
     #[test]
     fn bounded_deserialization_normal_payloads() {
         let request = DhtNodeRequest::Store {
-            from: Contact { identity: make_identity(1), addrs: vec!["127.0.0.1:8080".to_string()] },
+            from: Contact::single(make_identity(1), "127.0.0.1:8080"),
             key: [0u8; 32],
             value: vec![0u8; 100],
         };
@@ -347,7 +345,7 @@ mod tests {
         assert!(test_deserialize_request(&garbage).is_err());
 
         let request = DhtNodeRequest::Ping {
-            from: Contact { identity: make_identity(1), addrs: vec!["127.0.0.1:8080".to_string()] },
+            from: Contact::single(make_identity(1), "127.0.0.1:8080"),
         };
         let bytes = serialize(&request).unwrap();
         let truncated = &bytes[..bytes.len() / 2];
@@ -356,14 +354,14 @@ mod tests {
 
     #[test]
     fn response_deserialization() {
-        let response = DhtNodeResponse::Nodes(vec![Contact { identity: make_identity(1), addrs: vec!["127.0.0.1:8080".to_string()] }]);
+        let response = DhtNodeResponse::Nodes(vec![Contact::single(make_identity(1), "127.0.0.1:8080")]);
         let bytes = bincode::serialize(&response).unwrap();
         assert!(test_deserialize_response(&bytes).is_ok());
     }
 
     #[test]
     fn request_types_roundtrip() {
-        let contact = Contact { identity: make_identity(1), addrs: vec!["127.0.0.1:8080".to_string()] };
+        let contact = Contact::single(make_identity(1), "127.0.0.1:8080");
         let keypair = Keypair::generate();
         let identity = keypair.identity();
 
@@ -402,7 +400,7 @@ mod tests {
 
     #[test]
     fn sender_identity_extraction() {
-        let contact = Contact { identity: make_identity(42), addrs: vec!["127.0.0.1:8080".to_string()] };
+        let contact = Contact::single(make_identity(42), "127.0.0.1:8080");
 
         let ping = DhtNodeRequest::Ping { from: contact.clone() };
         assert_eq!(ping.sender_identity(), Some(make_identity(42)));

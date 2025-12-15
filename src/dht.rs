@@ -11,13 +11,12 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use crate::identity::{EndpointRecord, Identity, Keypair};
+use crate::identity::{Contact, Identity, Keypair};
 use crate::routing::{
     random_id_for_bucket, PendingBucketUpdate, RoutingInsertionLimiter, RoutingTable,
     BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
 };
 use crate::storage::LocalStore;
-use crate::transport::Contact;
 use crate::rpc::DhtNodeRpc;
 
 // Re-export Key for backward compatibility
@@ -51,7 +50,7 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
         return true;
     }
 
-    if let Ok(record) = crate::messages::deserialize_bounded::<EndpointRecord>(value) {
+    if let Ok(record) = crate::messages::deserialize_bounded::<Contact>(value) {
         if record.identity.as_bytes() == key
             && record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS)
         {
@@ -1171,7 +1170,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     pub async fn publish_address(&self, keypair: &Keypair, addresses: Vec<String>) -> Result<()> {
-        let record = keypair.create_endpoint_record(addresses);
+        let record = keypair.create_contact(addresses);
         let serialized = bincode::serialize(&record)
             .map_err(|e| anyhow!("Failed to serialize endpoint record: {}", e))?;
 
@@ -1180,7 +1179,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     /// Resolve a peer's endpoint record from the DHT.
-    pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<EndpointRecord>> {
+    pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<Contact>> {
         const MAX_RECORD_AGE_SECS: u64 = 24 * 60 * 60;
 
         let key: Key = *peer_id.as_bytes();
@@ -1188,7 +1187,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         match data_opt {
             Some(data) => {
-                let record: EndpointRecord = crate::messages::deserialize_bounded(&data)
+                let record: Contact = crate::messages::deserialize_bounded(&data)
                     .map_err(|e| anyhow!("Failed to deserialize endpoint record: {}", e))?;
 
                 if !record.validate_structure() {
@@ -1215,14 +1214,14 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         &self,
         keypair: &Keypair,
         new_addrs: Vec<String>,
-        relays: Vec<Contact>,
+        relays: Vec<Identity>,
     ) -> Result<()> {
         debug!(
             "republishing address after network change: {:?}",
             new_addrs
         );
 
-        let record = keypair.create_endpoint_record_with_relays(new_addrs, relays);
+        let record = keypair.create_contact_with_relays(new_addrs, relays);
         let serialized = bincode::serialize(&record)
             .map_err(|e| anyhow!("Failed to serialize endpoint record: {}", e))?;
 
@@ -1549,10 +1548,7 @@ mod tests {
         // Use index to create different /16 prefixes: 10.{hi}.{lo}.1
         let hi = ((index >> 8) & 0xFF) as u8;
         let lo = (index & 0xFF) as u8;
-        Contact {
-            identity: make_identity(index),
-            addrs: vec![format!("10.{hi}.{lo}.1:9001")],
-        }
+        Contact::single(make_identity(index), format!("10.{hi}.{lo}.1:9001"))
     }
 
     /// Find three indices whose generated identities have peers 2 and 3 in the same bucket
