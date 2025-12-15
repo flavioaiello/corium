@@ -587,8 +587,7 @@ mod tests {
     fn make_test_contact(byte: u8) -> Contact {
         Contact {
             identity: make_test_identity(byte),
-            addr: format!("node-{byte}"),
-            addrs: vec![],
+            addrs: vec![format!("node-{byte}")],
         }
     }
 

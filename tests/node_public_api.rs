@@ -56,7 +56,7 @@ async fn node_peer_endpoint_accessor() {
     
     let contact = node.peer_endpoint();
     
-    assert!(!contact.addr.is_empty(), "contact addr should not be empty");
+    assert!(!contact.addrs.is_empty(), "contact addrs should not be empty");
     assert_eq!(
         hex::encode(contact.identity),
         node.identity(),
@@ -207,10 +207,16 @@ async fn two_node_connect() {
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
     
-    // Direct connect should work
+    // Bootstrap node2 from node1 (populates routing tables)
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes its address so it can be resolved via DHT
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    
+    // Connect using identity only (resolves via DHT)
     let result = timeout(
         TEST_TIMEOUT,
-        node2.connect(&node1_id, &node1_addr)
+        node2.connect(&node1_id)
     ).await;
     
     assert!(result.is_ok(), "connect should complete within timeout");
@@ -305,12 +311,12 @@ async fn node_publish_address_with_relays() {
 #[tokio::test]
 async fn node_resolve_peer_not_found() {
     // Resolve requires an Identity which is internal type
-    // We test this through connect_peer instead which uses identity string
+    // We test this through connect instead which uses identity string
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Try to resolve a peer that doesn't exist via connect_peer
+    // Try to resolve a peer that doesn't exist via connect
     let fake_id = "0000000000000000000000000000000000000000000000000000000000000001";
-    let result = timeout(SHORT_TIMEOUT, node.connect_peer(fake_id)).await;
+    let result = timeout(SHORT_TIMEOUT, node.connect(fake_id)).await;
     
     // Should timeout or error
     match result {
@@ -358,13 +364,13 @@ async fn invalid_identity_rejected() {
 }
 
 #[tokio::test]
-async fn connect_peer_not_in_dht() {
+async fn connect_not_in_dht() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
     // Random peer not in DHT
     let fake_id = "0000000000000000000000000000000000000000000000000000000000000001";
     
-    let result = timeout(SHORT_TIMEOUT, node.connect_peer(fake_id)).await;
+    let result = timeout(SHORT_TIMEOUT, node.connect(fake_id)).await;
     
     // Should either timeout or return "peer not found"
     match result {

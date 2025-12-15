@@ -94,8 +94,9 @@ if let Some(data) = node.get(&key).await? {
 ### NAT Traversal
 
 ```rust
-// Automatic NAT configuration
-let (is_public, relay, incoming_rx) = node.configure_nat(&helper_peer, addresses).await?;
+// Automatic NAT configuration (helper is a known peer identity in the DHT)
+let helper_identity = "abc123..."; // hex-encoded peer identity
+let (is_public, relay, incoming_rx) = node.configure_nat(helper_identity, addresses).await?;
 
 if is_public {
     println!("Publicly reachable - can serve as relay");
@@ -179,8 +180,7 @@ A `Contact` represents a reachable peer:
 ```rust
 pub struct Contact {
     pub identity: Identity,   // Ed25519 public key
-    pub addr: String,         // Primary address (IP:port)
-    pub addrs: Vec<String>,   // Additional addresses
+    pub addrs: Vec<String>,   // List of addresses (IP:port)
 }
 ```
 
@@ -206,7 +206,7 @@ Automatic connection establishment with fallback:
 
 ```rust
 // SmartConnect handles all complexity internally
-let conn = node.connect_peer("target_identity_hex").await?;
+let conn = node.connect("target_identity_hex").await?;
 ```
 
 ## NAT Traversal

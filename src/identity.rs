@@ -89,12 +89,7 @@ impl Keypair {
         data.extend_from_slice(&(relays.len() as u32).to_le_bytes());
         for relay in &relays {
             data.extend_from_slice(relay.identity.as_bytes());
-            let relay_addr_count: u32 = (relay.addrs.len() as u32).saturating_add(1);
-            data.extend_from_slice(&relay_addr_count.to_le_bytes());
-
-            let primary_addr_bytes = relay.addr.as_bytes();
-            data.extend_from_slice(&(primary_addr_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(primary_addr_bytes);
+            data.extend_from_slice(&(relay.addrs.len() as u32).to_le_bytes());
 
             for addr in &relay.addrs {
                 let addr_bytes = addr.as_bytes();
@@ -248,12 +243,7 @@ impl EndpointRecord {
         data.extend_from_slice(&(self.relays.len() as u32).to_le_bytes());
         for relay in &self.relays {
             data.extend_from_slice(relay.identity.as_bytes());
-            let relay_addr_count: u32 = (relay.addrs.len() as u32).saturating_add(1);
-            data.extend_from_slice(&relay_addr_count.to_le_bytes());
-
-            let primary_addr_bytes = relay.addr.as_bytes();
-            data.extend_from_slice(&(primary_addr_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(primary_addr_bytes);
+            data.extend_from_slice(&(relay.addrs.len() as u32).to_le_bytes());
 
             for addr in &relay.addrs {
                 let addr_bytes = addr.as_bytes();
@@ -329,15 +319,11 @@ impl EndpointRecord {
                 return false;
             }
             
-            if relay.addr.len() > MAX_ADDR_LEN || relay.addr.is_empty() {
+            if relay.addrs.is_empty() {
                 return false;
             }
 
-            if relay.addrs.len() + 1 > MAX_ADDRS {
-                return false;
-            }
-
-            if relay.addrs.iter().any(|a| a == &relay.addr) {
+            if relay.addrs.len() > MAX_ADDRS {
                 return false;
             }
 
@@ -351,12 +337,6 @@ impl EndpointRecord {
                     if !seen.insert(addr) {
                         return false;
                     }
-                }
-            }
-
-            for addr in &relay.addrs {
-                if addr.len() > MAX_ADDR_LEN || addr.is_empty() {
-                    return false;
                 }
             }
         }
@@ -701,8 +681,7 @@ mod tests {
 
         let relays = vec![Contact {
             identity: relay_keypair.identity(),
-            addr: "10.0.0.1:9000".to_string(),
-            addrs: vec![],
+            addrs: vec!["10.0.0.1:9000".to_string()],
         }];
 
         let record =

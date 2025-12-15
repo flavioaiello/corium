@@ -271,8 +271,10 @@ impl RpcNodeActor {
     }
 
     async fn connect(&self, contact: &Contact) -> Result<Connection> {
-        let addr: SocketAddr = contact.addr.parse()
-            .with_context(|| format!("invalid socket address: {}", contact.addr))?;
+        let primary = contact.primary_addr()
+            .context("contact has no addresses")?;
+        let addr: SocketAddr = primary.parse()
+            .with_context(|| format!("invalid socket address: {}", primary))?;
         let sni = identity_to_sni(&contact.identity);
         
         let conn = self
@@ -470,7 +472,7 @@ impl RpcNode {
 
             if len > MAX_RESPONSE_SIZE {
                 warn!(
-                    peer = %contact.addr,
+                    peer = %contact.primary_addr().unwrap_or("<no addr>"),
                     size = len,
                     max = MAX_RESPONSE_SIZE,
                     "peer sent oversized response"
@@ -524,12 +526,8 @@ impl RpcNode {
         target_peer: Identity,
         session_id: [u8; 16],
     ) -> Result<(Connection, RelayResponse)> {
-        let relay_addrs: Vec<String> = std::iter::once(relay.addr.clone())
-            .chain(relay.addrs.iter().cloned())
-            .collect();
-
         let relay_conn = self
-            .connect_to_peer(&relay.identity, &relay_addrs)
+            .connect_to_peer(&relay.identity, &relay.addrs)
             .await
             .context("failed to connect to relay")?;
 
@@ -927,7 +925,7 @@ impl DhtNodeRpc for RpcNode {
             DhtNodeResponse::Nodes(nodes) => {
                 if nodes.len() > MAX_CONTACTS_PER_RESPONSE {
                     warn!(
-                        peer = %to.addr,
+                        peer = %to.primary_addr().unwrap_or("<no addr>"),
                         count = nodes.len(),
                         max = MAX_CONTACTS_PER_RESPONSE,
                         "peer returned too many contacts, truncating"
@@ -951,7 +949,7 @@ impl DhtNodeRpc for RpcNode {
                 if let Some(ref v) = value {
                     if v.len() > MAX_VALUE_SIZE {
                         warn!(
-                            peer = %to.addr,
+                            peer = %to.primary_addr().unwrap_or("<no addr>"),
                             size = v.len(),
                             max = MAX_VALUE_SIZE,
                             "peer returned oversized value, rejecting"
@@ -962,7 +960,7 @@ impl DhtNodeRpc for RpcNode {
                 
                 let closer = if closer.len() > MAX_CONTACTS_PER_RESPONSE {
                     warn!(
-                        peer = %to.addr,
+                        peer = %to.primary_addr().unwrap_or("<no addr>"),
                         count = closer.len(),
                         max = MAX_CONTACTS_PER_RESPONSE,
                         "peer returned too many contacts in FIND_VALUE, truncating"
@@ -1581,8 +1579,7 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
             // Create a contact for the probe address
             let probe_contact = Contact {
                 identity: from.identity,
-                addr: probe_addr.clone(),
-                addrs: vec![],
+                addrs: vec![probe_addr.clone()],
             };
             
             // Attempt to ping back with a short timeout

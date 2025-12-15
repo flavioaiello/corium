@@ -63,8 +63,7 @@ impl Node {
         
         let contact = Contact {
             identity,
-            addr: local_addr.to_string(),
-            addrs: vec![],
+            addrs: vec![local_addr.to_string()],
         };
         
         let rpcnode = RpcNode::with_identity(
@@ -220,8 +219,7 @@ impl Node {
         
         Some(Contact {
             identity: self.keypair.identity(),
-            addr: local_addr.to_string(),
-            addrs: vec![],
+            addrs: vec![local_addr.to_string()],
         })
     }
     
@@ -231,9 +229,10 @@ impl Node {
     /// their relay. When other peers want to connect via the relay, the node
     /// receives `IncomingConnection` notifications through the returned receiver.
     /// 
+    /// The relay's address is resolved via DHT lookup.
+    /// 
     /// # Arguments
     /// * `relay_identity` - Hex-encoded identity of the relay node
-    /// * `relay_addr` - Address of the relay node
     /// 
     /// # Returns
     /// A receiver that yields incoming connection notifications. Each notification
@@ -242,7 +241,7 @@ impl Node {
     /// 
     /// # Example
     /// ```ignore
-    /// let mut rx = node.register_with_relay("abc123...", "1.2.3.4:5000").await?;
+    /// let mut rx = node.register_with_relay("abc123...").await?;
     /// while let Some(notification) = rx.recv().await {
     ///     match notification {
     ///         IncomingConnection { from_peer, session_id, relay_data_addr } => {
@@ -254,15 +253,16 @@ impl Node {
     pub async fn register_with_relay(
         &self,
         relay_identity: &str,
-        relay_addr: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<IncomingConnection>> {
         let relay_id = Identity::from_hex(relay_identity)
             .context("invalid relay identity: must be 64 hex characters")?;
         
+        let record = self.dhtnode.resolve_peer(&relay_id).await?
+            .context("relay not found in DHT")?;
+        
         let relay_contact = Contact {
             identity: relay_id,
-            addr: relay_addr.to_string(),
-            addrs: vec![],
+            addrs: record.addrs,
         };
         
         self.relay_client.register_with_relay(&relay_contact).await?;
@@ -282,7 +282,7 @@ impl Node {
     /// peer's QUIC connection will arrive through the normal server accept loop.
     /// 
     /// # Flow
-    /// 1. Peer A calls `connect_peer(B)` → triggers relay session
+    /// 1. Peer A calls `connect(B)` → triggers relay session
     /// 2. B receives `IncomingConnection` notification
     /// 3. B calls `accept_incoming()` → configures tunnel, sends probe
     /// 4. A's pending QUIC handshake now completes through the relay
@@ -290,7 +290,7 @@ impl Node {
     /// 
     /// # Example
     /// ```ignore
-    /// let mut rx = node.register_with_relay("relay_id", "relay_addr").await?;
+    /// let mut rx = node.register_with_relay("relay_id").await?;
     /// tokio::spawn(async move {
     ///     while let Some(incoming) = rx.recv().await {
     ///         node.accept_incoming(&incoming).await?;
@@ -321,8 +321,7 @@ impl Node {
         
         let contact = Contact {
             identity: peer_identity,
-            addr: addr.to_string(),
-            addrs: vec![],
+            addrs: vec![addr.to_string()],
         };
         
         self.rpcnode.cache_contact(&contact).await;
@@ -336,16 +335,23 @@ impl Node {
         Ok(())
     }
     
-    
-    pub async fn connect(&self, identity: &str, addr: &str) -> Result<Connection> {
-        let peer_identity = Identity::from_hex(identity)
-            .context("invalid identity: must be 64 hex characters")?;
-        
-        let conn = self.rpcnode.connect_to_peer(&peer_identity, &[addr.to_string()]).await?;
-        Ok(conn)
-    }
-    
-    pub async fn connect_peer(&self, identity: &str) -> Result<Connection> {
+    /// Connect to a peer by identity using DHT-based address resolution.
+    /// 
+    /// This resolves the peer's published `EndpointRecord` from the DHT and uses
+    /// `smartconnect` which tries direct connection first, then falls back to
+    /// relay-assisted connection if the peer has designated relays.
+    /// 
+    /// # Arguments
+    /// * `identity` - Hex-encoded 32-byte identity of the peer
+    /// 
+    /// # Returns
+    /// A QUIC connection to the peer.
+    /// 
+    /// # Errors
+    /// - If the identity is invalid (not 64 hex characters)
+    /// - If the peer is not found in the DHT
+    /// - If connection fails (direct and relay)
+    pub async fn connect(&self, identity: &str) -> Result<Connection> {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
@@ -373,7 +379,6 @@ impl Node {
         
         let contact = Contact {
             identity: peer_identity,
-            addr: record.addrs.first().cloned().unwrap_or_default(),
             addrs: record.addrs.clone(),
         };
         
@@ -473,15 +478,28 @@ impl Node {
     /// This performs a "self-probe" by requesting `helper` to attempt a connection
     /// to our local address. Returns `true` if we are publicly reachable.
     /// 
+    /// The helper's address is resolved via DHT lookup.
+    /// 
     /// # Arguments
-    /// * `helper` - A known peer that will attempt to connect back to us
+    /// * `helper_identity` - Hex-encoded identity of a known peer to help with the probe
     /// 
     /// # Returns
     /// * `Ok(true)` - We are publicly reachable (can serve as relay)
     /// * `Ok(false)` - We are behind NAT (need to use a relay)
     /// * `Err(_)` - Could not complete the probe (helper unreachable, etc.)
-    pub async fn probe_reachability(&self, helper: &Contact) -> Result<bool> {
-        self.relay_client.probe_reachability(helper).await
+    pub async fn probe_reachability(&self, helper_identity: &str) -> Result<bool> {
+        let helper_id = Identity::from_hex(helper_identity)
+            .context("invalid helper identity: must be 64 hex characters")?;
+        
+        let record = self.dhtnode.resolve_peer(&helper_id).await?
+            .context("helper not found in DHT")?;
+        
+        let helper = Contact {
+            identity: helper_id,
+            addrs: record.addrs,
+        };
+        
+        self.relay_client.probe_reachability(&helper).await
     }
 
     /// Discover relay-capable nodes in the network.
@@ -515,18 +533,31 @@ impl Node {
     /// 2. If publicly reachable: publish address with `is_relay: true`
     /// 3. If NAT-bound: discover relays, select best one, register, and publish
     /// 
+    /// The helper's address is resolved via DHT lookup.
+    /// 
     /// # Arguments
-    /// * `helper` - A known peer to use for the reachability probe
+    /// * `helper_identity` - Hex-encoded identity of a known peer to use for the reachability probe
     /// * `addresses` - Our addresses to publish in the DHT
     /// 
     /// # Returns
     /// Configuration result indicating our NAT status and relay (if applicable).
     pub async fn configure_nat(
         &self,
-        helper: &Contact,
+        helper_identity: &str,
         addresses: Vec<String>,
     ) -> Result<(bool, Option<Contact>, Option<tokio::sync::mpsc::Receiver<IncomingConnection>>)> {
-        let status = self.relay_client.configure(helper, addresses).await?;
+        let helper_id = Identity::from_hex(helper_identity)
+            .context("invalid helper identity: must be 64 hex characters")?;
+        
+        let record = self.dhtnode.resolve_peer(&helper_id).await?
+            .context("helper not found in DHT")?;
+        
+        let helper = Contact {
+            identity: helper_id,
+            addrs: record.addrs,
+        };
+        
+        let status = self.relay_client.configure(&helper, addresses).await?;
         
         match status {
             NatStatus::Public => Ok((true, None, None)),

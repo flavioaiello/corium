@@ -150,7 +150,8 @@ async fn relay_endpoint_address_format() {
     
     if let Some(relay_ep) = node.relay_endpoint().await {
         // Relay address should be parseable
-        let addr: Result<SocketAddr, _> = relay_ep.addr.parse();
+        let primary = relay_ep.addrs.first().expect("should have at least one addr");
+        let addr: Result<SocketAddr, _> = primary.parse();
         assert!(addr.is_ok(), "relay addr should be valid socket address");
         
         // Relay port should be different from main port (typically +1)
@@ -170,12 +171,12 @@ async fn relay_endpoint_contains_quic_addr() {
         // The addrs field should contain the QUIC endpoint address
         let main_addr = node.local_addr().unwrap().to_string();
         
-        // Either the main addr is in addrs, or it matches the primary addr
-        let _has_quic = relay_ep.addr == main_addr 
-            || relay_ep.addrs.iter().any(|a| a == &main_addr);
+        // The addrs should contain the main addr
+        let has_quic = relay_ep.addrs.iter().any(|a| a == &main_addr);
         
         // Just verify the struct is populated correctly
-        assert!(!relay_ep.addr.is_empty());
+        assert!(!relay_ep.addrs.is_empty());
+        assert!(has_quic, "relay endpoint should contain QUIC address");
     }
 }
 
@@ -257,7 +258,8 @@ async fn relay_server_shares_socket() {
     let quic_addr = node.quic_endpoint().local_addr().expect("quic addr");
     
     // The advertised relay address should use the same port
-    let relay_addr: std::net::SocketAddr = relay.addr.parse().expect("parse relay addr");
+    let primary = relay.addrs.first().expect("should have relay addr");
+    let relay_addr: std::net::SocketAddr = primary.parse().expect("parse relay addr");
     assert_eq!(relay_addr.port(), quic_addr.port(), "relay and QUIC should share port");
 }
 
@@ -273,10 +275,16 @@ async fn direct_connect_preferred_when_available() {
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
     
-    // Direct connect should work
+    // Bootstrap node2 from node1 (populates routing tables)
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes its address for DHT resolution
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    
+    // Connect using identity only (resolves via DHT)
     let result = timeout(
         TEST_TIMEOUT,
-        node2.connect(&node1_id, &node1_addr)
+        node2.connect(&node1_id)
     ).await;
     
     assert!(result.is_ok(), "connect should complete");
@@ -322,10 +330,10 @@ async fn connect_with_relay_available() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Direct connect should still work since both are reachable
-    progress(start, "Starting connect...");
+    progress(start, "Starting connect via identity...");
     let result = timeout(
         TEST_TIMEOUT,
-        node2.connect(&node1.identity(), &node1.local_addr().unwrap().to_string())
+        node2.connect(&node1.identity())
     ).await;
     progress(start, "Connect complete");
     
@@ -358,10 +366,16 @@ async fn smartsock_peer_registration() {
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
     
-    // Connect which should register the peer
+    // Bootstrap node2 from node1 (populates routing tables)
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes its address for DHT resolution
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    
+    // Connect which should register the peer (identity-only resolves via DHT)
     let _ = timeout(
         TEST_TIMEOUT,
-        node2.connect(&node1_id, &node1_addr)
+        node2.connect(&node1_id)
     ).await;
     
     // SmartSock should have the peer registered

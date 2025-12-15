@@ -309,31 +309,35 @@ impl TieringManager {
 
     /// Register a contact and return its tiering level based on /16 prefix.
     pub fn register_contact(&mut self, contact: &Contact) -> TieringLevel {
-        if let Some(prefix) = Prefix16::from_addr_str(&contact.addr) {
-            // Ensure prefix is in LRU (touch it)
-            self.prefix_rtt.get_or_insert_mut(prefix, PrefixRttStats::default);
-            self.prefix_tiers
-                .get(&prefix)
-                .copied()
-                .unwrap_or_else(|| self.default_level())
-        } else {
-            self.default_level()
+        if let Some(primary) = contact.primary_addr() {
+            if let Some(prefix) = Prefix16::from_addr_str(primary) {
+                // Ensure prefix is in LRU (touch it)
+                self.prefix_rtt.get_or_insert_mut(prefix, PrefixRttStats::default);
+                return self.prefix_tiers
+                    .get(&prefix)
+                    .copied()
+                    .unwrap_or_else(|| self.default_level());
+            }
         }
+        self.default_level()
     }
 
     /// Record an RTT sample for a contact's /16 prefix.
     pub fn record_sample(&mut self, contact: &Contact, rtt_ms: f32) {
-        if let Some(prefix) = Prefix16::from_addr_str(&contact.addr) {
-            self.prefix_rtt
-                .get_or_insert_mut(prefix, PrefixRttStats::default)
-                .update(rtt_ms);
-            self.recompute_if_needed();
+        if let Some(primary) = contact.primary_addr() {
+            if let Some(prefix) = Prefix16::from_addr_str(primary) {
+                self.prefix_rtt
+                    .get_or_insert_mut(prefix, PrefixRttStats::default)
+                    .update(rtt_ms);
+                self.recompute_if_needed();
+            }
         }
     }
 
     /// Get tiering level for a contact based on its /16 prefix.
     pub fn level_for(&self, contact: &Contact) -> TieringLevel {
-        Prefix16::from_addr_str(&contact.addr)
+        contact.primary_addr()
+            .and_then(|primary| Prefix16::from_addr_str(primary))
             .and_then(|prefix| self.prefix_tiers.get(&prefix).copied())
             .unwrap_or_else(|| self.default_level())
     }
@@ -356,7 +360,8 @@ impl TieringManager {
     /// Returns the smoothed RTT if we have data, otherwise None.
     #[allow(dead_code)]
     pub fn estimate_rtt(&mut self, contact: &Contact) -> Option<f32> {
-        Prefix16::from_addr_str(&contact.addr)
+        contact.primary_addr()
+            .and_then(|primary| Prefix16::from_addr_str(primary))
             .and_then(|prefix| self.prefix_rtt.get(&prefix))
             .map(|stats| stats.smoothed)
     }
@@ -808,7 +813,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
         for c in &shortlist {
             seen.insert(c.identity);
-            seen_addrs.insert(c.addr.clone());
+            for addr in &c.addrs {
+                seen_addrs.insert(addr.clone());
+            }
         }
 
         let mut best_distance = shortlist
@@ -901,8 +908,8 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                             if n.identity == self.id {
                                 continue;
                             }
-                            if seen.insert(n.identity)
-                                && seen_addrs.insert(n.addr.clone())
+                            let has_new_addr = n.addrs.iter().any(|a| seen_addrs.insert(a.clone()));
+                            if seen.insert(n.identity) || has_new_addr
                             {
                                 shortlist.push(n);
                             }
@@ -1544,8 +1551,7 @@ mod tests {
         let lo = (index & 0xFF) as u8;
         Contact {
             identity: make_identity(index),
-            addr: format!("10.{hi}.{lo}.1:9001"),
-            addrs: vec![],
+            addrs: vec![format!("10.{hi}.{lo}.1:9001")],
         }
     }
 

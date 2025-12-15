@@ -33,8 +33,6 @@ pub trait PathEventHandler: Send + Sync {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Contact {
     pub identity: Identity,
-    pub addr: String,
-    #[serde(default)]
     pub addrs: Vec<String>,
 }
 
@@ -42,13 +40,17 @@ impl Contact {
     pub fn single(identity: Identity, addr: impl Into<String>) -> Self {
         Self {
             identity,
-            addr: addr.into(),
-            addrs: Vec::new(),
+            addrs: vec![addr.into()],
         }
     }
+    
+    /// Get the primary address (first in the list).
+    pub fn primary_addr(&self) -> Option<&str> {
+        self.addrs.first().map(|s| s.as_str())
+    }
 
-    pub fn all_addrs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
-        std::iter::once(self.addr.as_str()).chain(self.addrs.iter().map(|s| s.as_str()))
+    pub fn all_addrs(&self) -> impl Iterator<Item = &str> {
+        self.addrs.iter().map(|s| s.as_str())
     }
 }
 
@@ -704,12 +706,7 @@ impl SmartSock {
         // Parse all addresses from the contact
         let mut addrs: Vec<SocketAddr> = Vec::new();
         
-        // Parse primary address
-        if let Ok(addr) = contact.addr.parse::<SocketAddr>() {
-            addrs.push(addr);
-        }
-        
-        // Parse additional addresses
+        // Parse all addresses
         for addr_str in &contact.addrs {
             if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                 if !addrs.contains(&addr) {
@@ -885,17 +882,12 @@ impl SmartSock {
         let state = peers.get(&smart_addr)?;
         
         // Build contact from peer state
-        let primary_addr = state.direct_addrs.first()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
         let addrs: Vec<String> = state.direct_addrs.iter()
-            .skip(1)
             .map(|a| a.to_string())
             .collect();
         
         Some(Contact {
             identity: state.identity,
-            addr: primary_addr,
             addrs,
         })
     }
@@ -907,17 +899,12 @@ impl SmartSock {
         let state = peers.get(&smart_addr)?;
         
         // Build contact from peer state
-        let primary_addr = state.direct_addrs.first()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
         let addrs: Vec<String> = state.direct_addrs.iter()
-            .skip(1)
             .map(|a| a.to_string())
             .collect();
         
         Some(Contact {
             identity: state.identity,
-            addr: primary_addr,
             addrs,
         })
     }
