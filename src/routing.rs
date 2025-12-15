@@ -97,8 +97,8 @@ enum BucketTouchOutcome {
     Inserted,
     Refreshed,
     Full {
-        new_contact: Contact,
-        oldest: Contact,
+        new_contact: Box<Contact>,
+        oldest: Box<Contact>,
     },
 }
 
@@ -145,8 +145,8 @@ impl Bucket {
                 .cloned()
                 .unwrap_or_else(|| contact.clone());
             BucketTouchOutcome::Full {
-                new_contact: contact,
-                oldest,
+                new_contact: Box::new(contact),
+                oldest: Box::new(oldest),
             }
         }
     }
@@ -260,8 +260,8 @@ impl RoutingTable {
                 oldest,
             } => Some(PendingBucketUpdate {
                 bucket_index: idx,
-                oldest,
-                new_contact,
+                oldest: *oldest,
+                new_contact: *new_contact,
             }),
         }
     }

@@ -336,7 +336,7 @@ impl TieringManager {
     /// Get tiering level for a contact based on its /16 prefix.
     pub fn level_for(&self, contact: &Contact) -> TieringLevel {
         contact.primary_addr()
-            .and_then(|primary| Prefix16::from_addr_str(primary))
+            .and_then(Prefix16::from_addr_str)
             .and_then(|prefix| self.prefix_tiers.get(&prefix).copied())
             .unwrap_or_else(|| self.default_level())
     }
@@ -360,7 +360,7 @@ impl TieringManager {
     #[allow(dead_code)]
     pub fn estimate_rtt(&mut self, contact: &Contact) -> Option<f32> {
         contact.primary_addr()
-            .and_then(|primary| Prefix16::from_addr_str(primary))
+            .and_then(Prefix16::from_addr_str)
             .and_then(|prefix| self.prefix_rtt.get(&prefix))
             .map(|stats| stats.smoothed)
     }
