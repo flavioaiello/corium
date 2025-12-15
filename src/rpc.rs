@@ -110,7 +110,6 @@ enum RpcCommand {
         peer_id: Identity,
     },
     /// Shutdown the actor
-    #[allow(dead_code)]
     Quit,
 }
 
@@ -365,6 +364,11 @@ impl RpcNode {
     pub fn with_smartsock(mut self, smartsock: Arc<SmartSock>) -> Self {
         self.smartsock = Some(smartsock);
         self
+    }
+
+    /// Shutdown the RPC actor gracefully.
+    pub async fn quit(&self) {
+        let _ = self.cmd_tx.send(RpcCommand::Quit).await;
     }
     
     pub async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {

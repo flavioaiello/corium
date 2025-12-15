@@ -653,11 +653,6 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
             }
         }
-
-        #[allow(dead_code)]
-        async fn sent_messages(&self) -> Vec<(Identity, HyParViewMessage)> {
-            self.sent.lock().await.clone()
-        }
     }
 
     #[async_trait::async_trait]

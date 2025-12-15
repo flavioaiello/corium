@@ -444,10 +444,19 @@ impl Node {
     }
     
     pub async fn shutdown(&self) {
+        // Abort the server first to stop accepting new connections
+        self.server_handle.abort();
+        
+        // Shutdown actors in reverse dependency order
         self.hyparview.quit().await;
         self.plumtree.quit().await;
         self.dhtnode.quit().await;
-        self.server_handle.abort();
+        self.rpcnode.quit().await;
+        
+        // Shutdown the relay actor if present
+        if let Some(relay) = self.smartsock.relay() {
+            relay.quit().await;
+        }
     }
     
     
