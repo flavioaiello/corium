@@ -137,8 +137,8 @@ impl Keypair {
             addrs,
             relays,
             is_relay,
-            timestamp: Some(timestamp),
-            signature: Some(signature.to_bytes().to_vec()),
+            timestamp,
+            signature: signature.to_bytes().to_vec(),
         }
     }
 }
@@ -257,22 +257,23 @@ pub struct Contact {
     /// Whether this node can serve as a relay for other nodes.
     /// Nodes that are publicly reachable (passed self-probe) set this to true.
     pub is_relay: bool,
-    /// Timestamp when record was created (only for signed records).
-    pub timestamp: Option<u64>,
-    /// Ed25519 signature (only for signed records published to DHT).
-    pub signature: Option<Vec<u8>>,
+    /// Timestamp when record was created (0 = unsigned/ephemeral).
+    pub timestamp: u64,
+    /// Ed25519 signature (empty = unsigned/ephemeral).
+    pub signature: Vec<u8>,
 }
 
 impl Contact {
     /// Create an unsigned endpoint record (lightweight peer reference).
+    /// Unsigned records have timestamp=0 and empty signature.
     pub fn unsigned(identity: Identity, addrs: Vec<String>) -> Self {
         Self {
             identity,
             addrs,
             relays: vec![],
             is_relay: false,
-            timestamp: None,
-            signature: None,
+            timestamp: 0,
+            signature: vec![],
         }
     }
 
@@ -282,8 +283,9 @@ impl Contact {
     }
 
     /// Check if this record is signed.
+    /// Returns true if signature is non-empty and timestamp is non-zero.
     pub fn is_signed(&self) -> bool {
-        self.signature.is_some() && self.timestamp.is_some()
+        !self.signature.is_empty() && self.timestamp != 0
     }
 
     /// Get the primary address (first in the list).
@@ -306,10 +308,10 @@ impl Contact {
     /// SECURITY: Signature verification ensures addresses are bound to the identity.
     /// An attacker cannot forge a Contact pointing to their own address.
     pub fn verify(&self) -> bool {
-        // Unsigned records cannot be verified
-        let (Some(timestamp), Some(sig)) = (self.timestamp, self.signature.as_ref()) else {
+        // Unsigned records (empty signature or zero timestamp) cannot be verified
+        if self.signature.is_empty() || self.timestamp == 0 {
             return false;
-        };
+        }
 
         // Reconstruct the signed data exactly as it was created
         let mut data = Vec::new();
@@ -326,12 +328,12 @@ impl Contact {
         }
         // Include is_relay in signature verification
         data.push(if self.is_relay { 1 } else { 0 });
-        data.extend_from_slice(&timestamp.to_le_bytes());
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
         
         let Ok(verifying_key) = VerifyingKey::try_from(self.identity.as_bytes().as_slice()) else {
             return false;
         };
-        let Ok(sig_bytes): Result<[u8; 64], _> = sig.clone().try_into() else {
+        let Ok(sig_bytes): Result<[u8; 64], _> = self.signature.clone().try_into() else {
             return false;
         };
         let signature = Signature::from_bytes(&sig_bytes);
@@ -353,8 +355,7 @@ impl Contact {
             return false;
         }
         
-        // Already verified that timestamp exists in verify()
-        let timestamp = self.timestamp.unwrap();
+        // timestamp is already validated as non-zero by verify()
         let current_time = now_ms();
         
         let max_age_ms = max_age_secs * 1000;
@@ -362,12 +363,12 @@ impl Contact {
         // SECURITY: Allow small clock skew (10s) for future timestamps,
         // but reject anything too far in the future to prevent pre-dated attacks.
         const FUTURE_TOLERANCE_MS: u64 = 10_000;
-        if timestamp > current_time + FUTURE_TOLERANCE_MS {
+        if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
         }
         
         // Reject stale records to prevent replay of old addresses
-        if current_time.saturating_sub(timestamp) > max_age_ms {
+        if current_time.saturating_sub(self.timestamp) > max_age_ms {
             return false;
         }
         
@@ -392,7 +393,7 @@ impl Contact {
     /// - Relay count ≤ MAX_RELAYS (8)  
     /// - Each address ≤ MAX_ADDR_LEN (256) and non-empty
     /// - Each relay identity is a valid Ed25519 point
-    /// - Signature length is exactly 64 bytes if present
+    /// - Signature length is exactly 64 bytes if non-empty (signed)
     pub fn validate_structure(&self) -> bool {
         // SECURITY: These limits prevent memory exhaustion attacks when
         // deserializing untrusted Contact records from the network.
@@ -420,11 +421,9 @@ impl Contact {
             }
         }
         
-        // If signed, signature must be exactly 64 bytes
-        if let Some(ref sig) = self.signature {
-            if sig.len() != 64 {
-                return false;
-            }
+        // If signed (non-empty signature), must be exactly 64 bytes
+        if !self.signature.is_empty() && self.signature.len() != 64 {
+            return false;
         }
         
         true
@@ -496,10 +495,10 @@ mod tests {
         let kp = Keypair::generate();
         let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.timestamp = Some(std::time::SystemTime::now()
+        record.timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64 - (2 * 60 * 60 * 1000));
+            .as_millis() as u64 - (2 * 60 * 60 * 1000);
         
         assert!(!record.verify_fresh(3600));    }
 
@@ -508,10 +507,10 @@ mod tests {
         let kp = Keypair::generate();
         let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.timestamp = Some(std::time::SystemTime::now()
+        record.timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64 + (5 * 60 * 1000));
+            .as_millis() as u64 + (5 * 60 * 1000);
         
         assert!(!record.verify_fresh(3600));
     }
@@ -555,7 +554,7 @@ mod tests {
         let kp = Keypair::generate();
         let mut record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        record.signature = Some(vec![0u8; 32]);        
+        record.signature = vec![0u8; 32];        
         assert!(!record.validate_structure());
     }
 
@@ -669,15 +668,11 @@ mod tests {
         assert!(!tampered.verify(), "P5 violation: address tampering not detected");
         
         let mut tampered = record.clone();
-        if let Some(ref mut ts) = tampered.timestamp {
-            *ts += 1;
-        }
+        tampered.timestamp += 1;
         assert!(!tampered.verify(), "P5 violation: timestamp tampering not detected");
         
         let mut tampered = record.clone();
-        if let Some(ref mut sig) = tampered.signature {
-            sig[0] ^= 1;
-        }
+        tampered.signature[0] ^= 1;
         assert!(!tampered.verify(), "P5 violation: signature tampering not detected");
     }
 
@@ -845,8 +840,8 @@ mod tests {
             addrs,
             relays: vec![],
             is_relay: false,
-            timestamp: Some(old_timestamp),
-            signature: Some(signature.to_bytes().to_vec()),
+            timestamp: old_timestamp,
+            signature: signature.to_bytes().to_vec(),
         };
 
         assert!(old_record.verify());        assert!(!old_record.verify_fresh(3600));    }
@@ -884,8 +879,8 @@ mod tests {
             addrs,
             relays: vec![],
             is_relay: false,
-            timestamp: Some(future_timestamp),
-            signature: Some(signature.to_bytes().to_vec()),
+            timestamp: future_timestamp,
+            signature: signature.to_bytes().to_vec(),
         };
 
         assert!(!future_record.verify_fresh(3600));    }
@@ -911,7 +906,7 @@ mod tests {
         let keypair = Keypair::generate();
         let mut record = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
 
-        record.signature = record.signature.map(|s| s[..32].to_vec());
+        record.signature = record.signature[..32].to_vec();
 
         assert!(!record.validate_structure());
         assert!(!record.verify());

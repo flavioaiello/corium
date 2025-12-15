@@ -112,6 +112,10 @@ const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
 /// SECURITY: Bounded LruCache prevents connection table DoS.
 const MAX_CACHED_CONNECTIONS: usize = 1_000;
 
+/// Maximum concurrent in-flight connection attempts.
+/// SECURITY: Prevents memory exhaustion from parallel connection floods.
+const MAX_IN_FLIGHT_CONNECTIONS: usize = 100;
+
 /// Timeout after which idle connections are considered stale.
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -298,6 +302,11 @@ impl RpcNodeActor {
             if self.in_flight.contains(&peer_id) {
                 anyhow::bail!("timed out waiting for concurrent connection to peer");
             }
+        }
+
+        // SECURITY: Bound in-flight set to prevent memory exhaustion from connection floods
+        if self.in_flight.len() >= MAX_IN_FLIGHT_CONNECTIONS {
+            anyhow::bail!("too many concurrent connection attempts (max {})", MAX_IN_FLIGHT_CONNECTIONS);
         }
 
         // Mark in-flight

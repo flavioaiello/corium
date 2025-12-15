@@ -1140,7 +1140,19 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
 
-        let state = self.topics.entry(topic.to_string()).or_default();
+        // SECURITY: Only modify existing TopicState for subscribed topics.
+        // TopicState is created by handle_subscribe_cmd when we subscribe.
+        // This prevents attackers from creating orphan topic entries via Graft.
+        let Some(state) = self.topics.get_mut(topic) else {
+            // This should not happen: we're subscribed but no TopicState exists.
+            // Log and reject rather than creating state from untrusted input.
+            warn!(
+                peer = %hex::encode(&from.as_bytes()[..8]),
+                topic = %topic,
+                "graft received for subscribed topic without TopicState, rejecting"
+            );
+            return;
+        };
         state.promote_to_eager_with_limit(*from, self.config.eager_peers);
         
         debug!(

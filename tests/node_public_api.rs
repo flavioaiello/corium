@@ -385,3 +385,145 @@ async fn connect_not_in_dht() {
         Ok(Ok(_)) => panic!("should not connect to non-existent peer"),
     }
 }
+
+// ============================================================================
+// Contact Signature Lifecycle Tests
+// ============================================================================
+
+/// Tests that signed contacts published to DHT can be resolved by another node
+/// with valid signatures verified during resolution.
+#[tokio::test]
+async fn signed_contact_publish_and_resolve() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    // Bootstrap node2 from node1
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes its signed contact (create_contact internally signs with keypair)
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    
+    // Give time for DHT propagation
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Node2 resolves node1's contact - this verifies signature internally
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+        .expect("resolve timeout")
+        .expect("resolve failed");
+    
+    assert!(resolved.is_some(), "should resolve the contact");
+    let contact = resolved.unwrap();
+    
+    // Verify the resolved contact has correct identity
+    assert_eq!(hex::encode(contact.identity), node1_id);
+    
+    // Verify the contact is signed (non-empty signature and non-zero timestamp)
+    assert!(!contact.signature.is_empty(), "contact should have signature");
+    assert!(contact.timestamp > 0, "contact should have valid timestamp");
+    
+    // Verify addresses match what was published
+    assert!(contact.addrs.contains(&node1_addr), "should contain published address");
+}
+
+/// Tests that connections using DHT-resolved signed contacts work correctly.
+#[tokio::test]
+async fn signed_contact_enables_connection() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    // Bootstrap and publish
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    
+    // Connect via identity (internally resolves signed contact from DHT)
+    let conn = timeout(TEST_TIMEOUT, node2.connect(&node1_id)).await
+        .expect("connect timeout")
+        .expect("connect failed");
+    
+    // Connection should be established and open
+    assert!(conn.close_reason().is_none(), "connection should be open");
+    
+    // Verify the connection is to the correct peer (mTLS validates identity)
+    // If signature was invalid, resolution would fail before connection attempt
+}
+
+/// Tests that signed contacts with relays work across nodes.
+#[tokio::test]
+async fn signed_contact_with_relays_resolves() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    let relay_node = Node::bind(&test_addr()).await.expect("relay bind failed");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    let relay_id = relay_node.peer_identity();
+    
+    // Bootstrap node2 from node1
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes with relay info (signature covers relays field)
+    node1.publish_address_with_relays(
+        vec![node1_addr.clone()],
+        vec![relay_id],
+    ).await.expect("publish failed");
+    
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Node2 resolves - signature verification includes relay field
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+        .expect("resolve timeout")
+        .expect("resolve failed");
+    
+    assert!(resolved.is_some(), "should resolve contact");
+    let contact = resolved.unwrap();
+    
+    // Verify relays are included and signature is valid
+    assert!(!contact.signature.is_empty(), "should have signature");
+    assert_eq!(contact.relays.len(), 1, "should have one relay");
+    assert_eq!(contact.relays[0], relay_id, "relay identity should match");
+}
+
+/// Tests that three nodes can form a network with signed contacts.
+#[tokio::test]
+async fn three_node_signed_contact_network() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    let node3 = Node::bind(&test_addr()).await.expect("node3 bind failed");
+    
+    let node1_id = node1.identity();
+    let node2_id = node2.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    let node2_addr = node2.local_addr().unwrap().to_string();
+    
+    // Build network: node2 → node1, node3 → node2
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap 2→1 failed");
+    node3.bootstrap(&node2_id, &node2_addr).await.expect("bootstrap 3→2 failed");
+    
+    // All nodes publish signed contacts
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("node1 publish failed");
+    node2.publish_address(vec![node2_addr.clone()]).await.expect("node2 publish failed");
+    
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    // Node3 should be able to resolve node1 through the DHT
+    let resolved = timeout(TEST_TIMEOUT, node3.resolve_peer(&node1.peer_identity())).await
+        .expect("resolve timeout")
+        .expect("resolve failed");
+    
+    assert!(resolved.is_some(), "node3 should resolve node1's signed contact");
+    let contact = resolved.unwrap();
+    assert!(!contact.signature.is_empty(), "resolved contact should be signed");
+    
+    // Node3 should be able to connect to node1 using the resolved signed contact
+    let conn = timeout(TEST_TIMEOUT, node3.connect(&node1_id)).await
+        .expect("connect timeout")
+        .expect("connect failed");
+    
+    assert!(conn.close_reason().is_none(), "connection should be established");
+}

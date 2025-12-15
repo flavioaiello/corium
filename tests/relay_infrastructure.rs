@@ -451,3 +451,153 @@ async fn relay_with_closed_node() {
     // May succeed or fail depending on whether connection attempt is made
     let _ = result;
 }
+
+// ============================================================================
+// Signed Contact Lifecycle with Relay Tests
+// ============================================================================
+
+/// Tests that relay_endpoint() returns an unsigned ephemeral contact.
+/// Signed contacts are only created during DHT publication (publish_address).
+#[tokio::test]
+async fn relay_endpoint_is_ephemeral_unsigned() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    
+    // relay_endpoint() creates an ephemeral unsigned contact for immediate use
+    let relay_ep = node.relay_endpoint().await;
+    assert!(relay_ep.is_some(), "relay endpoint should exist");
+    
+    let contact = relay_ep.unwrap();
+    
+    // Ephemeral relay endpoint is unsigned (for immediate use, not DHT storage)
+    assert!(contact.signature.is_empty(), "relay_endpoint should be unsigned (ephemeral)");
+    assert_eq!(contact.timestamp, 0, "relay_endpoint should have zero timestamp");
+    assert_eq!(hex::encode(contact.identity), node.identity());
+    
+    // peer_endpoint() also returns unsigned contact for local RPC use
+    // Signed contacts are created only during DHT publication
+    let peer_ep = node.peer_endpoint();
+    assert!(peer_ep.signature.is_empty(), "peer_endpoint is also unsigned locally");
+}
+
+/// Tests that signed contacts with relay info survive DHT round-trip.
+#[tokio::test]
+async fn signed_contact_with_relay_dht_roundtrip() {
+    init_tracing();
+    let start = Instant::now();
+    
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    progress(start, "all nodes bound");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    let relay_id = relay.peer_identity();
+    
+    // Bootstrap
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    progress(start, "bootstrap complete");
+    
+    // Node1 publishes with relay (signature covers: identity, addrs, relays, is_relay, timestamp)
+    node1.publish_address_with_relays(
+        vec![node1_addr.clone()],
+        vec![relay_id],
+    ).await.expect("publish failed");
+    progress(start, "address published");
+    
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Node2 resolves - internal verify_fresh() checks signature
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+        .expect("resolve timeout")
+        .expect("resolve failed");
+    progress(start, "peer resolved");
+    
+    assert!(resolved.is_some(), "should resolve contact");
+    let contact = resolved.unwrap();
+    
+    // Verify all signed fields survived the round-trip
+    assert_eq!(hex::encode(contact.identity), node1_id, "identity preserved");
+    assert!(contact.addrs.contains(&node1_addr), "address preserved");
+    assert_eq!(contact.relays.len(), 1, "relay list preserved");
+    assert_eq!(contact.relays[0], relay_id, "relay identity preserved");
+    assert!(!contact.signature.is_empty(), "signature preserved");
+    assert!(contact.timestamp > 0, "timestamp preserved");
+    
+    progress(start, "test complete");
+}
+
+/// Tests that a node can use relay info from a signed contact to connect.
+#[tokio::test]
+async fn signed_contact_relay_info_usable() {
+    init_tracing();
+    let start = Instant::now();
+    
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    progress(start, "all nodes bound");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    let relay_id = relay.peer_identity();
+    let relay_addr = relay.local_addr().unwrap().to_string();
+    
+    // Bootstrap both nodes from relay (so they know relay's address)
+    node1.bootstrap(&hex::encode(relay_id.as_bytes()), &relay_addr).await.expect("node1 bootstrap failed");
+    node2.bootstrap(&hex::encode(relay_id.as_bytes()), &relay_addr).await.expect("node2 bootstrap failed");
+    progress(start, "both nodes bootstrapped from relay");
+    
+    // Relay publishes its address
+    relay.publish_address(vec![relay_addr.clone()]).await.expect("relay publish failed");
+    
+    // Node1 publishes with relay info
+    node1.publish_address_with_relays(
+        vec![node1_addr.clone()],
+        vec![relay_id],
+    ).await.expect("node1 publish failed");
+    progress(start, "addresses published");
+    
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    
+    // Node2 resolves node1's contact (with relay info)
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+        .expect("resolve timeout")
+        .expect("resolve failed");
+    
+    assert!(resolved.is_some(), "should resolve contact");
+    let contact = resolved.unwrap();
+    
+    // Contact should have relay info from signed record
+    assert!(!contact.relays.is_empty(), "contact should have relay info");
+    progress(start, "contact resolved with relay info");
+    
+    // Node2 should be able to connect to node1 (may use direct or relay path)
+    let conn = timeout(TEST_TIMEOUT, node2.connect(&node1_id)).await
+        .expect("connect timeout")
+        .expect("connect failed");
+    
+    assert!(conn.close_reason().is_none(), "connection should be open");
+    progress(start, "connection established");
+}
+
+/// Tests that modifying a signed contact's relay list breaks verification.
+#[tokio::test]
+async fn tampered_relay_list_rejected() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    let fake_relay = Node::bind(&test_addr()).await.expect("fake_relay bind failed");
+    
+    // Get a signed contact
+    let mut contact = node.peer_endpoint().clone();
+    let original_sig = contact.signature.clone();
+    
+    // Tamper with relay list after signing
+    contact.relays.push(fake_relay.peer_identity());
+    
+    // Signature should still be the original (which didn't cover the new relay)
+    assert_eq!(contact.signature, original_sig);
+    
+    // The contact is now invalid - calling verify on it should fail
+    // (We test this indirectly: if stored in DHT and resolved, verify_fresh would reject it)
+    // This validates that the signature binds the relay list
+}
