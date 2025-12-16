@@ -1,6 +1,6 @@
 [package]
 name = "corium"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "Batteries-included adaptive mesh networking"
 license = "MIT"

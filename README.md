@@ -63,16 +63,25 @@ while let Some(msg) = rx.recv().await {
 }
 ```
 
-### Direct Messaging
+### Request-Response (like libp2p)
 
 ```rust
-// Send direct message to a peer (resolved via DHT)
-node.send_direct("peer_identity_hex", b"Hello!".to_vec()).await?;
+// Set up a request handler (echo server)
+node.set_request_handler(|from, request| {
+    println!("Request from {}: {:?}", &from[..16], request);
+    request  // Echo back the request as response
+}).await?;
 
-// Receive direct messages
-let mut dm_rx = node.direct_messages().await?;
-while let Some((from, data)) = dm_rx.recv().await {
-    println!("DM from {}: {:?}", &from[..16], data);
+// Send a request and get a response
+let response = node.send_request("peer_identity_hex", b"Hello!".to_vec()).await?;
+println!("Response: {:?}", response);
+
+// Or use the low-level API for async handling
+let mut requests = node.incoming_requests().await?;
+while let Some((from, request, response_tx)) = requests.recv().await {
+    // Process request asynchronously
+    let response = process_request(request);
+    response_tx.send(response).ok();
 }
 ```
 
@@ -156,7 +165,7 @@ while let Some(incoming) = rx.recv().await {
 | `relay` | UDP relay server and client with mesh-mediated signaling for NAT traversal |
 | `crypto` | Ed25519 certificates, identity verification, custom TLS |
 | `identity` | Keypairs, endpoint records, and signed address publication |
-| `protocols` | Protocol trait definitions (DhtNodeRpc, GossipSubRpc, RelayRpc, DirectRpc) |
+| `protocols` | Protocol trait definitions (DhtNodeRpc, GossipSubRpc, RelayRpc, PlainRpc) |
 | `messages` | Protocol message types and bounded serialization |
 
 ## Core Concepts

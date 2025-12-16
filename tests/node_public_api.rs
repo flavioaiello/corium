@@ -508,3 +508,95 @@ async fn three_node_signed_contact_network() {
     
     assert!(conn.close_reason().is_none(), "connection should be established");
 }
+
+// =============================================================================
+// Request-Response Tests
+// =============================================================================
+
+#[tokio::test]
+async fn request_response_echo() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    // Bootstrap node2 from node1
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 sets up an echo handler
+    node1.set_request_handler(|_from, request| {
+        // Echo the request back with a prefix
+        let mut response = b"echo: ".to_vec();
+        response.extend(request);
+        response
+    }).await.expect("set_request_handler failed");
+    
+    // Node2 sends a request and receives a response
+    let response = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"hello".to_vec()))
+        .await
+        .expect("request timeout")
+        .expect("request failed");
+    
+    assert_eq!(response, b"echo: hello".to_vec());
+}
+
+#[tokio::test]
+async fn request_response_with_incoming_requests() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 uses low-level incoming_requests API
+    let mut requests = node1.incoming_requests().await.expect("incoming_requests failed");
+    
+    // Spawn handler task
+    tokio::spawn(async move {
+        while let Some((from, request, response_tx)) = requests.recv().await {
+            let response = format!("got {} bytes from {}", request.len(), &from[..8]);
+            response_tx.send(response.into_bytes()).ok();
+        }
+    });
+    
+    // Node2 sends a request
+    let response = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"test data".to_vec()))
+        .await
+        .expect("request timeout")
+        .expect("request failed");
+    
+    let response_str = String::from_utf8(response).unwrap();
+    assert!(response_str.starts_with("got 9 bytes from"));
+}
+
+#[tokio::test]
+async fn request_response_bidirectional() {
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    
+    let node1_id = node1.identity();
+    let node2_id = node2.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Both nodes set up handlers
+    node1.set_request_handler(|_from, _req| b"from node1".to_vec()).await.unwrap();
+    node2.set_request_handler(|_from, _req| b"from node2".to_vec()).await.unwrap();
+    
+    // Wait for mesh formation
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Node2 → Node1
+    let resp1 = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"ping".to_vec()))
+        .await.expect("timeout").expect("failed");
+    assert_eq!(resp1, b"from node1".to_vec());
+    
+    // Node1 → Node2
+    let resp2 = timeout(TEST_TIMEOUT, node1.send_request(&node2_id, b"ping".to_vec()))
+        .await.expect("timeout").expect("failed");
+    assert_eq!(resp2, b"from node2".to_vec());
+}

@@ -47,7 +47,7 @@ use crate::dht::Key;
 use crate::identity::{Contact, Keypair};
 use crate::messages::{Message, RelayResponse};
 use crate::gossipsub::{GossipSub, GossipSubConfig, ReceivedMessage, RelaySignal};
-use crate::protocols::{DirectRpc, RelayRpc};
+use crate::protocols::{PlainRpc, RelayRpc};
 use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection, generate_session_id, MeshSignalOut};
 use crate::transport::{SmartSock, DIRECT_CONNECT_TIMEOUT};
 use crate::rpc::{self, RpcNode};
@@ -59,6 +59,13 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 /// A receiver that can be taken exactly once via `.take()`.
 /// Used for message receivers that should only have one consumer.
 type TakeOnce<T> = tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<T>>>;
+
+/// Request tuple type for request-response pattern.
+type RequestTuple = (
+    Identity,
+    Vec<u8>,
+    tokio::sync::oneshot::Sender<Vec<u8>>,
+);
 
 // Re-export Identity for public API consumers
 pub use crate::identity::Identity;
@@ -73,7 +80,7 @@ pub struct Node {
     gossipsub: GossipSub<RpcNode>,
     relay_client: Arc<RelayClient>,
     gossipsub_receiver: TakeOnce<ReceivedMessage>,
-    direct_receiver: TakeOnce<(Identity, Vec<u8>)>,
+    request_handler_rx: TakeOnce<RequestTuple>,
     listener: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -193,17 +200,22 @@ impl Node {
             let smartsock = smartsock.clone();
             let gossipsub = gossipsub.clone();
             
-            let (direct_tx, direct_rx) = tokio::sync::mpsc::channel::<(Identity, Vec<u8>)>(256);
-            let direct_receiver = tokio::sync::Mutex::new(Some(direct_rx));
+            // Channel for request-response pattern
+            let (request_tx, request_rx) = tokio::sync::mpsc::channel::<(
+                Identity,
+                Vec<u8>,
+                tokio::sync::oneshot::Sender<Vec<u8>>,
+            )>(256);
+            let request_handler_rx = tokio::sync::Mutex::new(Some(request_rx));
             
             let listen = tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
                     let node = dhtnode.clone();
                     let gossipsub = Some(gossipsub.clone());
                     let ss = Some(smartsock.clone());
-                    let direct_tx = Some(direct_tx.clone());
+                    let request_tx = Some(request_tx.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = rpc::handle_connection(node, gossipsub, ss, incoming, direct_tx).await {
+                        if let Err(e) = rpc::handle_connection(node, gossipsub, ss, incoming, request_tx).await {
                             warn!("connection error: {:?}", e);
                         }
                     });
@@ -211,7 +223,7 @@ impl Node {
                 Ok(())
             });
             
-            (listen, direct_receiver)
+            (listen, request_handler_rx)
         };
         
         info!("Node {}/{}", local_addr, hex::encode(identity));
@@ -226,7 +238,7 @@ impl Node {
             gossipsub,
             relay_client,
             gossipsub_receiver,
-            direct_receiver: listener.1,
+            request_handler_rx: listener.1,
             listener: listener.0,
         })
     }
@@ -685,26 +697,74 @@ impl Node {
         anyhow::bail!("connection failed: direct, designated relays, and mesh relays all exhausted");
     }
     
-    pub async fn send_direct(&self, identity: &str, data: Vec<u8>) -> Result<()> {
+    /// Send a request to a peer and receive a response.
+    /// 
+    /// # Arguments
+    /// * `identity` - The peer's identity as a 64-character hex string
+    /// * `request` - The request data to send
+    /// 
+    /// # Returns
+    /// The response data from the peer
+    pub async fn send_request(&self, identity: &str, request: Vec<u8>) -> Result<Vec<u8>> {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
         let contact = self.resolve(&peer_identity).await?
             .context("peer not found")?;
         
-        self.rpcnode.send_direct(&contact, data).await
+        self.rpcnode.send_request(&contact, request).await
     }
     
-    pub async fn direct_messages(&self) -> Result<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
-        let mut guard = self.direct_receiver.lock().await;
-        let internal_rx = guard.take().context("direct message receiver already taken")?;
+    /// Set a request handler to process incoming requests.
+    /// 
+    /// The handler receives requests and must provide responses. Each request
+    /// expects a response.
+    /// 
+    /// # Arguments
+    /// * `handler` - A function that takes (sender_identity_hex, request_data) and returns response_data
+    /// 
+    /// # Example
+    /// ```ignore
+    /// node.set_request_handler(|from, request| {
+    ///     // Echo the request back
+    ///     request
+    /// }).await?;
+    /// ```
+    pub async fn set_request_handler<F>(&self, handler: F) -> Result<()>
+    where
+        F: Fn(String, Vec<u8>) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let mut guard = self.request_handler_rx.lock().await;
+        let mut internal_rx = guard.take().context("request handler already set")?;
+        
+        tokio::spawn(async move {
+            while let Some((from, request_data, response_tx)) = internal_rx.recv().await {
+                let from_hex = hex::encode(from.as_bytes());
+                let response = handler(from_hex, request_data);
+                // Send response back (ignore error if caller dropped)
+                let _ = response_tx.send(response);
+            }
+        });
+        
+        Ok(())
+    }
+    
+    /// Get a receiver for incoming requests that allows async response handling.
+    /// 
+    /// Each received item is (sender_identity_hex, request_data, response_sender).
+    /// You MUST send a response via the response_sender or the request will timeout.
+    /// 
+    /// This is the low-level API. For simpler cases, use `set_request_handler`.
+    pub async fn incoming_requests(&self) -> Result<tokio::sync::mpsc::Receiver<(String, Vec<u8>, tokio::sync::oneshot::Sender<Vec<u8>>)>> {
+        let mut guard = self.request_handler_rx.lock().await;
+        let internal_rx = guard.take().context("request handler already taken")?;
         
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(async move {
             let mut internal_rx = internal_rx;
-            while let Some((from, data)) = internal_rx.recv().await {
+            while let Some((from, request_data, response_tx)) = internal_rx.recv().await {
                 let from_hex = hex::encode(from.as_bytes());
-                if tx.send((from_hex, data)).await.is_err() {
+                if tx.send((from_hex, request_data, response_tx)).await.is_err() {
                     break;
                 }
             }

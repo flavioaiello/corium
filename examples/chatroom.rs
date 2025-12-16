@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     println!("\nSubscribed to room: {}", args.room);
 
     let mut pubsub_rx = node.messages().await?;
-    let mut dm_rx = node.direct_messages().await?;
+    let mut dm_rx = node.incoming_requests().await?;
 
     let room_filter = args.room.clone();
     let my_name = args.name.clone();
@@ -123,9 +123,11 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(async move {
-        while let Some((from, data)) = dm_rx.recv().await {
+        while let Some((from, data, response_tx)) = dm_rx.recv().await {
             let text = String::from_utf8_lossy(&data);
             println!("\x1b[35m[dm ← {}...]\x1b[0m {}", &from[..8], text);
+            // Send acknowledgment response
+            let _ = response_tx.send(b"received".to_vec());
         }
     });
 
@@ -182,9 +184,10 @@ async fn main() -> Result<()> {
 
             let dm_payload = format!("{}@{}: {}", args.name, my_id_prefix, message);
             
-            match node.send_direct(peer_identity, dm_payload.into_bytes()).await {
-                Ok(()) => {
-                    println!("\x1b[33m[dm → {}...]\x1b[0m {}", &peer_identity[..8], message);
+            match node.send_request(peer_identity, dm_payload.into_bytes()).await {
+                Ok(response) => {
+                    let response_text = String::from_utf8_lossy(&response);
+                    println!("\x1b[33m[dm → {}...]\x1b[0m {} (ack: {})", &peer_identity[..8], message, response_text);
                 }
                 Err(e) => {
                     eprintln!("\x1b[31m[dm error]\x1b[0m Failed to send: {}", e);

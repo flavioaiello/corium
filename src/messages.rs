@@ -10,7 +10,7 @@
 //! | DHT | `DhtNodeRequest` | `DhtNodeResponse` |
 //! | PubSub | `GossipSubRequest` | `GossipSubAck` |
 //! | Relay | `RelayRequest` | `RelayResponse` |
-//! | Direct | `Vec<u8>` | (application-defined) |
+//! | Plain | `Vec<u8>` | (application-defined) |
 //!
 //! ## Security Limits
 //!
@@ -31,8 +31,13 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::dht::Key;
 use crate::identity::{Contact, Identity};
 
-/// Channel sender for direct (non-PubSub) messages between peers.
-pub type DirectMessageSender = tokio::sync::mpsc::Sender<(Identity, Vec<u8>)>;
+/// Channel sender for plain requests that expect a response.
+/// Sends (sender_identity, request_data, response_channel).
+pub type PlainRequest = tokio::sync::mpsc::Sender<(
+    Identity,
+    Vec<u8>,
+    tokio::sync::oneshot::Sender<Vec<u8>>,
+)>;
 
 /// Maximum size of a stored value in the DHT (1 MiB).
 /// Larger values should be chunked or stored externally.
@@ -283,19 +288,19 @@ pub enum RpcRequest {
     DhtNode(DhtNodeRequest),
     Relay(RelayRequest),
     GossipSub(GossipSubRequest),
-    Direct(Vec<u8>),
+    Plain(Vec<u8>),
 }
 
 impl RpcRequest {
     /// Returns the claimed sender identity for request types that include one.
-    /// GossipSub and Direct requests rely on TLS-verified identity.
+    /// GossipSub and Plain requests rely on TLS-verified identity.
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
             RpcRequest::DhtNode(dht_msg) => dht_msg.sender_identity(),
             RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
             // These request types rely on TLS-verified identity
             RpcRequest::GossipSub(_) => None,
-            RpcRequest::Direct(_) => None,
+            RpcRequest::Plain(_) => None,
         }
     }
 }
@@ -308,7 +313,8 @@ pub enum RpcResponse {
 
     GossipSubAck,
 
-    DirectAck,
+    /// Response to a plain request.
+    Plain(Vec<u8>),
 
     Error { message: String },
 }

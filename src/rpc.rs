@@ -16,7 +16,7 @@
 //! - [`DhtNodeRpc`]: DHT operations (ping, find_node, find_value, store)
 //! - [`GossipSubRpc`]: PubSub message forwarding
 //! - [`RelayRpc`]: NAT traversal relay operations
-//! - [`DirectRpc`]: Point-to-point direct messaging
+//! - [`PlainRpc`]: Point-to-point messaging
 //!
 //! ## Connection Management
 //!
@@ -45,7 +45,7 @@ use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use crate::messages::{self as messages, DirectMessageSender, DhtNodeRequest, DhtNodeResponse, GossipSubRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
+use crate::messages::{self as messages, PlainRequest, DhtNodeRequest, DhtNodeResponse, GossipSubRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
 use crate::relay::{Relay, handle_relay_request};
@@ -53,7 +53,7 @@ use crate::dht::DhtNode;
 use crate::dht::Key;
 use crate::identity::{Contact, Identity};
 use crate::gossipsub::GossipSub;
-use crate::protocols::{DhtNodeRpc, GossipSubRpc, RelayRpc, DirectRpc};
+use crate::protocols::{DhtNodeRpc, GossipSubRpc, RelayRpc, PlainRpc};
 
 
 // ============================================================================
@@ -716,13 +716,13 @@ impl GossipSubRpc for RpcNode {
 
 
 #[async_trait]
-impl DirectRpc for RpcNode {
-    async fn send_direct(&self, to: &Contact, data: Vec<u8>) -> Result<()> {
-        let request = RpcRequest::Direct(data);
-        match self.rpc_raw(to, request).await? {
-            RpcResponse::DirectAck => Ok(()),
-            RpcResponse::Error { message } => anyhow::bail!("Direct message rejected: {}", message),
-            other => anyhow::bail!("unexpected response to Direct: {:?}", other),
+impl PlainRpc for RpcNode {
+    async fn send_request(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>> {
+        let rpc_request = RpcRequest::Plain(request);
+        match self.rpc_raw(to, rpc_request).await? {
+            RpcResponse::Plain(response) => Ok(response),
+            RpcResponse::Error { message } => anyhow::bail!("Plain request rejected: {}", message),
+            other => anyhow::bail!("unexpected response to Plain: {:?}", other),
         }
     }
 }
@@ -821,7 +821,7 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
     gossipsub: Option<GossipSub<N>>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
-    direct_tx: Option<DirectMessageSender>,
+    direct_tx: Option<PlainRequest>,
 ) -> Result<()> {
     // Extract relay from smartsock
     let udprelay = smartsock.as_ref().and_then(|ss| ss.relay());
@@ -931,7 +931,7 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
     from_contact: Contact,
-    direct_tx: Option<DirectMessageSender>,
+    direct_tx: Option<PlainRequest>,
 ) -> Result<()> {
     let verified_identity = from_contact.identity;
     let mut len_buf = [0u8; 4];
@@ -1029,7 +1029,7 @@ async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static
     gossipsub: Option<GossipSub<N>>,
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
-    direct_tx: Option<DirectMessageSender>,
+    direct_tx: Option<PlainRequest>,
 ) -> RpcResponse {
     match request {
         RpcRequest::DhtNode(dht_request) => {
@@ -1048,11 +1048,32 @@ async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static
         RpcRequest::GossipSub(message) => {
             handle_gossipsub_rpc(&from_contact, message, gossipsub).await
         }
-        RpcRequest::Direct(data) => {
+        RpcRequest::Plain(request_data) => {
             if let Some(tx) = direct_tx {
-                let _ = tx.send((from_contact.identity, data)).await;
+                // Create a oneshot channel for the response
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                
+                // Send request to handler and wait for response
+                if tx.send((from_contact.identity, request_data, response_tx)).await.is_ok() {
+                    // Wait for the handler to provide a response (with timeout)
+                    match tokio::time::timeout(REQUEST_PROCESS_TIMEOUT, response_rx).await {
+                        Ok(Ok(response_data)) => RpcResponse::Plain(response_data),
+                        Ok(Err(_)) => RpcResponse::Error { 
+                            message: "request handler dropped without responding".to_string() 
+                        },
+                        Err(_) => RpcResponse::Error { 
+                            message: "request handler timed out".to_string() 
+                        },
+                    }
+                } else {
+                    RpcResponse::Error { 
+                        message: "request handler channel closed".to_string() 
+                    }
+                }
+            } else {
+                // No handler registered - return empty response
+                RpcResponse::Plain(Vec::new())
             }
-            RpcResponse::DirectAck
         }
     }
 }

@@ -11,7 +11,7 @@
 //! | DHT | [`DhtNodeRpc`] | Distributed hash table operations |
 //! | PubSub | [`GossipSubRpc`] | Epidemic broadcast message forwarding |
 //! | Relay | [`RelayRpc`] | NAT traversal via relay servers |
-//! | Direct | [`DirectRpc`] | Point-to-point messaging |
+//! | Plain | [`PlainRpc`] | Point-to-point messaging |
 //!
 //! ## Design
 //!
@@ -82,9 +82,11 @@ pub trait RelayRpc: Send + Sync {
 }
 
 
-/// Direct point-to-point messaging.
+/// Plain point-to-point request-response messaging.
 #[async_trait]
-pub trait DirectRpc: Send + Sync {
-    /// Send raw bytes directly to a peer.
-    async fn send_direct(&self, to: &Contact, data: Vec<u8>) -> Result<()>;
+pub trait PlainRpc: Send + Sync {
+    /// Send a request directly to a peer and receive a response.
+    /// 
+    /// The caller sends a request and blocks until a response is received.
+    async fn send_request(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>>;
 }
