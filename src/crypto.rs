@@ -24,10 +24,121 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ed25519_dalek::{Signature, VerifyingKey};
 use quinn::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::identity::{Identity, Keypair};
+
+// ============================================================================
+// Signature Error Types
+// ============================================================================
+
+/// Error type for signature verification failures.
+/// Used across all Corium signature verification (GossipSub, Contact, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureError {
+    /// Signature is missing (empty).
+    Missing,
+    /// Signature has invalid length (expected 64 bytes for Ed25519).
+    InvalidLength,
+    /// Cryptographic verification failed.
+    VerificationFailed,
+    /// The public key is not a valid Ed25519 point.
+    InvalidPublicKey,
+}
+
+impl std::fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignatureError::Missing => write!(f, "signature is missing"),
+            SignatureError::InvalidLength => write!(f, "signature has invalid length"),
+            SignatureError::VerificationFailed => write!(f, "signature verification failed"),
+            SignatureError::InvalidPublicKey => write!(f, "invalid public key"),
+        }
+    }
+}
+
+impl std::error::Error for SignatureError {}
+
+// ============================================================================
+// Domain Separation Prefixes
+// ============================================================================
+//
+// SECURITY: Domain separation prevents cross-protocol signature replay attacks.
+// Each signed data type in Corium uses a unique prefix to ensure signatures
+// cannot be reused in a different context.
+
+/// Domain separation prefix for GossipSub message signatures.
+pub const GOSSIPSUB_SIGNATURE_DOMAIN: &[u8] = b"corium-gossipsub-v1:";
+
+/// Domain separation prefix for Contact record signatures.
+pub const CONTACT_SIGNATURE_DOMAIN: &[u8] = b"corium-contact-v1:";
+
+// ============================================================================
+// Domain-Separated Signature Helpers
+// ============================================================================
+
+/// Sign data with domain separation.
+/// 
+/// Prepends the domain prefix to the data before signing, preventing
+/// cross-protocol signature replay attacks.
+/// 
+/// # Arguments
+/// * `keypair` - The signing keypair
+/// * `domain` - Domain separation prefix (e.g., `GOSSIPSUB_SIGNATURE_DOMAIN`)
+/// * `data` - The data to sign
+/// 
+/// # Returns
+/// 64-byte Ed25519 signature as a Vec<u8>
+pub fn sign_with_domain(keypair: &Keypair, domain: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut prefixed = Vec::with_capacity(domain.len() + data.len());
+    prefixed.extend_from_slice(domain);
+    prefixed.extend_from_slice(data);
+    keypair.sign(&prefixed).to_bytes().to_vec()
+}
+
+/// Verify a signature with domain separation.
+/// 
+/// Reconstructs the prefixed data and verifies the Ed25519 signature.
+/// 
+/// # Arguments
+/// * `identity` - The claimed signer's identity (public key)
+/// * `domain` - Domain separation prefix (must match what was used during signing)
+/// * `data` - The original data that was signed
+/// * `signature` - The 64-byte Ed25519 signature
+/// 
+/// # Returns
+/// `Ok(())` if signature is valid, `Err(SignatureError)` otherwise
+pub fn verify_with_domain(
+    identity: &Identity,
+    domain: &[u8],
+    data: &[u8],
+    signature: &[u8],
+) -> std::result::Result<(), SignatureError> {
+    if signature.is_empty() {
+        return Err(SignatureError::Missing);
+    }
+    if signature.len() != 64 {
+        return Err(SignatureError::InvalidLength);
+    }
+
+    let verifying_key = VerifyingKey::try_from(identity.as_bytes().as_slice())
+        .map_err(|_| SignatureError::InvalidPublicKey)?;
+
+    let sig_bytes: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| SignatureError::InvalidLength)?;
+    let sig = Signature::from_bytes(&sig_bytes);
+
+    let mut prefixed = Vec::with_capacity(domain.len() + data.len());
+    prefixed.extend_from_slice(domain);
+    prefixed.extend_from_slice(data);
+
+    verifying_key
+        .verify_strict(&prefixed, &sig)
+        .map_err(|_| SignatureError::VerificationFailed)
+}
 
 /// Lazily-initialized crypto provider for rustls.
 /// Uses ring as the underlying cryptographic implementation.

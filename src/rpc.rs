@@ -14,8 +14,7 @@
 //!
 //! Each protocol defines its own RPC trait:
 //! - [`DhtNodeRpc`]: DHT operations (ping, find_node, find_value, store)
-//! - [`PlumTreeRpc`]: PubSub message forwarding
-//! - [`HyParViewRpc`]: Membership protocol messages
+//! - [`GossipSubRpc`]: PubSub message forwarding
 //! - [`RelayRpc`]: NAT traversal relay operations
 //! - [`DirectRpc`]: Point-to-point direct messaging
 //!
@@ -46,16 +45,15 @@ use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use crate::messages::{self as messages, DirectMessageSender, DhtNodeRequest, DhtNodeResponse, PlumTreeRequest, HyParViewRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
+use crate::messages::{self as messages, DirectMessageSender, DhtNodeRequest, DhtNodeResponse, GossipSubRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
 use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
 use crate::relay::{Relay, handle_relay_request};
 use crate::dht::DhtNode;
-use crate::storage::Key;
+use crate::dht::Key;
 use crate::identity::{Contact, Identity};
-use crate::hyparview::HyParView;
-use crate::plumtree::PlumTree;
-use crate::protocols::{DhtNodeRpc, PlumTreeRpc, HyParViewRpc, RelayRpc, DirectRpc};
+use crate::gossipsub::GossipSub;
+use crate::protocols::{DhtNodeRpc, GossipSubRpc, RelayRpc, DirectRpc};
 
 
 // ============================================================================
@@ -705,26 +703,13 @@ impl DhtNodeRpc for RpcNode {
 
 
 #[async_trait]
-impl PlumTreeRpc for RpcNode {
-    async fn send_plumtree(&self, to: &Contact, message: PlumTreeRequest) -> Result<()> {
-        let request = RpcRequest::PlumTree(message);
+impl GossipSubRpc for RpcNode {
+    async fn send_gossipsub(&self, to: &Contact, message: GossipSubRequest) -> Result<()> {
+        let request = RpcRequest::GossipSub(message);
         match self.rpc_raw(to, request).await? {
-            RpcResponse::PlumTreeAck => Ok(()),
-            RpcResponse::Error { message } => anyhow::bail!("PlumTree rejected: {}", message),
-            other => anyhow::bail!("unexpected response to PlumTree: {:?}", other),
-        }
-    }
-}
-
-
-#[async_trait]
-impl HyParViewRpc for RpcNode {
-    async fn send_hyparview(&self, to: &Contact, message: HyParViewRequest) -> Result<()> {
-        let request = RpcRequest::HyParView(message);
-        match self.rpc_raw(to, request).await? {
-            RpcResponse::HyParViewAck => Ok(()),
-            RpcResponse::Error { message } => anyhow::bail!("HyParView rejected: {}", message),
-            other => anyhow::bail!("unexpected response to HyParView: {:?}", other),
+            RpcResponse::GossipSubAck => Ok(()),
+            RpcResponse::Error { message } => anyhow::bail!("GossipSub rejected: {}", message),
+            other => anyhow::bail!("unexpected response to GossipSub: {:?}", other),
         }
     }
 }
@@ -745,28 +730,6 @@ impl DirectRpc for RpcNode {
 
 #[async_trait]
 impl RelayRpc for RpcNode {
-    async fn request_relay_session(
-        &self,
-        relay: &Contact,
-        from_peer: Identity,
-        target_peer: Identity,
-        session_id: [u8; 16],
-    ) -> Result<(Connection, RelayResponse)> {
-        let relay_conn = self
-            .get_or_connect(relay)
-            .await
-            .context("failed to connect to relay")?;
-
-        let request = RelayRequest::Connect {
-            from_peer,
-            target_peer,
-            session_id,
-        };
-
-        let response = self.send_relay_rpc(&relay_conn, request).await?;
-        Ok((relay_conn, response))
-    }
-
     async fn complete_relay_session(
         &self,
         relay: &Contact,
@@ -813,105 +776,37 @@ impl RelayRpc for RpcNode {
         Ok(())
     }
 
-    async fn register_for_signaling(
+    // NOTE: register_for_signaling removed - mesh-only signaling now
+    // NAT peers receive signals via GossipSub mesh instead of dedicated QUIC streams
+
+    async fn request_mesh_relay(
         &self,
-        relay: &Contact,
-        our_identity: Identity,
-    ) -> Result<tokio::sync::mpsc::Receiver<RelayResponse>> {
-        let conn = self.get_or_connect(relay).await
-            .context("failed to connect to relay")?;
-        
-        let (mut send, mut recv) = conn
-            .open_bi()
+        mesh_peer: &Contact,
+        from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<RelayResponse> {
+        debug!(
+            mesh_peer = ?mesh_peer.identity,
+            from_peer = ?from_peer,
+            target_peer = ?target_peer,
+            session = hex::encode(session_id),
+            "requesting mesh relay from peer"
+        );
+
+        let conn = self
+            .get_or_connect(mesh_peer)
             .await
-            .context("failed to open bidirectional stream for signaling")?;
-        
-        // Send Register request
-        let request = RpcRequest::Relay(RelayRequest::Register { from_peer: our_identity });
-        let request_bytes = messages::serialize_request(&request)
-            .context("failed to serialize Register request")?;
-        let len = request_bytes.len() as u32;
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&request_bytes).await?;
-        // Note: NOT calling send.finish() - keep stream open
-        
-        // Read initial response (should be Registered)
-        let mut len_buf = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut len_buf))
-            .await
-            .context("timeout waiting for Registered response")??;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        
-        if len > MAX_RESPONSE_SIZE {
-            anyhow::bail!("response too large: {} bytes", len);
-        }
-        
-        let mut response_bytes = vec![0u8; len];
-        recv.read_exact(&mut response_bytes).await?;
-        
-        let rpc_response: RpcResponse = messages::deserialize_bounded(&response_bytes)
-            .context("failed to deserialize response")?;
-        
-        match rpc_response {
-            RpcResponse::Relay(RelayResponse::Registered) => {
-                debug!(relay = ?relay.identity, "successfully registered for signaling");
-            }
-            RpcResponse::Relay(RelayResponse::Rejected { reason }) => {
-                anyhow::bail!("relay rejected registration: {}", reason);
-            }
-            other => {
-                anyhow::bail!("unexpected response to Register: {:?}", other);
-            }
-        }
-        
-        // Create channel to forward incoming notifications
-        let (tx, rx) = tokio::sync::mpsc::channel::<RelayResponse>(16);
-        
-        // Spawn task to read notifications and forward them
-        tokio::spawn(async move {
-            loop {
-                let mut len_buf = [0u8; 4];
-                match recv.read_exact(&mut len_buf).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        debug!(error = %e, "signaling stream closed");
-                        break;
-                    }
-                }
-                let len = u32::from_be_bytes(len_buf) as usize;
-                
-                if len > MAX_RESPONSE_SIZE {
-                    warn!(len = len, "oversized notification, dropping");
-                    break;
-                }
-                
-                let mut response_bytes = vec![0u8; len];
-                if let Err(e) = recv.read_exact(&mut response_bytes).await {
-                    debug!(error = %e, "failed to read notification body");
-                    break;
-                }
-                
-                let rpc_response: RpcResponse = match messages::deserialize_bounded(&response_bytes) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(error = %e, "failed to deserialize notification");
-                        continue;
-                    }
-                };
-                
-                if let RpcResponse::Relay(relay_response) = rpc_response {
-                    if tx.send(relay_response).await.is_err() {
-                        debug!("signaling receiver dropped, closing connection");
-                        break;
-                    }
-                }
-            }
-            
-            // Cleanup: close the stream
-            let _ = send.finish();
-        });
-        
-        Ok(rx)
+            .context("failed to connect to mesh peer for relay")?;
+
+        let request = RelayRequest::MeshRelay {
+            from_peer,
+            target_peer,
+            session_id,
+        };
+
+        let response = self.send_relay_rpc(&conn, request).await?;
+        Ok(response)
     }
 }
 
@@ -921,12 +816,11 @@ const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
+pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Sync + 'static>(
     node: DhtNode<N>,
-    plumtree: Option<PlumTree<N>>,
+    gossipsub: Option<GossipSub<N>>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
-    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
     // Extract relay from smartsock
@@ -945,7 +839,7 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
     let verified_identity = verified_identity.unwrap();
 
     // Register incoming peer in DHT routing table for identity resolution.
-    // This enables HyParView/PlumTree to send messages to peers that connected to us.
+    // This enables GossipSub to send messages to peers that connected to us.
     let incoming_contact = Contact::unsigned(verified_identity, vec![remote.to_string()]);
     node.observe_contact(incoming_contact).await;
     
@@ -971,7 +865,6 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 debug!(remote = %remote, "connection closed by application");
-                hyparview.handle_peer_disconnected(verified_identity).await;
                 // Clean up relay tunnels for this peer
                 if let Some(ss) = &smartsock {
                     let removed = ss.cleanup_peer_relay_tunnels(&verified_identity).await;
@@ -988,7 +881,6 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
             Err(quinn::ConnectionError::TimedOut) => {
                 // Idle timeout is normal - connection had no activity
                 debug!(remote = %remote, "connection idle timeout");
-                hyparview.handle_peer_disconnected(verified_identity).await;
                 // Clean up relay tunnels for this peer
                 if let Some(ss) = &smartsock {
                     let removed = ss.cleanup_peer_relay_tunnels(&verified_identity).await;
@@ -1003,7 +895,6 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
                 break Ok(());
             }
             Err(e) => {
-                hyparview.handle_peer_disconnected(verified_identity).await;
                 // Clean up relay tunnels for this peer
                 if let Some(ss) = &smartsock {
                     ss.cleanup_peer_relay_tunnels(&verified_identity).await;
@@ -1013,16 +904,15 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
         };
 
         let node = node.clone();
-        let plumtree_h = plumtree.clone();
+        let gossipsub_h = gossipsub.clone();
         let udprelay = udprelay.clone();
         let remote_addr = remote;
         let verified_id = verified_identity;
         let from_contact = Contact::unsigned(verified_id, vec![remote_addr.to_string()]);
-        let hv = hyparview.clone();
         let direct_sender = direct_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(node, plumtree_h, udprelay, udprelay_addr, stream, remote_addr, from_contact, hv, direct_sender).await
+                handle_stream(node, gossipsub_h, udprelay, udprelay_addr, stream, remote_addr, from_contact, direct_sender).await
             {
                 debug!(error = ?e, "stream error");
             }
@@ -1033,15 +923,14 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clon
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
+async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
-    plumtree: Option<PlumTree<N>>,
+    gossipsub: Option<GossipSub<N>>,
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
     from_contact: Contact,
-    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
     let verified_identity = from_contact.identity;
@@ -1097,111 +986,8 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync 
         }
     }
 
-    // Special handling for signaling registration - keep stream open
-    if let RpcRequest::Relay(RelayRequest::Register { from_peer }) = &request {
-        debug!(
-            from = ?from_peer,
-            remote = %remote_addr,
-            "handling signaling registration"
-        );
-        
-        let udprelay = match &udprelay {
-            Some(s) => s,
-            None => {
-                let response = RpcResponse::Relay(RelayResponse::Rejected {
-                    reason: "relay not available".to_string(),
-                });
-                let response_bytes = bincode::serialize(&response)?;
-                let len = response_bytes.len() as u32;
-                send.write_all(&len.to_be_bytes()).await?;
-                send.write_all(&response_bytes).await?;
-                send.finish()?;
-                return Ok(());
-            }
-        };
-        
-        // Register signaling channel
-        let mut notification_rx = match udprelay.register_signaling(verified_identity).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                let response = RpcResponse::Relay(RelayResponse::Rejected {
-                    reason: e.to_string(),
-                });
-                let response_bytes = bincode::serialize(&response)?;
-                let len = response_bytes.len() as u32;
-                send.write_all(&len.to_be_bytes()).await?;
-                send.write_all(&response_bytes).await?;
-                send.finish()?;
-                return Ok(());
-            }
-        };
-        
-        // Send Registered acknowledgment
-        let response = RpcResponse::Relay(RelayResponse::Registered);
-        let response_bytes = bincode::serialize(&response)?;
-        let len = response_bytes.len() as u32;
-        send.write_all(&len.to_be_bytes()).await?;
-        send.write_all(&response_bytes).await?;
-        // Note: NOT calling send.finish() - keep stream open
-        
-        debug!(
-            peer = ?verified_identity,
-            "signaling channel registered, listening for notifications"
-        );
-        
-        // Buffer for detecting connection close
-        let mut close_detect_buf = [0u8; 1];
-        
-        // Forward notifications until channel closes or connection drops
-        loop {
-            tokio::select! {
-                notification = notification_rx.recv() => {
-                    match notification {
-                        Some(relay_response) => {
-                            let response = RpcResponse::Relay(relay_response);
-                            let response_bytes = match bincode::serialize(&response) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!(error = %e, "failed to serialize notification");
-                                    continue;
-                                }
-                            };
-                            let len = response_bytes.len() as u32;
-                            
-                            if let Err(e) = send.write_all(&len.to_be_bytes()).await {
-                                debug!(error = %e, "signaling stream write failed");
-                                break;
-                            }
-                            if let Err(e) = send.write_all(&response_bytes).await {
-                                debug!(error = %e, "signaling stream write failed");
-                                break;
-                            }
-                            
-                            debug!(
-                                peer = ?verified_identity,
-                                "forwarded incoming notification"
-                            );
-                        }
-                        None => {
-                            debug!(peer = ?verified_identity, "notification channel closed");
-                            break;
-                        }
-                    }
-                }
-                _ = recv.read(&mut close_detect_buf) => {
-                    // Connection closed by peer
-                    debug!(peer = ?verified_identity, "signaling connection closed by peer");
-                    break;
-                }
-            }
-        }
-        
-        // Cleanup
-        udprelay.unregister_signaling(&verified_identity).await;
-        let _ = send.finish();
-        
-        return Ok(());
-    }
+    // NOTE: RelayRequest::Register handling removed - mesh-only signaling
+    // NAT peers now receive signals via GossipSub mesh instead of dedicated QUIC streams
 
     let response = match tokio::time::timeout(
         REQUEST_PROCESS_TIMEOUT,
@@ -1210,10 +996,9 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync 
             request,
             remote_addr,
             from_contact,
-            plumtree,
+            gossipsub,
             udprelay,
             udprelay_addr,
-            hyparview,
             direct_tx,
         )
     ).await {
@@ -1236,15 +1021,14 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
+async fn handle_rpc_request<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     request: RpcRequest,
     remote_addr: SocketAddr,
     from_contact: Contact,
-    plumtree: Option<PlumTree<N>>,
+    gossipsub: Option<GossipSub<N>>,
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
-    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> RpcResponse {
     match request {
@@ -1261,11 +1045,8 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + 
             ).await;
             RpcResponse::Relay(relay_response)
         }
-        RpcRequest::PlumTree(message) => {
-            handle_plumtree_rpc(&from_contact, message, plumtree).await
-        }
-        RpcRequest::HyParView(message) => {
-            handle_hyparview_rpc(from_contact.clone(), message, hyparview).await
+        RpcRequest::GossipSub(message) => {
+            handle_gossipsub_rpc(&from_contact, message, gossipsub).await
         }
         RpcRequest::Direct(data) => {
             if let Some(tx) = direct_tx {
@@ -1408,49 +1189,33 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
     }
 }
 
-async fn handle_plumtree_rpc<N: PlumTreeRpc + Send + Sync + 'static>(
+async fn handle_gossipsub_rpc<N: GossipSubRpc + Send + Sync + 'static>(
     from: &Contact,
-    message: PlumTreeRequest,
-    plumtree: Option<PlumTree<N>>,
+    message: GossipSubRequest,
+    gossipsub: Option<GossipSub<N>>,
 ) -> RpcResponse {
-    if let Some(pt) = plumtree {
+    if let Some(gs) = gossipsub {
         trace!(
             from = ?hex::encode(&from.identity.as_bytes()[..8]),
             message = ?message,
-            "dispatching PLUMTREE request to handler"
+            "dispatching GOSSIPSUB request to handler"
         );
-        if let Err(e) = pt.handle_message(from, message).await {
-            warn!(from = ?hex::encode(&from.identity.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
+        if let Err(e) = gs.handle_message(from, message).await {
+            warn!(from = ?hex::encode(&from.identity.as_bytes()[..8]), error = %e, "GossipSub handler returned error");
             RpcResponse::Error {
-                message: format!("PlumTree error: {}", e),
+                message: format!("GossipSub error: {}", e),
             }
         } else {
-            RpcResponse::PlumTreeAck
+            RpcResponse::GossipSubAck
         }
     } else {
         warn!(
             from = ?hex::encode(&from.identity.as_bytes()[..8]),
             message = ?message,
-            "received PLUMTREE request but no handler registered"
+            "received GOSSIPSUB request but no handler registered"
         );
         RpcResponse::Error {
-            message: "PlumTree not enabled on this node".to_string(),
+            message: "GossipSub not enabled on this node".to_string(),
         }
     }
-}
-
-async fn handle_hyparview_rpc<N: HyParViewRpc + Send + Sync + 'static>(
-    from: Contact,
-    message: HyParViewRequest,
-    hyparview: HyParView<N>,
-) -> RpcResponse {
-    trace!(
-        from = ?hex::encode(&from.identity.as_bytes()[..8]),
-        message = ?message,
-        "handling HyParView request"
-    );
-    
-    hyparview.handle_message(from, message).await;
-    
-    RpcResponse::HyParViewAck
 }

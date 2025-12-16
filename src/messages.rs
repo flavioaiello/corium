@@ -8,8 +8,7 @@
 //! | Protocol | Request Type | Response Type |
 //! |----------|--------------|---------------|
 //! | DHT | `DhtNodeRequest` | `DhtNodeResponse` |
-//! | PubSub | `PlumTreeRequest` | (fire-and-forget) |
-//! | Membership | `HyParViewRequest` | (fire-and-forget) |
+//! | PubSub | `GossipSubRequest` | `GossipSubAck` |
 //! | Relay | `RelayRequest` | `RelayResponse` |
 //! | Direct | `Vec<u8>` | (application-defined) |
 //!
@@ -29,7 +28,7 @@
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::storage::Key;
+use crate::dht::Key;
 use crate::identity::{Contact, Identity};
 
 /// Channel sender for direct (non-PubSub) messages between peers.
@@ -132,10 +131,12 @@ pub enum RelayRequest {
         target_peer: Identity,
         session_id: [u8; 16],
     },
-    /// Register this NAT-bound node for incoming connection notifications.
-    /// The connection must be kept open to receive `Incoming` push notifications.
-    Register {
+    /// Request a mesh peer to act as relay for connecting to a target peer.
+    /// Phase 4: Opportunistic mesh relay - any relay-capable mesh peer can help.
+    MeshRelay {
         from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
     },
 }
 
@@ -143,7 +144,7 @@ impl RelayRequest {
     pub fn sender_identity(&self) -> Identity {
         match self {
             RelayRequest::Connect { from_peer, .. } => *from_peer,
-            RelayRequest::Register { from_peer } => *from_peer,
+            RelayRequest::MeshRelay { from_peer, .. } => *from_peer,
         }
     }
 }
@@ -164,12 +165,16 @@ pub enum RelayResponse {
     Rejected {
         reason: String,
     },
-    /// Registration acknowledged. Keep connection open for Incoming notifications.
-    Registered,
     /// Push notification: another peer wants to connect via relay.
     /// NAT-bound node should initiate Connect with the provided session_id.
     Incoming {
         from_peer: Identity,
+        session_id: [u8; 16],
+        relay_data_addr: String,
+    },
+    /// Mesh relay offer: peer is willing to relay.
+    /// Phase 4: Response to MeshRelay request when peer can help.
+    MeshRelayOffer {
         session_id: [u8; 16],
         relay_data_addr: String,
     },
@@ -179,20 +184,30 @@ pub enum RelayResponse {
 pub type MessageId = [u8; 32];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum PlumTreeRequest {
+pub enum GossipSubRequest {
+    /// Subscribe to a topic - informs peer we want messages for this topic.
     Subscribe {
         topic: String,
     },
+    /// Unsubscribe from a topic - informs peer we no longer want messages.
     Unsubscribe {
         topic: String,
     },
+    /// GRAFT - request to join the mesh for a topic.
     Graft {
         topic: String,
     },
+    /// PRUNE - request to leave the mesh for a topic.
+    /// Per GossipSub v1.1: includes backoff duration and optional peer exchange.
     Prune {
         topic: String,
+        /// Peer exchange: suggested peers the pruned peer can connect to.
         peers: Vec<Identity>,
+        /// Backoff duration in seconds before the peer should attempt to re-graft.
+        /// If None, use default backoff (60 seconds per spec).
+        backoff_secs: Option<u64>,
     },
+    /// Publish a message to a topic with full content.
     Publish {
         topic: String,
         msg_id: MessageId,
@@ -201,61 +216,58 @@ pub enum PlumTreeRequest {
         data: Vec<u8>,
         signature: Vec<u8>,
     },
+    /// IHAVE - gossip announcing message IDs we have for a topic.
     IHave {
         topic: String,
         msg_ids: Vec<MessageId>,
     },
+    /// IWANT - request messages by their IDs.
     IWant {
         msg_ids: Vec<MessageId>,
     },
+    /// IDONTWANT - preemptively tell peers not to send us certain messages.
+    /// Per GossipSub v1.2: optimization to reduce bandwidth by indicating
+    /// messages we've already received via another path.
+    IDontWant {
+        msg_ids: Vec<MessageId>,
+    },
+    /// RelaySignal - relay signaling message forwarded through mesh.
+    /// 
+    /// Used for mesh-mediated signaling: instead of maintaining dedicated
+    /// connections to relays, signaling messages are forwarded through
+    /// GossipSub mesh connections. This reduces connection overhead.
+    /// 
+    /// The relay sends this to notify a NAT-bound peer about an incoming
+    /// connection request. The target peer processes it and completes
+    /// the relay handshake.
+    RelaySignal {
+        /// The target peer identity (recipient of the signal).
+        target: Identity,
+        /// The peer requesting connection (initiator).
+        from_peer: Identity,
+        /// Session ID to use for the relay connection.
+        session_id: [u8; 16],
+        /// Address to send relay data packets to.
+        relay_data_addr: String,
+    },
 }
 
-impl PlumTreeRequest {
+impl GossipSubRequest {
     pub fn topic(&self) -> Option<&str> {
         match self {
-            PlumTreeRequest::Subscribe { topic } => Some(topic),
-            PlumTreeRequest::Unsubscribe { topic } => Some(topic),
-            PlumTreeRequest::Graft { topic } => Some(topic),
-            PlumTreeRequest::Prune { topic, .. } => Some(topic),
-            PlumTreeRequest::Publish { topic, .. } => Some(topic),
-            PlumTreeRequest::IHave { topic, .. } => Some(topic),
-            PlumTreeRequest::IWant { .. } => None,
+            GossipSubRequest::Subscribe { topic } => Some(topic),
+            GossipSubRequest::Unsubscribe { topic } => Some(topic),
+            GossipSubRequest::Graft { topic } => Some(topic),
+            GossipSubRequest::Prune { topic, .. } => Some(topic),
+            GossipSubRequest::Publish { topic, .. } => Some(topic),
+            GossipSubRequest::IHave { topic, .. } => Some(topic),
+            GossipSubRequest::IWant { .. } => None,
+            GossipSubRequest::IDontWant { .. } => None,
+            GossipSubRequest::RelaySignal { .. } => None, // Not topic-based
         }
     }
 }
 
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Priority {
-    High,
-    Low,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HyParViewRequest {
-    Join,
-    ForwardJoin {
-        new_peer: Identity,
-        ttl: u8,
-    },
-    Neighbor {
-        priority: Priority,
-    },
-    NeighborReply {
-        accepted: bool,
-    },
-    Shuffle {
-        origin: Identity,
-        peers: Vec<Identity>,
-        ttl: u8,
-    },
-    ShuffleReply {
-        peers: Vec<Identity>,
-    },
-    Disconnect {
-        alive: bool,
-    },
-}
 
 
 #[derive(Clone, Debug)]
@@ -270,22 +282,19 @@ pub struct Message {
 pub enum RpcRequest {
     DhtNode(DhtNodeRequest),
     Relay(RelayRequest),
-    PlumTree(PlumTreeRequest),
-    HyParView(HyParViewRequest),
+    GossipSub(GossipSubRequest),
     Direct(Vec<u8>),
 }
 
 impl RpcRequest {
     /// Returns the claimed sender identity for request types that include one.
-    /// PlumTree, HyParView, and Direct requests no longer include identity
-    /// since TLS already provides verified identity.
+    /// GossipSub and Direct requests rely on TLS-verified identity.
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
             RpcRequest::DhtNode(dht_msg) => dht_msg.sender_identity(),
             RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
             // These request types rely on TLS-verified identity
-            RpcRequest::PlumTree(_) => None,
-            RpcRequest::HyParView(_) => None,
+            RpcRequest::GossipSub(_) => None,
             RpcRequest::Direct(_) => None,
         }
     }
@@ -297,9 +306,7 @@ pub enum RpcResponse {
 
     Relay(RelayResponse),
 
-    PlumTreeAck,
-
-    HyParViewAck,
+    GossipSubAck,
 
     DirectAck,
 
@@ -476,42 +483,43 @@ mod tests {
 
 
     #[test]
-    fn plumtree_message_variants() {
-        let sub = PlumTreeRequest::Subscribe {
+    fn gossipsub_message_variants() {
+        let sub = GossipSubRequest::Subscribe {
             topic: "test".to_string(),
         };
         assert_eq!(sub.topic(), Some("test"));
 
-        let unsub = PlumTreeRequest::Unsubscribe {
+        let unsub = GossipSubRequest::Unsubscribe {
             topic: "test".to_string(),
         };
         assert_eq!(unsub.topic(), Some("test"));
 
-        let graft = PlumTreeRequest::Graft {
+        let graft = GossipSubRequest::Graft {
             topic: "test".to_string(),
         };
         assert_eq!(graft.topic(), Some("test"));
 
-        let prune = PlumTreeRequest::Prune {
+        let prune = GossipSubRequest::Prune {
             topic: "test".to_string(),
             peers: vec![],
+            backoff_secs: None,
         };
         assert_eq!(prune.topic(), Some("test"));
 
-        let ihave = PlumTreeRequest::IHave {
+        let ihave = GossipSubRequest::IHave {
             topic: "test".to_string(),
             msg_ids: vec![],
         };
         assert_eq!(ihave.topic(), Some("test"));
 
-        let iwant = PlumTreeRequest::IWant { msg_ids: vec![] };
+        let iwant = GossipSubRequest::IWant { msg_ids: vec![] };
         assert_eq!(iwant.topic(), None);
     }
 
     #[test]
-    fn plumtree_message_serialization() {
+    fn gossipsub_message_serialization() {
         let identity = Identity::from_bytes([1u8; 32]);
-        let msg = PlumTreeRequest::Publish {
+        let msg = GossipSubRequest::Publish {
             topic: "test".to_string(),
             msg_id: [0u8; 32],
             source: identity,
@@ -521,10 +529,10 @@ mod tests {
         };
 
         let encoded = bincode::serialize(&msg).expect("serialize failed");
-        let decoded: PlumTreeRequest = bincode::deserialize(&encoded).expect("deserialize failed");
+        let decoded: GossipSubRequest = bincode::deserialize(&encoded).expect("deserialize failed");
 
         match decoded {
-            PlumTreeRequest::Publish {
+            GossipSubRequest::Publish {
                 topic, seqno, data, ..
             } => {
                 assert_eq!(topic, "test");
@@ -567,8 +575,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_plumtree_request() {
-        let request = RpcRequest::PlumTree(PlumTreeRequest::Publish {
+    fn round_trip_gossipsub_request() {
+        let request = RpcRequest::GossipSub(GossipSubRequest::Publish {
             topic: "test".to_string(),
             msg_id: [0u8; 32],
             source: test_identity(),
@@ -581,7 +589,7 @@ mod tests {
         let decoded = deserialize_request(&bytes).expect("deserialize should succeed");
 
         match decoded {
-            RpcRequest::PlumTree(PlumTreeRequest::Publish { topic, .. }) => {
+            RpcRequest::GossipSub(GossipSubRequest::Publish { topic, .. }) => {
                 assert_eq!(topic, "test");
             }
             _ => panic!("unexpected variant"),
@@ -589,27 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_plumtree_ack() {
-        let response = RpcResponse::PlumTreeAck;
+    fn round_trip_gossipsub_ack() {
+        let response = RpcResponse::GossipSubAck;
         let bytes = bincode::serialize(&response).expect("serialize should succeed");
         let decoded: RpcResponse =
             bincode::deserialize(&bytes).expect("deserialize should succeed");
 
         match decoded {
-            RpcResponse::PlumTreeAck => {}
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn round_trip_hyparview_ack() {
-        let response = RpcResponse::HyParViewAck;
-        let bytes = bincode::serialize(&response).expect("serialize should succeed");
-        let decoded: RpcResponse =
-            bincode::deserialize(&bytes).expect("deserialize should succeed");
-
-        match decoded {
-            RpcResponse::HyParViewAck => {}
+            RpcResponse::GossipSubAck => {}
             _ => panic!("unexpected variant"),
         }
     }
@@ -632,20 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn plumtree_message_topic_accessor() {
-        let subscribe = PlumTreeRequest::Subscribe { topic: "test".into() };
+    fn gossipsub_message_topic_accessor() {
+        let subscribe = GossipSubRequest::Subscribe { topic: "test".into() };
         assert_eq!(subscribe.topic(), Some("test"));
         
-        let unsubscribe = PlumTreeRequest::Unsubscribe { topic: "foo".into() };
+        let unsubscribe = GossipSubRequest::Unsubscribe { topic: "foo".into() };
         assert_eq!(unsubscribe.topic(), Some("foo"));
         
-        let graft = PlumTreeRequest::Graft { topic: "bar".into() };
+        let graft = GossipSubRequest::Graft { topic: "bar".into() };
         assert_eq!(graft.topic(), Some("bar"));
         
-        let prune = PlumTreeRequest::Prune { topic: "baz".into(), peers: vec![] };
+        let prune = GossipSubRequest::Prune { topic: "baz".into(), peers: vec![], backoff_secs: None };
         assert_eq!(prune.topic(), Some("baz"));
         
-        let publish = PlumTreeRequest::Publish {
+        let publish = GossipSubRequest::Publish {
             topic: "pub".into(),
             msg_id: [0u8; 32],
             source: test_identity(),
@@ -655,10 +650,10 @@ mod tests {
         };
         assert_eq!(publish.topic(), Some("pub"));
         
-        let ihave = PlumTreeRequest::IHave { topic: "ih".into(), msg_ids: vec![] };
+        let ihave = GossipSubRequest::IHave { topic: "ih".into(), msg_ids: vec![] };
         assert_eq!(ihave.topic(), Some("ih"));
         
-        let iwant = PlumTreeRequest::IWant { msg_ids: vec![] };
+        let iwant = GossipSubRequest::IWant { msg_ids: vec![] };
         assert_eq!(iwant.topic(), None);
     }
 }

@@ -947,21 +947,6 @@ impl SmartSock {
         removed_sessions
     }
     
-    /// Get contact information for a peer from SmartSock's peer registry.
-    /// Uses try_read to avoid blocking if the lock is contended.
-    pub fn get_peer_contact_nonblocking(&self, identity: &Identity) -> Option<Contact> {
-        let smart_addr = SmartAddr::from_identity(identity);
-        let peers = self.peers.try_read().ok()?;
-        let state = peers.get(&smart_addr)?;
-        
-        // Build contact from peer state
-        let addrs: Vec<String> = state.direct_addrs.iter()
-            .map(|a| a.to_string())
-            .collect();
-        
-        Some(Contact::unsigned(state.identity, addrs))
-    }
-    
     /// Get contact information for a peer from SmartSock's peer registry (async version).
     pub async fn get_peer_contact(&self, identity: &Identity) -> Option<Contact> {
         let smart_addr = SmartAddr::from_identity(identity);
@@ -1024,6 +1009,33 @@ impl SmartSock {
         false
     }
     
+    /// Check if a peer's active path is through a relay.
+    /// 
+    /// Returns `true` if the peer is registered and using a relay path,
+    /// `false` if using direct path or peer is not registered.
+    pub async fn is_peer_relayed(&self, identity: &Identity) -> bool {
+        let smart_addr = SmartAddr::from_identity(identity);
+        let peers = self.peers.read().await;
+        peers.get(&smart_addr)
+            .map(|state| state.is_relayed())
+            .unwrap_or(false)
+    }
+    
+    /// Get the active relay session ID for a peer, if using relay path.
+    /// 
+    /// Returns `Some(session_id)` if the peer is using a relay path,
+    /// `None` if using direct path or peer is not registered.
+    pub async fn peer_relay_session(&self, identity: &Identity) -> Option<[u8; 16]> {
+        let smart_addr = SmartAddr::from_identity(identity);
+        let peers = self.peers.read().await;
+        peers.get(&smart_addr).and_then(|state| {
+            match &state.active_path {
+                Some(PathChoice::Relay { session_id, .. }) => Some(*session_id),
+                _ => None,
+            }
+        })
+    }
+
     pub async fn update_path(&self, identity: &Identity, path: PathChoice) {
         let smart_addr = SmartAddr::from_identity(identity);
         let mut peers = self.peers.write().await;

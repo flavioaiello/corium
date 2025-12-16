@@ -295,20 +295,6 @@ async fn node_publish_address() {
 }
 
 #[tokio::test]
-async fn node_publish_address_with_relays() {
-    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
-    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
-    
-    let relay_identity = node2.peer_identity();
-    let addrs = vec!["192.168.1.100:5000".to_string()];
-    
-    // Should succeed with relay info
-    node1.publish_address_with_relays(addrs, vec![relay_identity])
-        .await
-        .expect("publish_address_with_relays failed");
-}
-
-#[tokio::test]
 async fn node_resolve_peer_not_found() {
     // Resolve requires an Identity which is internal type
     // We test this through connect instead which uses identity string
@@ -453,29 +439,26 @@ async fn signed_contact_enables_connection() {
     // If signature was invalid, resolution would fail before connection attempt
 }
 
-/// Tests that signed contacts with relays work across nodes.
+/// Tests that signed contacts work across nodes.
 #[tokio::test]
-async fn signed_contact_with_relays_resolves() {
+async fn signed_contact_resolves() {
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
-    let relay_node = Node::bind(&test_addr()).await.expect("relay bind failed");
     
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
-    let relay_id = relay_node.peer_identity();
     
     // Bootstrap node2 from node1
     node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
     
-    // Node1 publishes with relay info (signature covers relays field)
-    node1.publish_address_with_relays(
+    // Node1 publishes signed contact
+    node1.publish_address(
         vec![node1_addr.clone()],
-        vec![relay_id],
     ).await.expect("publish failed");
     
     tokio::time::sleep(Duration::from_millis(100)).await;
     
-    // Node2 resolves - signature verification includes relay field
+    // Node2 resolves - signature verification validates contact
     let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
@@ -483,10 +466,8 @@ async fn signed_contact_with_relays_resolves() {
     assert!(resolved.is_some(), "should resolve contact");
     let contact = resolved.unwrap();
     
-    // Verify relays are included and signature is valid
+    // Verify signature is present
     assert!(!contact.signature.is_empty(), "should have signature");
-    assert_eq!(contact.relays.len(), 1, "should have one relay");
-    assert_eq!(contact.relays[0], relay_id, "relay identity should match");
 }
 
 /// Tests that three nodes can form a network with signed contacts.

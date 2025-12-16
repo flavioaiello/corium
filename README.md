@@ -103,12 +103,18 @@ if is_public {
 } else {
     println!("Behind NAT - using relay: {:?}", relay);
     
-    // Handle incoming relay connections
+    // Handle incoming relay connections via mesh signaling
     if let Some(mut rx) = incoming_rx {
         while let Some(incoming) = rx.recv().await {
             node.accept_incoming(&incoming).await?;
         }
     }
+}
+
+// Alternative: Enable mesh-mediated signaling (no dedicated relay connection)
+let mut rx = node.enable_mesh_signaling().await;
+while let Some(incoming) = rx.recv().await {
+    node.accept_incoming(&incoming).await?;
 }
 ```
 
@@ -117,12 +123,12 @@ if is_public {
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                              Node                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐ │
-│  │   PlumTree  │  │  HyParView  │  │     DHT     │  │   Relay    │ │
-│  │   (PubSub)  │  │ (Membership)│  │  (Storage)  │  │  (Client)  │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────┬──────┘ │
-│         │                │                │                │        │
-│  ┌──────┴────────────────┴────────────────┴────────────────┴──────┐ │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │
+│  │  GossipSub  │  │   Crypto    │  │     DHT     │  │   Relay    │  │
+│  │   (PubSub)  │  │ (Identity)  │  │  (Storage)  │  │  (Client)  │  │
+│  └──────┬──────┘  └─────────────┘  └──────┬──────┘  └─────┬──────┘  │
+│         │                                 │                │        │
+│  ┌──────┴─────────────────────────────────┴────────────────┴──────┐ │
 │  │                          RpcNode                               │ │
 │  │            (Connection pooling, request routing)               │ │
 │  └────────────────────────────┬───────────────────────────────────┘ │
@@ -138,7 +144,6 @@ if is_public {
 │  └────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
 ```
-
 ### Module Overview
 
 | Module | Description |
@@ -146,14 +151,12 @@ if is_public {
 | `node` | High-level facade exposing the complete public API |
 | `transport` | SmartSock with path probing, relay tunnels, and virtual addresses |
 | `rpc` | Connection pooling, RPC dispatch, and actor-based state management |
-| `dht` | Kademlia-style DHT with latency tiering and adaptive parameters |
-| `plumtree` | Epidemic broadcast trees for efficient PubSub |
-| `hyparview` | Hybrid partial view membership protocol |
-| `relay` | UDP relay server and client for NAT traversal |
+| `dht` | Kademlia-style DHT with latency tiering, adaptive parameters, routing table, and storage |
+| `gossipsub` | GossipSub epidemic broadcast for efficient PubSub |
+| `relay` | UDP relay server and client with mesh-mediated signaling for NAT traversal |
 | `crypto` | Ed25519 certificates, identity verification, custom TLS |
 | `identity` | Keypairs, endpoint records, and signed address publication |
-| `storage` | LRU storage with per-peer quotas and pressure-based eviction |
-| `routing` | Kademlia routing table with bucket refresh |
+| `protocols` | Protocol trait definitions (DhtNodeRpc, GossipSubRpc, RelayRpc, DirectRpc) |
 | `messages` | Protocol message types and bounded serialization |
 
 ## Core Concepts
@@ -210,6 +213,15 @@ let conn = node.connect("target_identity_hex").await?;
 ```
 
 ## NAT Traversal
+
+### Mesh-First Relay Model
+
+Corium uses a **mesh-first** relay model where any reachable mesh peer can act as a relay:
+
+1. **No dedicated relay servers** — Any publicly reachable node serves as a relay
+2. **Mesh-mediated signaling** — Relay signals forwarded through GossipSub mesh
+3. **Opportunistic relaying** — Connection attempts try mesh peers as relays
+4. **Zero configuration** — Works automatically when mesh peers are available
 
 ### How SmartSock Works
 
@@ -310,7 +322,7 @@ Corium is designed to scale to millions of concurrent peers. Key design decision
 | **Concurrency** | Fixed α=3 | Adaptive 2-5 | Load shedding |
 | **RTT optimization** | ❌ None | /16 prefix tiering | Lower latency paths |
 | **Sybil protection** | ❌ Basic | Per-peer insertion limits | Eclipse resistant |
-| **Gossip layer** | ❌ None | HyParView + PlumTree | Fast broadcast, recovery |
+| **Gossip layer** | ❌ None | GossipSub | Fast broadcast, recovery |
 | **NAT traversal** | ❌ None | SmartSock + relays | Works behind NAT |
 | **Identity** | SHA-1 node IDs | Ed25519 public keys | Self-certifying |
 
@@ -332,27 +344,26 @@ Corium is designed to scale to millions of concurrent peers. Key design decision
 
 3. **Bounded data structures** — All caches use LRU eviction with fixed caps, ensuring memory stays constant regardless of network size.
 
-4. **Hybrid membership** — HyParView's active/passive split provides strong connectivity (5 active peers) with good recovery (100 passive candidates) at minimal cost.
+## GossipSub (PubSub)
 
-## PlumTree (PubSub)
+### Epidemic Broadcast
 
-### Epidemic Broadcast Trees
-
-PlumTree combines:
-- **Eager push** — Fast tree-based delivery to connected peers
-- **Lazy push** — IHave/IWant recovery via gossip mesh
-- **Automatic repair** — Tree rebuilds on peer failure
+GossipSub implements efficient topic-based publish/subscribe:
+- **Mesh overlay** — Each topic maintains a mesh of connected peers
+- **Eager push** — Messages forwarded immediately to mesh peers
+- **Gossip protocol** — IHave/IWant metadata exchange for reliability
+- **Relay signaling** — NAT traversal signals forwarded through mesh peers
 
 ### Message Flow
 
 ```
-Publisher → Eager Push (tree) → Subscribers
+Publisher → Mesh Push → Subscribers
               ↓
-         Lazy Push (IHave)
+         Gossip (IHave)
               ↓
          IWant requests
               ↓
-         Message recovery
+         Message delivery
 ```
 
 ### Message Authentication
@@ -376,24 +387,6 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 | Max message size | 64 KB |
 | Max topics | 10,000 |
 | Max peers per topic | 1,000 |
-
-## HyParView (Membership)
-
-Hybrid Partial View membership protocol:
-
-- **Active view** (5 peers) — Fully connected TCP/QUIC links
-- **Passive view** (100 peers) — Known but not connected
-- **Shuffle protocol** — Periodic peer exchange
-- **Failure detection** — Automatic promotion from passive view
-
-```
-┌─────────────────┐     ┌─────────────────┐
-│   Active View   │────▶│  Passive View   │
-│   (connected)   │◀────│   (standby)     │
-└─────────────────┘     └─────────────────┘
-        │                       │
-        └───────Shuffle─────────┘
-```
 
 ## Security
 
@@ -504,17 +497,15 @@ cargo test --test relay_infrastructure
 
   Introduced "sloppy" DHT with latency-based clustering—inspiration for Corium's tiering system.
 
-### PlumTree
+### GossipSub / PlumTree
+
+- **Vyzovitis, D., et al.** (2020). *GossipSub: Attack-Resilient Message Propagation in the Filecoin and ETH2.0 Networks*.
+
+  The GossipSub v1.1 specification that Corium's PubSub implementation follows.
 
 - **Leitão, J., Pereira, J., & Rodrigues, L.** (2007). *Epidemic Broadcast Trees*. SRDS '07.
 
-  The original PlumTree paper combining gossip reliability with tree efficiency.
-
-### HyParView
-
-- **Leitão, J., Pereira, J., & Rodrigues, L.** (2007). *HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast*. DSN '07.
-
-  Hybrid partial view membership protocol for robust overlay maintenance.
+  The PlumTree paper that influenced GossipSub's design, combining gossip reliability with efficient message propagation.
 
 ## License
 

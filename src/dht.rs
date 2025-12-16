@@ -33,7 +33,7 @@
 //! - Content verification: `hash(value) == key` or signed identity record
 //! - Bounded storage with automatic eviction
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -47,11 +47,6 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use crate::identity::{Contact, Identity, Keypair};
-use crate::routing::{
-    random_id_for_bucket, PendingBucketUpdate, RoutingInsertionLimiter, RoutingTable,
-    BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
-};
-use crate::storage::{Key, LocalStore};
 use crate::protocols::DhtNodeRpc;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
@@ -64,7 +59,7 @@ const OFFLOAD_MAX_RETRIES: usize = 3;
 /// Base delay between offload retry attempts (exponential backoff).
 const OFFLOAD_BASE_DELAY_MS: u64 = 100;
 
-pub(crate) fn blake3_digest(data: &[u8]) -> [u8; 32] {
+fn blake3_digest(data: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(data);
     let digest = hasher.finalize();
@@ -102,7 +97,7 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
     false
 }
 
-pub(crate) fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
     for i in 0..32 {
         if a[i] < b[i] {
             return std::cmp::Ordering::Less;
@@ -114,6 +109,896 @@ pub(crate) fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
 }
 
 
+// ============================================================================
+// Routing Table (XOR-Metric)
+// ============================================================================
+//
+// Kademlia routing table with XOR-based distance metric.
+//
+// Key Concepts:
+// - XOR Distance: distance(a, b) = a XOR b (bitwise)
+// - Bucket Index: Number of leading zero bits in XOR distance
+// - k-Buckets: Each bucket holds up to k contacts at similar distances
+//
+// Bucket Organization:
+//   Bucket 0: Contacts where distance has 0 leading zeros (furthest, 50% of keyspace)
+//   Bucket 1: Contacts where distance has 1 leading zero (25% of keyspace)
+//   ...
+//   Bucket 255: Contacts where distance has 255 leading zeros (closest)
+//
+// Anti-Eclipse Protection:
+//   RoutingInsertionLimiter uses token-bucket rate limiting to prevent
+//   a single peer from flooding the routing table with contacts (Sybil/Eclipse attack).
+//
+// Bucket Refresh:
+//   Stale buckets (no activity for BUCKET_STALE_THRESHOLD) trigger random lookups
+//   within that bucket's keyspace to discover new contacts.
+
+/// Interval between bucket refresh checks.
+/// Buckets without activity for this long will trigger random lookups.
+const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Threshold after which a bucket is considered stale and needs refresh.
+const BUCKET_STALE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
+
+/// Maximum routing insertions per peer per rate window.
+/// SECURITY: Prevents eclipse attacks by limiting how fast any peer can
+/// populate the routing table with (potentially Sybil) contacts.
+const ROUTING_INSERTION_PER_PEER_LIMIT: usize = 50;
+
+/// Time window for insertion rate limiting.
+const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum peers to track for insertion rate limiting.
+/// Uses LRU eviction when full.
+const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
+
+
+#[derive(Debug, Clone, Copy)]
+struct RoutingInsertionBucket {
+    tokens: f64,
+    last_update: Instant,
+}
+
+impl RoutingInsertionBucket {
+    fn new() -> Self {
+        Self {
+            tokens: ROUTING_INSERTION_PER_PEER_LIMIT as f64,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        let window_secs = ROUTING_INSERTION_RATE_WINDOW.as_secs_f64();
+        
+        let rate = ROUTING_INSERTION_PER_PEER_LIMIT as f64 / window_secs;
+        self.tokens = (self.tokens + elapsed * rate).min(ROUTING_INSERTION_PER_PEER_LIMIT as f64);
+        self.last_update = now;
+        
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct RoutingInsertionLimiter {
+    buckets: LruCache<Identity, RoutingInsertionBucket>,
+}
+
+impl RoutingInsertionLimiter {
+    pub fn new() -> Self {
+        Self {
+            buckets: LruCache::new(
+                NonZeroUsize::new(MAX_ROUTING_INSERTION_TRACKED_PEERS).unwrap()
+            ),
+        }
+    }
+
+    pub fn allow_insertion(&mut self, from_peer: &Identity) -> bool {
+        let bucket = self.buckets.get_or_insert_mut(*from_peer, RoutingInsertionBucket::new);
+        bucket.try_consume()
+    }
+    
+    #[cfg(test)]
+    pub fn remaining_tokens(&mut self, peer: &Identity) -> f64 {
+        if let Some(bucket) = self.buckets.get(peer) {
+            bucket.tokens
+        } else {
+            ROUTING_INSERTION_PER_PEER_LIMIT as f64
+        }
+    }
+}
+
+
+#[derive(Debug, Clone)]
+struct RoutingBucket {
+    contacts: Vec<Contact>,
+    last_refresh: Instant,
+}
+
+impl Default for RoutingBucket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+enum BucketTouchOutcome {
+    Inserted,
+    Refreshed,
+    Full {
+        new_contact: Box<Contact>,
+        oldest: Box<Contact>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PendingBucketUpdate {
+    bucket_index: usize,
+    oldest: Contact,
+    new_contact: Contact,
+}
+
+impl RoutingBucket {
+    fn new() -> Self {
+        Self {
+            contacts: Vec::new(),
+            last_refresh: Instant::now(),
+        }
+    }
+
+    fn mark_refreshed(&mut self) {
+        self.last_refresh = Instant::now();
+    }
+
+    fn is_stale(&self, threshold: Duration) -> bool {
+        self.last_refresh.elapsed() > threshold
+    }
+
+    fn touch(&mut self, contact: Contact, k: usize) -> BucketTouchOutcome {
+        if let Some(pos) = self.contacts.iter().position(|c| c.identity == contact.identity) {
+            let existing = self.contacts.remove(pos);
+            // Prefer signed/newer contact over unsigned/older one
+            let updated = if contact.signature.len() > existing.signature.len()
+                || (contact.signature.len() == existing.signature.len()
+                    && contact.timestamp > existing.timestamp)
+            {
+                contact
+            } else {
+                existing
+            };
+            self.contacts.push(updated);
+            self.mark_refreshed();
+            return BucketTouchOutcome::Refreshed;
+        }
+
+        if self.contacts.len() < k {
+            self.contacts.push(contact);
+            self.mark_refreshed();
+            BucketTouchOutcome::Inserted
+        } else {
+            debug_assert!(!self.contacts.is_empty(), "bucket len >= k but contacts empty");
+            let oldest = self
+                .contacts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| contact.clone());
+            BucketTouchOutcome::Full {
+                new_contact: Box::new(contact),
+                oldest: Box::new(oldest),
+            }
+        }
+    }
+
+    fn refresh(&mut self, id: &Identity) -> bool {
+        if let Some(pos) = self.contacts.iter().position(|c| &c.identity == id) {
+            let existing = self.contacts.remove(pos);
+            self.contacts.push(existing);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove(&mut self, id: &Identity) -> bool {
+        if let Some(pos) = self.contacts.iter().position(|c| &c.identity == id) {
+            self.contacts.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+
+fn bucket_index(self_id: &Identity, other: &Identity) -> usize {
+    let dist = xor_distance(self_id, other);
+    for (byte_idx, byte) in dist.iter().enumerate() {
+        if *byte != 0 {
+            let leading = byte.leading_zeros() as usize;
+            let bit_index = byte_idx * 8 + leading;
+            return bit_index;
+        }
+    }
+    255
+}
+
+fn random_id_for_bucket(self_id: &Identity, bucket_idx: usize) -> Identity {
+    let self_bytes = self_id.as_bytes();
+    
+    let mut distance = [0u8; 32];
+    if getrandom::getrandom(&mut distance).is_err() {
+        for (i, byte) in distance.iter_mut().enumerate() {
+            *byte = self_bytes[i].wrapping_add((bucket_idx.wrapping_mul(i + 1)) as u8);
+        }
+    }
+
+    let byte_idx = bucket_idx / 8;
+    let bit_pos = bucket_idx % 8;
+
+    for byte in distance.iter_mut().take(byte_idx) {
+        *byte = 0;
+    }
+
+    let target_bit = 0x80u8 >> bit_pos;
+    let random_mask = target_bit.wrapping_sub(1);
+    distance[byte_idx] = target_bit | (distance[byte_idx] & random_mask);
+
+    let mut target = [0u8; 32];
+    for i in 0..32 {
+        target[i] = self_bytes[i] ^ distance[i];
+    }
+
+    Identity::from_bytes(target)
+}
+
+
+#[derive(Debug)]
+pub struct RoutingTable {
+    self_id: Identity,
+    k: usize,
+    buckets: Vec<RoutingBucket>,
+}
+
+impl RoutingTable {
+    pub fn new(self_id: Identity, k: usize) -> Self {
+        let mut buckets = Vec::with_capacity(256);
+        for _ in 0..256 {
+            buckets.push(RoutingBucket::new());
+        }
+        Self {
+            self_id,
+            k,
+            buckets,
+        }
+    }
+
+    pub fn set_k(&mut self, k: usize) {
+        self.k = k;
+        for bucket in &mut self.buckets {
+            if bucket.contacts.len() > self.k {
+                while bucket.contacts.len() > self.k {
+                    bucket.contacts.remove(0);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn update(&mut self, contact: Contact) {
+        let _ = self.update_with_pending(contact);
+    }
+
+    fn update_with_pending(&mut self, contact: Contact) -> Option<PendingBucketUpdate> {
+        if contact.identity == self.self_id {
+            return None;
+        }
+        let idx = bucket_index(&self.self_id, &contact.identity);
+        match self.buckets[idx].touch(contact, self.k) {
+            BucketTouchOutcome::Inserted | BucketTouchOutcome::Refreshed => None,
+            BucketTouchOutcome::Full {
+                new_contact,
+                oldest,
+            } => Some(PendingBucketUpdate {
+                bucket_index: idx,
+                oldest: *oldest,
+                new_contact: *new_contact,
+            }),
+        }
+    }
+
+    pub fn closest(&self, target: &Identity, k: usize) -> Vec<Contact> {
+        if k == 0 {
+            return Vec::new();
+        }
+
+        #[derive(Eq, PartialEq)]
+        struct DistEndpointInfo {
+            dist: [u8; 32],
+            contact: Contact,
+        }
+        
+        impl Ord for DistEndpointInfo {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                distance_cmp(&self.dist, &other.dist)
+            }
+        }
+        
+        impl PartialOrd for DistEndpointInfo {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap: BinaryHeap<DistEndpointInfo> = BinaryHeap::with_capacity(k + 1);
+
+        for bucket in &self.buckets {
+            for contact in &bucket.contacts {
+                let dist = xor_distance(&contact.identity, target);
+                
+                if heap.len() < k {
+                    heap.push(DistEndpointInfo { dist, contact: contact.clone() });
+                } else if let Some(max_entry) = heap.peek() {
+                    if distance_cmp(&dist, &max_entry.dist) == std::cmp::Ordering::Less {
+                        heap.push(DistEndpointInfo { dist, contact: contact.clone() });
+                        heap.pop();
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<_> = heap.into_iter().map(|dc| dc.contact).collect();
+        result.sort_by(|a, b| {
+            let da = xor_distance(&a.identity, target);
+            let db = xor_distance(&b.identity, target);
+            distance_cmp(&da, &db)
+        });
+        result
+    }
+
+    fn apply_ping_result(&mut self, pending: PendingBucketUpdate, oldest_alive: bool) {
+        let bucket = &mut self.buckets[pending.bucket_index];
+        if oldest_alive {
+            bucket.refresh(&pending.oldest.identity);
+            return;
+        }
+
+        let _ = bucket.remove(&pending.oldest.identity);
+        let already_present = bucket
+            .contacts
+            .iter()
+            .any(|contact| contact.identity == pending.new_contact.identity);
+        if already_present {
+            return;
+        }
+        if bucket.contacts.len() < self.k {
+            bucket.contacts.push(pending.new_contact);
+        }
+    }
+
+    fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| !bucket.contacts.is_empty() && bucket.is_stale(threshold))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn mark_bucket_refreshed(&mut self, bucket_idx: usize) {
+        if bucket_idx < self.buckets.len() {
+            self.buckets[bucket_idx].mark_refreshed();
+        }
+    }
+
+    /// Look up a contact by identity.
+    /// Returns the contact if found in the routing table, None otherwise.
+    fn lookup_contact(&self, identity: &Identity) -> Option<Contact> {
+        if *identity == self.self_id {
+            return None;
+        }
+        let idx = bucket_index(&self.self_id, identity);
+        self.buckets[idx]
+            .contacts
+            .iter()
+            .find(|c| c.identity == *identity)
+            .cloned()
+    }
+}
+
+
+// ============================================================================
+// Local Storage (DHT Key-Value Store)
+// ============================================================================
+//
+// Local storage for DHT key-value pairs with pressure-based eviction and per-peer quotas.
+//
+// Features:
+// - LRU cache with configurable capacity limits
+// - Pressure-based eviction when resource limits are approached
+// - Per-peer storage quotas and rate limiting to prevent abuse
+// - Automatic expiration of stale entries
+
+/// Key type for DHT storage (32-byte hash).
+pub type Key = [u8; 32];
+
+/// Default time-to-live for stored entries (24 hours).
+const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often to check for expired entries.
+const EXPIRATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Soft limit for total storage bytes (8 MiB).
+/// Exceeding this contributes to storage pressure score.
+const PRESSURE_DISK_SOFT_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Soft limit for memory usage (4 MiB).
+/// Used in pressure calculation alongside disk limit.
+const PRESSURE_MEMORY_SOFT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Time window for counting storage requests.
+const PRESSURE_REQUEST_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum requests per window before pressure increases.
+const PRESSURE_REQUEST_LIMIT: usize = 200;
+
+/// Pressure threshold (0.0-1.0) that triggers proactive eviction.
+/// At 0.75, eviction starts before hard limits are reached.
+const PRESSURE_THRESHOLD: f32 = 0.75;
+
+/// Maximum size of a single stored value.
+/// SECURITY: Prevents memory exhaustion from large value storage.
+const MAX_VALUE_SIZE: usize = crate::messages::MAX_VALUE_SIZE;
+
+/// Maximum bytes a single peer can store (1 MiB per-peer quota).
+/// SECURITY: Prevents a single peer from monopolizing storage.
+const PER_PEER_STORAGE_QUOTA: usize = 1024 * 1024;
+
+/// Maximum entries a single peer can store.
+/// SECURITY: Complements byte quota to limit entry count attacks.
+const PER_PEER_ENTRY_LIMIT: usize = 100;
+
+/// Maximum store requests per peer per window.
+/// SECURITY: Rate limits storage operations per peer.
+const PER_PEER_RATE_LIMIT: usize = 20;
+
+/// Time window for per-peer rate limiting.
+const PER_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Access count below which entries are considered unpopular for eviction.
+/// Low-popularity entries are evicted first under pressure.
+const POPULARITY_THRESHOLD: u32 = 3;
+
+/// Maximum number of peers to track storage stats for.
+/// SECURITY: Bounded LruCache prevents quota tracking table growth.
+const MAX_TRACKED_PEERS: usize = 10_000;
+
+/// Maximum entries in the local store.
+/// SCALABILITY: 100K entries is the per-node DHT storage limit (see README).
+/// SECURITY: Hard cap on DHT storage entry count.
+const LOCAL_STORE_MAX_ENTRIES: usize = 100_000;
+
+/// Safety limit on eviction loop iterations.
+/// Prevents runaway eviction loops from blocking the actor.
+const MAX_EVICTION_ITERATIONS: usize = 10_000;
+
+/// Monitors resource pressure to trigger eviction when limits are approached.
+struct PressureMonitor {
+    current_bytes: usize,
+    requests: VecDeque<Instant>,
+    request_window: Duration,
+    request_limit: usize,
+    disk_limit: usize,
+    memory_limit: usize,
+    current_pressure: f32,
+}
+
+impl PressureMonitor {
+    pub fn new() -> Self {
+        Self {
+            current_bytes: 0,
+            requests: VecDeque::new(),
+            request_window: PRESSURE_REQUEST_WINDOW,
+            request_limit: PRESSURE_REQUEST_LIMIT,
+            disk_limit: PRESSURE_DISK_SOFT_LIMIT,
+            memory_limit: PRESSURE_MEMORY_SOFT_LIMIT,
+            current_pressure: 0.0,
+        }
+    }
+
+    pub fn record_store(&mut self, bytes: usize) {
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
+    }
+
+    pub fn record_evict(&mut self, bytes: usize) {
+        self.current_bytes = self.current_bytes.saturating_sub(bytes);
+    }
+
+    pub fn record_spill(&mut self) {
+        self.current_pressure = 1.0;
+    }
+
+    pub fn record_request(&mut self) {
+        let now = Instant::now();
+        self.requests.push_back(now);
+        self.trim_requests(now);
+    }
+
+    fn trim_requests(&mut self, now: Instant) {
+        while let Some(front) = self.requests.front() {
+            if now.duration_since(*front) > self.request_window {
+                self.requests.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn update_pressure(&mut self, stored_keys: usize) {
+        let disk_ratio = self.current_bytes as f32 / self.disk_limit as f32;
+        let memory_ratio = self.current_bytes as f32 / self.memory_limit as f32;
+        let request_ratio = self.requests.len() as f32 / self.request_limit as f32;
+        let combined = (disk_ratio + memory_ratio + request_ratio) / 3.0;
+        if combined > 1.0 {
+            self.current_pressure = 1.0;
+        } else if combined < 0.0 {
+            self.current_pressure = 0.0;
+        } else {
+            self.current_pressure = combined;
+        }
+
+        if stored_keys == 0 {
+            self.current_pressure = self.current_pressure.min(1.0);
+        }
+    }
+
+    pub fn current_pressure(&self) -> f32 {
+        self.current_pressure
+    }
+}
+
+/// A stored entry with metadata for expiration and access tracking.
+#[derive(Clone)]
+struct StoredEntry {
+    value: Vec<u8>,
+    expires_at: Instant,
+    stored_by: Identity,
+    access_count: u32,
+    stored_at: Instant,
+}
+
+/// Per-peer storage statistics for quota enforcement.
+#[derive(Debug, Clone, Default)]
+struct PeerStorageStats {
+    bytes_stored: usize,
+    entry_count: usize,
+    store_requests: VecDeque<Instant>,
+}
+
+impl PeerStorageStats {
+    fn can_store(&self, value_size: usize) -> bool {
+        self.bytes_stored + value_size <= PER_PEER_STORAGE_QUOTA
+            && self.entry_count < PER_PEER_ENTRY_LIMIT
+    }
+
+    fn is_rate_limited(&mut self) -> bool {
+        let now = Instant::now();
+        while let Some(front) = self.store_requests.front() {
+            if now.duration_since(*front) > PER_PEER_RATE_WINDOW {
+                self.store_requests.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.store_requests.len() >= PER_PEER_RATE_LIMIT
+    }
+
+    fn record_store(&mut self, value_size: usize) {
+        self.bytes_stored = self.bytes_stored.saturating_add(value_size);
+        self.entry_count = self.entry_count.saturating_add(1);
+        self.store_requests.push_back(Instant::now());
+    }
+
+    fn record_evict(&mut self, value_size: usize) {
+        self.bytes_stored = self.bytes_stored.saturating_sub(value_size);
+        self.entry_count = self.entry_count.saturating_sub(1);
+    }
+}
+
+/// Reason a store request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreRejection {
+    /// Value exceeds maximum allowed size.
+    ValueTooLarge,
+    /// Peer has exceeded their storage quota.
+    QuotaExceeded,
+    /// Peer is sending requests too quickly.
+    RateLimited,
+}
+
+/// Local key-value store with LRU eviction and per-peer quotas.
+///
+/// Provides storage for DHT entries with:
+/// - Automatic expiration based on TTL
+/// - Pressure-based eviction when resource limits are approached
+/// - Per-peer quotas to prevent any single peer from monopolizing storage
+/// - Rate limiting to prevent store request flooding
+struct LocalStore {
+    cache: LruCache<Key, StoredEntry>,
+    pressure: PressureMonitor,
+    /// Per-peer storage statistics for quota enforcement.
+    /// SECURITY: Bounded by MAX_TRACKED_PEERS to prevent memory exhaustion
+    /// from attackers using many identities.
+    peer_stats: LruCache<Identity, PeerStorageStats>,
+    ttl: Duration,
+    last_expiration_check: Instant,
+    last_peer_cleanup: Instant,
+}
+
+impl LocalStore {
+    pub fn new() -> Self {
+        let cap = NonZeroUsize::new(LOCAL_STORE_MAX_ENTRIES).expect("capacity must be non-zero");
+        let peer_stats_cap = NonZeroUsize::new(MAX_TRACKED_PEERS).expect("peer stats capacity must be non-zero");
+        Self {
+            cache: LruCache::new(cap),
+            pressure: PressureMonitor::new(),
+            peer_stats: LruCache::new(peer_stats_cap),
+            ttl: DEFAULT_TTL,
+            last_expiration_check: Instant::now(),
+            last_peer_cleanup: Instant::now(),
+        }
+    }
+
+    /// Record an incoming request and perform periodic maintenance.
+    pub fn record_request(&mut self) {
+        self.pressure.record_request();
+        self.maybe_expire_entries();
+        self.maybe_cleanup_peer_stats();
+        let len = self.cache.len();
+        self.pressure.update_pressure(len);
+    }
+
+    /// Check if a store request from the given peer would be allowed.
+    pub fn check_store_allowed(&mut self, peer_id: &Identity, value_size: usize) -> Result<(), StoreRejection> {
+        if value_size > MAX_VALUE_SIZE {
+            debug!(
+                peer = ?hex::encode(&peer_id.as_bytes()[..8]),
+                size = value_size,
+                max = MAX_VALUE_SIZE,
+                "store rejected: value too large"
+            );
+            return Err(StoreRejection::ValueTooLarge);
+        }
+
+        let stats = self.peer_stats.get_or_insert_mut(*peer_id, PeerStorageStats::default);
+
+        if stats.is_rate_limited() {
+            debug!(
+                peer = ?hex::encode(&peer_id.as_bytes()[..8]),
+                "store rejected: rate limited"
+            );
+            return Err(StoreRejection::RateLimited);
+        }
+
+        if !stats.can_store(value_size) {
+            debug!(
+                peer = ?hex::encode(&peer_id.as_bytes()[..8]),
+                bytes_stored = stats.bytes_stored,
+                entry_count = stats.entry_count,
+                "store rejected: quota exceeded"
+            );
+            return Err(StoreRejection::QuotaExceeded);
+        }
+
+        Ok(())
+    }
+
+    /// Store a key-value pair, returning any entries that were evicted due to pressure.
+    pub fn store(&mut self, key: Key, value: &[u8], stored_by: Identity) -> Vec<(Key, Vec<u8>)> {
+        if value.len() > MAX_VALUE_SIZE {
+            warn!(
+                size = value.len(),
+                limit = MAX_VALUE_SIZE,
+                peer = ?stored_by,
+                "rejecting oversized value"
+            );
+            return Vec::new();
+        }
+
+        if let Err(rejection) = self.check_store_allowed(&stored_by, value.len()) {
+            info!(peer = ?stored_by, reason = ?rejection, "store request rejected");
+            return Vec::new();
+        }
+
+        if let Some(existing) = self.cache.pop(&key) {
+            self.pressure.record_evict(existing.value.len());
+            if let Some(old_stats) = self.peer_stats.get_mut(&existing.stored_by) {
+                old_stats.record_evict(existing.value.len());
+            }
+        }
+
+        let now = Instant::now();
+        let entry = StoredEntry {
+            value: value.to_vec(),
+            expires_at: now + self.ttl,
+            stored_by,
+            access_count: 0,
+            stored_at: now,
+        };
+
+        let stats = self.peer_stats.get_or_insert_mut(stored_by, PeerStorageStats::default);
+        stats.record_store(entry.value.len());
+
+        self.pressure.record_store(entry.value.len());
+        self.cache.put(key, entry);
+        self.pressure.update_pressure(self.cache.len());
+
+        self.evict_under_pressure()
+    }
+
+    /// Evict entries until pressure drops below threshold.
+    fn evict_under_pressure(&mut self) -> Vec<(Key, Vec<u8>)> {
+        let mut spilled = Vec::new();
+        let mut spill_happened = false;
+        let mut iterations = 0;
+
+        while self.pressure.current_pressure() > PRESSURE_THRESHOLD {
+            iterations += 1;
+            if iterations > MAX_EVICTION_ITERATIONS {
+                warn!(
+                    iterations = iterations,
+                    pressure = self.pressure.current_pressure(),
+                    cache_size = self.cache.len(),
+                    "eviction loop exceeded max iterations, breaking"
+                );
+                break;
+            }
+
+            let unpopular_key = self.find_unpopular_entry();
+
+            if let Some(key) = unpopular_key {
+                if let Some(evicted_entry) = self.cache.pop(&key) {
+                    self.pressure.record_evict(evicted_entry.value.len());
+                    if let Some(stats) = self.peer_stats.get_mut(&evicted_entry.stored_by) {
+                        stats.record_evict(evicted_entry.value.len());
+                    }
+                    self.pressure.update_pressure(self.cache.len());
+                    spilled.push((key, evicted_entry.value));
+                    spill_happened = true;
+                    continue;
+                }
+            }
+
+            if let Some((evicted_key, evicted_entry)) = self.cache.pop_lru() {
+                self.pressure.record_evict(evicted_entry.value.len());
+                if let Some(stats) = self.peer_stats.get_mut(&evicted_entry.stored_by) {
+                    stats.record_evict(evicted_entry.value.len());
+                }
+                self.pressure.update_pressure(self.cache.len());
+                spilled.push((evicted_key, evicted_entry.value));
+                spill_happened = true;
+            } else {
+                break;
+            }
+        }
+
+        if spill_happened {
+            warn!(
+                spilled_count = spilled.len(),
+                pressure = self.pressure.current_pressure(),
+                "pressure-based eviction triggered"
+            );
+            self.pressure.record_spill();
+        }
+
+        spilled
+    }
+
+    /// Find the least popular entry for eviction.
+    fn find_unpopular_entry(&self) -> Option<Key> {
+        self.cache
+            .iter()
+            .filter(|(_, entry)| entry.access_count < POPULARITY_THRESHOLD)
+            .min_by_key(|(_, entry)| (entry.access_count, entry.stored_at))
+            .map(|(key, _)| *key)
+    }
+
+    /// Get a value by key, returning None if not found or expired.
+    pub fn get(&mut self, key: &Key) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        if let Some(entry) = self.cache.get_mut(key) {
+            if now < entry.expires_at {
+                entry.access_count = entry.access_count.saturating_add(1);
+                return Some(entry.value.clone());
+            }
+        }
+        
+        if let Some(expired) = self.cache.pop(key) {
+            self.pressure.record_evict(expired.value.len());
+            if let Some(stats) = self.peer_stats.get_mut(&expired.stored_by) {
+                stats.record_evict(expired.value.len());
+            }
+        }
+        None
+    }
+
+    /// Periodically clean up stale peer stats to bound memory.
+    /// With LruCache, old entries are automatically evicted when capacity is reached,
+    /// so this just ensures we don't have excessively stale entries.
+    fn maybe_cleanup_peer_stats(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_peer_cleanup) < Duration::from_secs(300) {
+            return;
+        }
+        self.last_peer_cleanup = now;
+
+        // LruCache automatically evicts when at capacity, so we just need to
+        // identify and remove truly empty entries. Collect keys first to avoid
+        // borrow issues.
+        let empty_peers: Vec<Identity> = self.peer_stats
+            .iter()
+            .filter(|(_, stats)| stats.entry_count == 0 && stats.store_requests.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        
+        for peer_id in empty_peers {
+            self.peer_stats.pop(&peer_id);
+        }
+    }
+
+    /// Remove expired entries from the cache.
+    fn maybe_expire_entries(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_expiration_check) < EXPIRATION_CHECK_INTERVAL {
+            return;
+        }
+        self.last_expiration_check = now;
+
+        let expired_keys: Vec<Key> = self
+            .cache
+            .iter()
+            .filter_map(|(key, entry)| {
+                if now >= entry.expires_at {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !expired_keys.is_empty() {
+            debug!(
+                expired_count = expired_keys.len(),
+                "removing expired entries"
+            );
+        }
+        for key in expired_keys {
+            if let Some(entry) = self.cache.pop(&key) {
+                self.pressure.record_evict(entry.value.len());
+                if let Some(stats) = self.peer_stats.get_mut(&entry.stored_by) {
+                    stats.record_evict(entry.value.len());
+                }
+            }
+        }
+    }
+
+    /// Get the current storage pressure (0.0 to 1.0).
+    pub fn current_pressure(&self) -> f32 {
+        self.pressure.current_pressure()
+    }
+
+    /// Get the number of entries currently stored.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+
 /// Window size for query statistics used in adaptive parameter tuning.
 const QUERY_STATS_WINDOW: usize = 100;
 
@@ -122,7 +1007,7 @@ const QUERY_STATS_WINDOW: usize = 100;
 /// Tracks query success/failure history to dynamically adjust:
 /// - `k`: Replication factor (number of contacts per bucket)
 /// - `alpha`: Concurrency factor (parallel queries during lookup)
-pub(crate) struct AdaptiveParams {
+struct AdaptiveParams {
     k: usize,
     alpha: usize,
     churn_history: VecDeque<bool>,
@@ -247,11 +1132,11 @@ const MAX_TIERING_TRACKED_PREFIXES: usize = 10_000;
 pub struct TieringLevel(usize);
 
 impl TieringLevel {
-    pub(crate) fn new(index: usize) -> Self {
+    fn new(index: usize) -> Self {
         Self(index)
     }
 
-    pub(crate) fn index(self) -> usize {
+    fn index(self) -> usize {
         self.0
     }
 }
@@ -334,7 +1219,7 @@ impl PrefixRttStats {
 /// - O(1) memory per prefix (~512KB for entire IPv4 space)
 /// - Immediate RTT estimates for unseen peers in known prefixes
 /// - Linear scaling to millions of nodes
-pub(crate) struct TieringManager {
+struct TieringManager {
     /// /16 prefix → RTT statistics (LRU cache, bounded by MAX_TIERING_TRACKED_PREFIXES)
     prefix_rtt: LruCache<Prefix16, PrefixRttStats>,
     /// /16 prefix → tier assignment.
@@ -827,7 +1712,9 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let _ = self.cmd_tx.send(Command::HandleStore(from.clone(), key, value)).await;
     }
 
-    async fn record_rtt(&self, contact: &Contact, elapsed: Duration) {
+    /// Record an RTT measurement for a contact (used for tiering).
+    /// This is fire-and-forget; failures are silently ignored.
+    pub async fn record_rtt(&self, contact: &Contact, elapsed: Duration) {
         let _ = self.cmd_tx.send(Command::RecordRtt(contact.clone(), elapsed)).await;
     }
 
@@ -1278,14 +2165,13 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         &self,
         keypair: &Keypair,
         new_addrs: Vec<String>,
-        relays: Vec<Identity>,
     ) -> Result<()> {
         debug!(
             "republishing address after network change: {:?}",
             new_addrs
         );
 
-        let record = keypair.create_contact_with_relays(new_addrs, relays);
+        let record = keypair.create_contact(new_addrs);
         let serialized = bincode::serialize(&record)
             .map_err(|e| anyhow!("Failed to serialize endpoint record: {}", e))?;
 
@@ -1622,7 +2508,6 @@ mod tests {
     /// Find three indices whose generated identities have peers 2 and 3 in the same bucket
     /// relative to peer 1. This is needed for bucket eviction tests.
     fn find_same_bucket_indices() -> (u32, u32, u32) {
-        use crate::routing::bucket_index;
         let main_id = make_identity(0);
         for incumbent_idx in 1u32..1000 {
             let incumbent_id = make_identity(incumbent_idx);
@@ -2437,5 +3322,358 @@ mod tests {
             .expect("get should succeed");
 
         assert_eq!(outcome, Some(value));
+    }
+
+    // ========================================================================
+    // Routing Table Unit Tests
+    // ========================================================================
+
+    #[test]
+    fn bucket_index_finds_first_different_bit() {
+        let self_id = Identity::from_bytes([0u8; 32]);
+
+        let mut other_bytes = [0u8; 32];
+        other_bytes[0] = 0b1000_0000;
+        let other = Identity::from_bytes(other_bytes);
+        assert_eq!(bucket_index(&self_id, &other), 0);
+
+        let mut other_two_bytes = [0u8; 32];
+        other_two_bytes[1] = 0b0001_0000;
+        let other_two = Identity::from_bytes(other_two_bytes);
+        assert_eq!(bucket_index(&self_id, &other_two), 11);
+
+        assert_eq!(bucket_index(&self_id, &self_id), 255);
+    }
+
+    #[test]
+    fn random_id_for_bucket_lands_in_correct_bucket() {
+        let self_id = Identity::from_bytes([0x42u8; 32]);
+        for bucket_idx in [0, 1, 7, 8, 15, 127, 200, 255] {
+            for _ in 0..10 {
+                let target = random_id_for_bucket(&self_id, bucket_idx);
+                let actual_bucket = bucket_index(&self_id, &target);
+                assert_eq!(
+                    actual_bucket, bucket_idx,
+                    "random ID for bucket {} landed in bucket {} instead",
+                    bucket_idx, actual_bucket
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routing_insertion_limiter_enforces_per_peer_limit() {
+        let mut limiter = RoutingInsertionLimiter::new();
+        let peer1 = Identity::from_bytes([1u8; 32]);
+        let peer2 = Identity::from_bytes([2u8; 32]);
+
+        for i in 0..ROUTING_INSERTION_PER_PEER_LIMIT {
+            assert!(
+                limiter.allow_insertion(&peer1),
+                "insertion {} from peer1 should be allowed",
+                i
+            );
+        }
+
+        assert!(
+            !limiter.allow_insertion(&peer1),
+            "insertion after limit should be rejected for peer1"
+        );
+
+        assert!(
+            limiter.allow_insertion(&peer2),
+            "peer2 should still be allowed"
+        );
+
+        assert!(
+            limiter.remaining_tokens(&peer1) < 1.0,
+            "peer1 should have no tokens left"
+        );
+
+        let remaining = limiter.remaining_tokens(&peer2);
+        assert!(
+            (remaining - (ROUTING_INSERTION_PER_PEER_LIMIT as f64 - 1.0)).abs() < 0.1,
+            "peer2 should have used one token, has {} remaining",
+            remaining
+        );
+    }
+
+    #[test]
+    fn routing_insertion_limiter_uses_lru_eviction() {
+        let mut limiter = RoutingInsertionLimiter::new();
+        
+        for i in 0..MAX_ROUTING_INSERTION_TRACKED_PEERS {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+            let peer = Identity::from_bytes(bytes);
+            limiter.allow_insertion(&peer);
+        }
+
+        let new_peer = Identity::from_bytes([0xFF; 32]);
+        assert!(limiter.allow_insertion(&new_peer), "new peer should be allowed");
+
+        let remaining = limiter.remaining_tokens(&new_peer);
+        assert!(
+            (remaining - (ROUTING_INSERTION_PER_PEER_LIMIT as f64 - 1.0)).abs() < 0.1,
+            "new peer should have used one token"
+        );
+    }
+
+    #[test]
+    fn routing_table_orders_contacts_by_distance() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 4);
+
+        let contacts = [
+            make_test_contact(0x10),
+            make_test_contact(0x20),
+            make_test_contact(0x08),
+        ];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        let target = make_test_identity(0x18);
+        let closest = table.closest(&target, 3);
+        let ids: Vec<u8> = closest.iter().map(|c| c.identity.as_bytes()[0]).collect();
+        assert_eq!(ids, vec![0x10, 0x08, 0x20]);
+    }
+
+    #[test]
+    fn routing_table_respects_bucket_capacity() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 2);
+
+        let contacts = [
+            make_test_contact(0x80),
+            make_test_contact(0xC0),
+            make_test_contact(0xA0),
+        ];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        let target = make_test_identity(0x90);
+        let closest = table.closest(&target, 10);
+        let ids: Vec<u8> = closest.iter().map(|c| c.identity.as_bytes()[0]).collect();
+        assert_eq!(closest.len(), 2);
+        assert!(ids.contains(&0x80));
+        assert!(ids.contains(&0xC0));
+    }
+
+    #[test]
+    fn routing_table_truncates_when_k_changes() {
+        let self_id = make_test_identity(0x00);
+        let mut table = RoutingTable::new(self_id, 4);
+
+        let contacts = [
+            make_test_contact(0x80),
+            make_test_contact(0x81),
+            make_test_contact(0x82),
+        ];
+        for contact in &contacts {
+            table.update(contact.clone());
+        }
+
+        table.set_k(2);
+        let target = make_test_identity(0x80);
+        let closest = table.closest(&target, 10);
+        assert_eq!(closest.len(), 2);
+    }
+
+    const MAX_K: usize = 30;
+    const NUM_BUCKETS: usize = 256;
+
+    #[test]
+    fn routing_table_size_bounded() {
+        let max_routing_table_size = MAX_K * NUM_BUCKETS;
+        assert_eq!(max_routing_table_size, 7680);
+        assert!(
+            max_routing_table_size < 10_000,
+            "Routing table should be bounded"
+        );
+    }
+
+    #[test]
+    fn sybil_attack_targeted_bucket() {
+        let _target_bucket = 100;
+        let attacker_nodes = 100;
+
+        let nodes_in_bucket = std::cmp::min(attacker_nodes, MAX_K);
+
+        assert_eq!(nodes_in_bucket, 30, "Bucket should accept at most k nodes");
+    }
+
+    #[test]
+    fn sybil_bucket_distribution() {
+        let honest_identity = make_test_identity(0x01);
+
+        let mut bucket_counts = vec![0usize; NUM_BUCKETS];
+
+        for i in 0..1000u32 {
+            let attacker_id = make_test_identity(i.wrapping_mul(7919) as u8);
+            let bucket = bucket_index_for_test(honest_identity.as_bytes(), attacker_id.as_bytes());
+            bucket_counts[bucket] += 1;
+        }
+
+        let non_empty_buckets = bucket_counts.iter().filter(|&&c| c > 0).count();
+
+        assert!(
+            non_empty_buckets >= 5,
+            "Should distribute across multiple buckets, got {} non-empty buckets",
+            non_empty_buckets
+        );
+    }
+
+    #[test]
+    fn bucket_index_calculation_correct() {
+        let self_id = make_test_identity(0x00);
+
+        let same_id = make_test_identity(0x00);
+        assert_eq!(
+            bucket_index_for_test(self_id.as_bytes(), same_id.as_bytes()),
+            255,
+            "Same ID should be in bucket 255"
+        );
+
+        let msb_differs = Identity::from_bytes({
+            let mut b = [0u8; 32];
+            b[0] = 0x80;
+            b
+        });
+        assert_eq!(
+            bucket_index_for_test(self_id.as_bytes(), msb_differs.as_bytes()),
+            0,
+            "MSB differs should be bucket 0"
+        );
+    }
+
+    fn bucket_index_for_test(self_id: &[u8; 32], other: &[u8; 32]) -> usize {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = self_id[i] ^ other[i];
+        }
+
+        for (byte_idx, &byte) in xor.iter().enumerate() {
+            if byte != 0 {
+                let bit_idx = byte.leading_zeros() as usize;
+                return byte_idx * 8 + bit_idx;
+            }
+        }
+
+        255
+    }
+
+    fn make_test_identity(byte: u8) -> Identity {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        Identity::from_bytes(id)
+    }
+
+    fn make_test_contact(byte: u8) -> Contact {
+        Contact::single(make_test_identity(byte), format!("node-{byte}"))
+    }
+
+    #[test]
+    fn routing_table_update_api() {
+        let self_id = make_test_identity(0x00);
+        let mut rt = RoutingTable::new(self_id, 20);
+
+        let peer = make_test_contact(0x80);
+
+        rt.update(peer.clone());
+
+        let closest = rt.closest(&peer.identity, 1);
+        assert_eq!(closest.len(), 1);
+        assert_eq!(closest[0].identity, peer.identity);
+    }
+
+    // ========================================================================
+    // Storage Unit Tests
+    // ========================================================================
+
+    #[test]
+    fn store_and_retrieve() {
+        let mut store = LocalStore::new();
+        let key: Key = [1u8; 32];
+        let value = b"test value";
+        let peer = make_test_identity(0x01);
+
+        let spilled = store.store(key, value, peer);
+        assert!(spilled.is_empty());
+
+        let retrieved = store.get(&key);
+        assert_eq!(retrieved, Some(value.to_vec()));
+    }
+
+    #[test]
+    fn rejects_oversized_value() {
+        let mut store = LocalStore::new();
+        let key: Key = [1u8; 32];
+        let value = vec![0u8; MAX_VALUE_SIZE + 1];
+        let peer = make_test_identity(0x01);
+
+        let spilled = store.store(key, &value, peer);
+        assert!(spilled.is_empty());
+        assert!(store.get(&key).is_none());
+    }
+
+    #[test]
+    fn rate_limiting_works() {
+        let mut store = LocalStore::new();
+        let peer = make_test_identity(0x01);
+
+        // Exhaust rate limit
+        for i in 0..PER_PEER_RATE_LIMIT {
+            let mut key: Key = [0u8; 32];
+            key[0] = i as u8;
+            store.store(key, b"value", peer);
+        }
+
+        // Next store should be rate limited
+        let mut key: Key = [0u8; 32];
+        key[0] = 0xFF;
+        let result = store.check_store_allowed(&peer, 5);
+        assert_eq!(result, Err(StoreRejection::RateLimited));
+    }
+
+    #[test]
+    fn quota_enforcement() {
+        let mut store = LocalStore::new();
+        let peer = make_test_identity(0x01);
+
+        // Store up to entry limit
+        for i in 0..PER_PEER_ENTRY_LIMIT {
+            let mut key: Key = [0u8; 32];
+            key[0] = i as u8;
+            key[1] = (i >> 8) as u8;
+            store.store(key, b"v", peer);
+        }
+
+        // Check that further stores would exceed quota
+        // Note: rate limiting may trigger first depending on timing
+        let result = store.check_store_allowed(&peer, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pressure_monitor_tracks_bytes() {
+        let mut monitor = PressureMonitor::new();
+        assert_eq!(monitor.current_pressure(), 0.0);
+
+        monitor.record_store(1_000_000);
+        monitor.update_pressure(100);
+        assert!(monitor.current_pressure() > 0.0);
+
+        monitor.record_evict(1_000_000);
+        monitor.update_pressure(0);
+        // Pressure should decrease after eviction
+    }
+
+    #[test]
+    fn missing_key_returns_none() {
+        let mut store = LocalStore::new();
+        let key: Key = [99u8; 32];
+        assert!(store.get(&key).is_none());
     }
 }

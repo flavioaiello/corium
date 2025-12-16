@@ -1,7 +1,7 @@
 //! # High-Level Node API
 //!
 //! This module provides the main entry point for using Corium. A [`Node`] combines
-//! all the underlying components (DHT, PubSub, Membership, Relay) into a single
+//! all the underlying components (DHT, PubSub, Relay) into a single
 //! unified interface.
 //!
 //! ## Quick Start
@@ -30,8 +30,7 @@
 //! - **SmartSock**: Multi-path transport (direct UDP, relay tunnels)
 //! - **RpcNode**: QUIC-based RPC for all protocol messages
 //! - **DhtNode**: Kademlia DHT for peer/value lookup
-//! - **HyParView**: Membership protocol maintaining active/passive views
-//! - **PlumTree**: Epidemic broadcast tree for PubSub
+//! - **GossipSub**: Epidemic broadcast for PubSub
 //! - **RelayClient**: NAT traversal via relay servers
 
 use std::net::SocketAddr;
@@ -44,13 +43,12 @@ use tracing::{debug, info, warn};
 
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
 use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
-use crate::storage::Key;
-use crate::hyparview::{HyParView, HyParViewConfig};
-use crate::identity::{Contact, Identity, Keypair};
+use crate::dht::Key;
+use crate::identity::{Contact, Keypair};
 use crate::messages::{Message, RelayResponse};
-use crate::plumtree::{PlumTree, PlumTreeConfig, ReceivedMessage};
+use crate::gossipsub::{GossipSub, GossipSubConfig, ReceivedMessage, RelaySignal};
 use crate::protocols::{DirectRpc, RelayRpc};
-use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection, generate_session_id};
+use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection, generate_session_id, MeshSignalOut};
 use crate::transport::{SmartSock, DIRECT_CONNECT_TIMEOUT};
 use crate::rpc::{self, RpcNode};
 
@@ -62,6 +60,9 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Used for message receivers that should only have one consumer.
 type TakeOnce<T> = tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<T>>>;
 
+// Re-export Identity for public API consumers
+pub use crate::identity::Identity;
+
 pub struct Node {
     keypair: Keypair,
     endpoint: Endpoint,
@@ -69,10 +70,9 @@ pub struct Node {
     contact: Contact,
     dhtnode: DhtNode<RpcNode>,
     rpcnode: RpcNode,
-    hyparview: HyParView<RpcNode>,
-    plumtree: PlumTree<RpcNode>,
-    relay_client: RelayClient,
-    plumtree_receiver: TakeOnce<ReceivedMessage>,
+    gossipsub: GossipSub<RpcNode>,
+    relay_client: Arc<RelayClient>,
+    gossipsub_receiver: TakeOnce<ReceivedMessage>,
     direct_receiver: TakeOnce<(Identity, Vec<u8>)>,
     listener: tokio::task::JoinHandle<Result<()>>,
 }
@@ -121,19 +121,15 @@ impl Node {
             DEFAULT_ALPHA,
         );
         
-        // Initialize relay server (shares socket with SmartSock)
-        let relay = Relay::with_socket(smartsock.inner_socket().clone());
+        // Create channel for relay server → mesh signaling (outbound signals)
+        let (mesh_out_tx, mut mesh_out_rx) = tokio::sync::mpsc::channel::<MeshSignalOut>(32);
+        
+        // Initialize relay server (shares socket with SmartSock, uses mesh-only signaling)
+        let relay = Relay::with_socket(smartsock.inner_socket().clone(), mesh_out_tx);
         smartsock.set_udprelay(relay);
-        info!("UDP relay server sharing port {}", local_addr);
+        info!("UDP relay server sharing port {} (mesh-only signaling)", local_addr);
         
-        let hyparview = HyParView::spawn(identity, HyParViewConfig::default(), Arc::new(rpcnode.clone()));
-        
-        let (plumtree, plumtree_rx) = PlumTree::spawn(Arc::new(rpcnode.clone()), keypair.clone(), PlumTreeConfig::default());
-        let plumtree_receiver = tokio::sync::Mutex::new(Some(plumtree_rx));
-        
-        hyparview.set_neighbor_callback(Arc::new(plumtree.clone())).await;
-        
-        // Create relay client for NAT traversal
+        // Create relay client for NAT traversal (before GossipSub so we can wire up mesh signaling)
         let relay_client = RelayClient::new(
             Arc::new(rpcnode.clone()),
             dhtnode.clone(),
@@ -141,12 +137,61 @@ impl Node {
             local_addr,
         );
         
+        // Create channel for mesh-mediated relay signaling (inbound signals to RelayClient)
+        let (relay_signal_tx, mut relay_signal_rx) = tokio::sync::mpsc::channel::<RelaySignal>(32);
+        
+        // GossipSub with DHT and relay signaling integration
+        let (gossipsub, gossipsub_rx) = GossipSub::spawn(
+            Arc::new(rpcnode.clone()), 
+            keypair.clone(), 
+            GossipSubConfig::default(),
+            dhtnode.clone(),
+            relay_signal_tx,
+        );
+        let gossipsub_receiver = tokio::sync::Mutex::new(Some(gossipsub_rx));
+        
+        // Wrap relay_client in Arc for sharing with mesh signaling task
+        let relay_client = Arc::new(relay_client);
+        
+        // Wire up mesh signaling: forward RelaySignal messages from GossipSub to RelayClient
+        {
+            let relay_client = relay_client.clone();
+            tokio::spawn(async move {
+                while let Some(signal) = relay_signal_rx.recv().await {
+                    if let Err(e) = relay_client.receive_mesh_signal(
+                        signal.from_peer,
+                        signal.session_id,
+                        signal.relay_data_addr,
+                    ).await {
+                        debug!("failed to process mesh relay signal: {}", e);
+                    }
+                }
+            });
+        }
+        
+        // Wire up mesh signaling: forward MeshSignalOut from RelayServer to GossipSub
+        // When the relay server needs to signal a NAT peer, it sends via the mesh network.
+        {
+            let gossipsub_clone = gossipsub.clone();
+            tokio::spawn(async move {
+                while let Some(signal) = mesh_out_rx.recv().await {
+                    if let Err(e) = gossipsub_clone.send_relay_signal(
+                        signal.target,
+                        signal.from_peer,
+                        signal.session_id,
+                        signal.relay_data_addr,
+                    ).await {
+                        debug!("failed to send relay signal via mesh: {}", e);
+                    }
+                }
+            });
+        }
+        
         let listener = {
             let endpoint = endpoint.clone();
             let dhtnode = dhtnode.clone();
             let smartsock = smartsock.clone();
-            let plumtree = plumtree.clone();
-            let hyparview = hyparview.clone();
+            let gossipsub = gossipsub.clone();
             
             let (direct_tx, direct_rx) = tokio::sync::mpsc::channel::<(Identity, Vec<u8>)>(256);
             let direct_receiver = tokio::sync::Mutex::new(Some(direct_rx));
@@ -154,12 +199,11 @@ impl Node {
             let listen = tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
                     let node = dhtnode.clone();
-                    let plumtree = Some(plumtree.clone());
+                    let gossipsub = Some(gossipsub.clone());
                     let ss = Some(smartsock.clone());
-                    let hv = hyparview.clone();
                     let direct_tx = Some(direct_tx.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = rpc::handle_connection(node, plumtree, ss, incoming, hv, direct_tx).await {
+                        if let Err(e) = rpc::handle_connection(node, gossipsub, ss, incoming, direct_tx).await {
                             warn!("connection error: {:?}", e);
                         }
                     });
@@ -179,10 +223,9 @@ impl Node {
             contact,
             dhtnode,
             rpcnode,
-            hyparview,
-            plumtree,
+            gossipsub,
             relay_client,
-            plumtree_receiver,
+            gossipsub_receiver,
             direct_receiver: listener.1,
             listener: listener.0,
         })
@@ -220,6 +263,30 @@ impl Node {
         &self.smartsock
     }
 
+    /// Check if communication with a peer is currently routed through a relay.
+    /// 
+    /// Returns `true` if the peer is registered in SmartSock and using a relay path,
+    /// `false` if using direct path or peer is not registered.
+    /// 
+    /// # Arguments
+    /// * `identity` - The peer's identity to check
+    #[cfg(test)]
+    pub async fn is_peer_relayed(&self, identity: &Identity) -> bool {
+        self.smartsock.is_peer_relayed(identity).await
+    }
+
+    /// Get the active relay session ID for a peer, if using relay path.
+    /// 
+    /// Returns `Some(session_id)` if the peer is using a relay path,
+    /// `None` if using direct path or peer is not registered.
+    /// 
+    /// # Arguments
+    /// * `identity` - The peer's identity to check
+    #[cfg(test)]
+    pub async fn peer_relay_session(&self, identity: &Identity) -> Option<[u8; 16]> {
+        self.smartsock.peer_relay_session(identity).await
+    }
+
     /// Get the relay handle for this node.
     /// 
     /// All nodes run an embedded relay server that shares the QUIC socket.
@@ -247,16 +314,6 @@ impl Node {
     
     pub async fn publish_address(&self, addresses: Vec<String>) -> Result<()> {
         self.dhtnode.publish_address(&self.keypair, addresses).await
-    }
-    
-    pub async fn publish_address_with_relays(
-        &self,
-        addresses: Vec<String>,
-        relays: Vec<Identity>,
-    ) -> Result<()> {
-        self.dhtnode
-            .republish_on_network_change(&self.keypair, addresses, relays)
-            .await
     }
     
     pub async fn relay_endpoint(&self) -> Option<Contact> {
@@ -341,6 +398,39 @@ impl Node {
         self.relay_client.accept_incoming(incoming).await
     }
 
+    /// Enable mesh-mediated signaling for relay connections.
+    /// 
+    /// This is an alternative to `register_with_relay()` that doesn't require
+    /// maintaining a dedicated signaling connection to the relay. Instead,
+    /// relay signals are forwarded through the GossipSub mesh.
+    /// 
+    /// **Benefits:**
+    /// - Reduces connection overhead for NAT-bound nodes
+    /// - Works as long as you have mesh peers (no relay connectivity needed)
+    /// - Signals can be forwarded by any mesh peer who receives them
+    /// 
+    /// **Trade-offs:**
+    /// - Slightly higher latency (goes through mesh peers)
+    /// - Requires active GossipSub participation
+    /// - Signals may not reach if mesh is partitioned
+    /// 
+    /// # Returns
+    /// A receiver that yields incoming connection notifications, same as
+    /// `register_with_relay()`. Handle them with `accept_incoming()`.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let mut rx = node.enable_mesh_signaling().await;
+    /// while let Some(notification) = rx.recv().await {
+    ///     node.accept_incoming(&notification).await?;
+    /// }
+    /// ```
+    pub async fn enable_mesh_signaling(
+        &self,
+    ) -> tokio::sync::mpsc::Receiver<IncomingConnection> {
+        self.relay_client.enable_mesh_signaling().await
+    }
+
     /// Resolve identity to contact, trying local cache first, then network.
     /// Prefers signed contacts over unsigned ones.
     pub async fn resolve(&self, identity: &Identity) -> Result<Option<Contact>> {
@@ -364,6 +454,27 @@ impl Node {
         self.dhtnode.iterative_find_node(target).await
     }
     
+    /// Find mesh peers that can act as relays (opportunistic mesh relay).
+    /// 
+    /// In the mesh-first relay model, any mesh peer that is reachable by both
+    /// parties can act as a relay. Returns all mesh peers except ourselves.
+    async fn find_mesh_relays(&self) -> Vec<Contact> {
+        let our_id = self.keypair.identity();
+        let mesh_peers = self.gossipsub.mesh_peers().await;
+        
+        let relays: Vec<Contact> = mesh_peers
+            .into_iter()
+            .filter(|c| c.identity != our_id && c.has_direct_addrs())
+            .collect();
+        
+        debug!(
+            mesh_relay_count = relays.len(),
+            "found mesh peers for relay"
+        );
+        
+        relays
+    }
+    
     pub async fn add_peer(&self, endpoint: Contact) {
         self.dhtnode.observe_contact(endpoint).await
     }
@@ -374,9 +485,7 @@ impl Node {
         
         let contact = Contact::single(peer_identity, addr.to_string());
         
-        self.dhtnode.observe_contact(contact.clone()).await;
-        
-        self.hyparview.request_join(contact).await;
+        self.dhtnode.observe_contact(contact).await;
         
         let self_identity = self.keypair.identity();
         self.dhtnode.iterative_find_node(self_identity).await?;
@@ -410,8 +519,6 @@ impl Node {
         debug!(
             peer = %identity,
             addrs = ?contact.addrs,
-            relays = contact.relays.len(),
-            is_relay = contact.is_relay,
             "resolved peer endpoint, attempting connection"
         );
 
@@ -446,126 +553,84 @@ impl Node {
             }
         }
 
-        // Use the peer's designated relays from their published contact
-        if !contact.relays.is_empty() {
+        // Try mesh peers as opportunistic relays (mesh-first relay model)
+        let mesh_relays = self.find_mesh_relays().await;
+        if !mesh_relays.is_empty() {
             debug!(
                 peer = ?peer_id,
-                relay_count = contact.relays.len(),
-                "trying connection via peer's designated relays"
+                mesh_relay_count = mesh_relays.len(),
+                "attempting connection via mesh relay"
             );
-            
-            let our_peer_id = self.keypair.identity();
 
             let direct_addrs = &contact.addrs;
             if direct_addrs.is_empty() {
                 anyhow::bail!("cannot use relay without at least one target address");
             }
-            
-            // Try each designated relay (resolve identity from DHT)
-            let mut last_error = None;
-            for relay_id in &contact.relays {
+
+            let our_peer_id = self.keypair.identity();
+
+            for mesh_relay in mesh_relays {
                 let session_id = match generate_session_id() {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
-                
+
                 debug!(
                     peer = ?peer_id,
-                    relay = ?relay_id,
-                    "attempting connection via designated relay"
+                    mesh_relay = ?mesh_relay.identity,
+                    "attempting mesh relay"
                 );
-                
-                // Resolve relay identity from DHT
-                let relay_contact = match self.dhtnode.lookup_contact(relay_id).await {
-                    Some(c) if !c.addrs.is_empty() => c,
-                    Some(_) => {
-                        debug!(relay = ?relay_id, "relay has no addresses, trying next");
-                        last_error = Some(anyhow::anyhow!("relay has no addresses"));
-                        continue;
-                    }
-                    None => {
-                        debug!(relay = ?relay_id, "failed to resolve relay, trying next");
-                        last_error = Some(anyhow::anyhow!("relay not found"));
-                        continue;
-                    }
-                };
-                
-                let relay_result = tokio::time::timeout(
+
+                let mesh_result = tokio::time::timeout(
                     RELAY_TIMEOUT,
-                    self.rpcnode
-                        .request_relay_session(&relay_contact, our_peer_id, peer_id, session_id),
+                    self.rpcnode.request_mesh_relay(&mesh_relay, our_peer_id, peer_id, session_id),
                 )
                 .await;
 
-                let (relay_conn, response) = match relay_result {
-                    Ok(Ok((conn, resp))) => (conn, resp),
+                let (session_id, relay_data_addr) = match mesh_result {
+                    Ok(Ok(RelayResponse::MeshRelayOffer { session_id, relay_data_addr })) => {
+                        debug!(
+                            peer = ?peer_id,
+                            mesh_relay = ?mesh_relay.identity,
+                            session = hex::encode(session_id),
+                            "mesh relay session offered"
+                        );
+                        (session_id, relay_data_addr)
+                    }
+                    Ok(Ok(RelayResponse::Rejected { reason })) => {
+                        debug!(
+                            mesh_relay = ?mesh_relay.identity,
+                            reason = %reason,
+                            "mesh relay rejected, trying next"
+                        );
+                        continue;
+                    }
+                    Ok(Ok(other)) => {
+                        debug!(
+                            mesh_relay = ?mesh_relay.identity,
+                            response = ?other,
+                            "unexpected mesh relay response, trying next"
+                        );
+                        continue;
+                    }
                     Ok(Err(e)) => {
                         debug!(
-                            relay = ?relay_id,
+                            mesh_relay = ?mesh_relay.identity,
                             error = %e,
-                            "failed to request relay session, trying next"
+                            "mesh relay request failed, trying next"
                         );
-                        last_error = Some(e);
                         continue;
                     }
                     Err(_) => {
                         debug!(
-                            relay = ?relay_id,
-                            "relay session request timed out, trying next"
+                            mesh_relay = ?mesh_relay.identity,
+                            "mesh relay request timed out, trying next"
                         );
-                        last_error = Some(anyhow::anyhow!("relay session request timed out"));
                         continue;
                     }
                 };
 
-                let (session_id, relay_data_addr) = match response {
-                    RelayResponse::Accepted {
-                        session_id,
-                        relay_data_addr,
-                    } => {
-                        debug!(
-                            peer = ?peer_id,
-                            relay = ?relay_id,
-                            session = hex::encode(session_id),
-                            relay_data = %relay_data_addr,
-                            "relay session pending"
-                        );
-                        (session_id, relay_data_addr)
-                    }
-                    RelayResponse::Connected {
-                        session_id,
-                        relay_data_addr,
-                    } => {
-                        debug!(
-                            peer = ?peer_id,
-                            relay = ?relay_id,
-                            session = hex::encode(session_id),
-                            relay_data = %relay_data_addr,
-                            "relay session established"
-                        );
-                        (session_id, relay_data_addr)
-                    }
-                    RelayResponse::Rejected { reason } => {
-                        debug!(
-                            relay = ?relay_id,
-                            reason = %reason,
-                            "relay rejected, trying next"
-                        );
-                        last_error = Some(anyhow::anyhow!("relay rejected: {}", reason));
-                        continue;
-                    }
-                    RelayResponse::Registered => {
-                        debug!(relay = ?relay_id, "unexpected Registered response, trying next");
-                        last_error = Some(anyhow::anyhow!("unexpected Registered response"));
-                        continue;
-                    }
-                    RelayResponse::Incoming { .. } => {
-                        debug!(relay = ?relay_id, "unexpected Incoming response, trying next");
-                        last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
-                        continue;
-                    }
-                };
-
+                // Configure relay path through mesh peer
                 if let Err(e) = self.rpcnode.configure_relay_path_for_peer(
                     peer_id,
                     direct_addrs,
@@ -573,60 +638,51 @@ impl Node {
                     &relay_data_addr,
                 ).await {
                     debug!(
-                        relay = ?relay_id,
+                        mesh_relay = ?mesh_relay.identity,
                         error = %e,
-                        "failed to configure relay path, trying next"
+                        "failed to configure mesh relay path, trying next"
                     );
-                    last_error = Some(e);
                     continue;
                 }
 
+                // Try to connect through the mesh relay
                 let peer_conn_result = tokio::time::timeout(
                     RELAY_TIMEOUT,
-                    self.rpcnode.connect_to_peer(&peer_id, &direct_addrs),
+                    self.rpcnode.connect_to_peer(&peer_id, direct_addrs),
                 )
                 .await;
-
-                drop(relay_conn);
 
                 match peer_conn_result {
                     Ok(Ok(conn)) => {
                         info!(
                             peer = ?peer_id,
-                            relay = ?relay_id,
-                            "connection successful via designated relay"
+                            mesh_relay = ?mesh_relay.identity,
+                            "connection successful via mesh relay"
                         );
                         return Ok(conn);
                     }
                     Ok(Err(e)) => {
                         self.smartsock.remove_relay_tunnel(&peer_id, &session_id).await;
                         debug!(
-                            relay = ?relay_id,
+                            mesh_relay = ?mesh_relay.identity,
                             error = %e,
-                            "relay-assisted connect failed, trying next"
+                            "mesh relay connect failed, trying next"
                         );
-                        last_error = Some(e);
                         continue;
                     }
                     Err(_) => {
                         self.smartsock.remove_relay_tunnel(&peer_id, &session_id).await;
                         debug!(
-                            relay = ?relay_id,
-                            "relay-assisted connect timed out, trying next"
+                            mesh_relay = ?mesh_relay.identity,
+                            "mesh relay connect timed out, trying next"
                         );
-                        last_error = Some(anyhow::anyhow!("relay-assisted connect timed out"));
                         continue;
                     }
                 }
             }
-
-            // All designated relays failed
-            if let Some(e) = last_error {
-                anyhow::bail!("all relay attempts failed, last error: {}", e);
-            }
         }
 
-        anyhow::bail!("direct connection failed and peer has no designated relays");
+        anyhow::bail!("connection failed: direct, designated relays, and mesh relays all exhausted");
     }
     
     pub async fn send_direct(&self, identity: &str, data: Vec<u8>) -> Result<()> {
@@ -659,25 +715,25 @@ impl Node {
     
     
     pub async fn subscribe(&self, topic: &str) -> Result<()> {
-        self.plumtree.subscribe(topic).await
+        self.gossipsub.subscribe(topic).await
     }
     
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
-        self.plumtree.publish(topic, data).await?;
+        self.gossipsub.publish(topic, data).await?;
         Ok(())
     }
     
     pub async fn unsubscribe(&self, topic: &str) -> Result<()> {
-        self.plumtree.unsubscribe(topic).await?;
+        self.gossipsub.unsubscribe(topic).await?;
         Ok(())
     }
     
     pub async fn subscriptions(&self) -> Result<Vec<String>> {
-        Ok(self.plumtree.subscriptions().await)
+        Ok(self.gossipsub.subscriptions().await)
     }
     
     pub async fn messages(&self) -> Result<tokio::sync::mpsc::Receiver<Message>> {
-        let mut guard = self.plumtree_receiver.lock().await;
+        let mut guard = self.gossipsub_receiver.lock().await;
         let internal_rx = guard.take().context("message receiver already taken")?;
         
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -698,17 +754,12 @@ impl Node {
         Ok(rx)
     }
     
-    pub fn is_running(&self) -> bool {
-        !self.listener.is_finished()
-    }
-    
     pub async fn shutdown(&self) {
         // Abort the server first to stop accepting new connections
         self.listener.abort();
         
         // Shutdown actors in reverse dependency order
-        self.hyparview.quit().await;
-        self.plumtree.quit().await;
+        self.gossipsub.quit().await;
         self.dhtnode.quit().await;
         self.rpcnode.quit().await;
         
@@ -751,14 +802,42 @@ impl Node {
         self.relay_client.probe_reachability(&record).await
     }
 
-    /// Discover relay-capable nodes in the network.
+    /// Discover peers that can serve as relays.
     /// 
-    /// Searches for peers with `is_relay: true` in their published EndpointRecords.
-    /// This queries peers from the routing table and checks their relay capability.
+    /// Uses a **mesh-first** strategy: any mesh peer with direct addresses
+    /// can potentially relay traffic between NAT-bound peers. The mesh-based
+    /// relay model means we don't need pre-declared relay nodes - any reachable
+    /// mesh peer that both parties can connect to can serve as a relay.
+    /// 
+    /// Falls back to DHT discovery if no suitable mesh peers are found.
     /// 
     /// # Returns
     /// A list of contacts that can serve as relays.
     pub async fn discover_relays(&self) -> Result<Vec<Contact>> {
+        let our_id = self.keypair.identity();
+        
+        // Check mesh peers first (zero network overhead, already connected)
+        let mesh_peers = self.gossipsub.mesh_peers().await;
+        debug!(
+            mesh_peer_count = mesh_peers.len(),
+            "checking mesh peers for relay capability"
+        );
+        
+        let relays: Vec<Contact> = mesh_peers
+            .into_iter()
+            .filter(|c| c.identity != our_id && c.has_direct_addrs())
+            .collect();
+        
+        if !relays.is_empty() {
+            debug!(
+                relay_count = relays.len(),
+                "discovered relays from mesh peers (mesh-first)"
+            );
+            return Ok(relays);
+        }
+        
+        // Fall back to DHT discovery if no mesh peers available
+        debug!("no mesh peers available, falling back to DHT discovery");
         self.relay_client.discover_relays().await
     }
 
@@ -779,7 +858,7 @@ impl Node {
     /// 
     /// This performs the complete NAT configuration flow:
     /// 1. Probe reachability via a helper peer
-    /// 2. If publicly reachable: publish address with `is_relay: true`
+    /// 2. If publicly reachable: publish address (can serve as relay for others)
     /// 3. If NAT-bound: discover relays, select best one, register, and publish
     /// 
     /// The helper's address is resolved via DHT lookup.
@@ -818,6 +897,41 @@ impl Node {
     /// Get the current NAT status.
     pub async fn nat_status(&self) -> NatStatus {
         self.relay_client.status().await
+    }
+
+    /// Check if the registered relay is healthy (recently communicated with).
+    /// 
+    /// This uses mesh traffic to prove relay liveness: if we're subscribed to
+    /// topics and sending GossipSub messages to our relay, it proves the relay
+    /// is alive without dedicated health probes.
+    /// 
+    /// # Returns
+    /// * `true` - Relay recently responded to traffic (healthy)
+    /// * `false` - No recent communication (may need failover)
+    pub async fn is_relay_healthy(&self) -> bool {
+        self.relay_client.is_relay_healthy().await
+    }
+
+    /// Update relay health by checking if the relay is in our mesh.
+    /// 
+    /// Call this periodically (e.g., from heartbeat) to update relay health
+    /// based on mesh activity. If the registered relay is a mesh peer and
+    /// we're actively sending to it, this proves liveness.
+    pub async fn update_relay_health_from_mesh(&self) {
+        let relay_identity = match self.relay_client.registered_relay_identity().await {
+            Some(id) => id,
+            None => return, // No registered relay
+        };
+        
+        // Check if relay is in our mesh peers
+        let mesh_peers = self.gossipsub.mesh_peers().await;
+        for peer in mesh_peers {
+            if peer.identity == relay_identity {
+                // Relay is a mesh peer - record it as alive
+                self.relay_client.record_relay_alive(&relay_identity).await;
+                return;
+            }
+        }
     }
 
     /// Get access to the relay client for advanced NAT management.

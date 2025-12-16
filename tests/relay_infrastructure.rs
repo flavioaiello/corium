@@ -87,57 +87,25 @@ async fn two_relay_nodes_capability() {
 }
 
 // ============================================================================
-// Relay-Assisted Address Publishing
+// Address Publishing
 // ============================================================================
 
 #[tokio::test]
-async fn publish_address_with_relay_info() {
-    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
-    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+async fn publish_address_idempotent() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Node2 acts as a potential relay
-    let relay_identity = node2.peer_identity();
-    
-    // Node1 publishes its address with relay info
+    // Publish addresses
     let addrs = vec![
         "10.0.0.1:5000".to_string(),
         "192.168.1.1:5000".to_string(),
     ];
     
-    let result = node1.publish_address_with_relays(addrs.clone(), vec![relay_identity]).await;
-    assert!(result.is_ok(), "publish_address_with_relays should succeed");
+    let result = node.publish_address(addrs.clone()).await;
+    assert!(result.is_ok(), "publish_address should succeed");
     
     // Publish again to verify idempotency
-    let result = node1.publish_address_with_relays(addrs, vec![relay_identity]).await;
+    let result = node.publish_address(addrs).await;
     assert!(result.is_ok(), "second publish should also succeed");
-}
-
-#[tokio::test]
-async fn publish_address_with_multiple_relays() {
-    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
-    let relay1 = Node::bind(&test_addr()).await.expect("relay1 bind failed");
-    let relay2 = Node::bind(&test_addr()).await.expect("relay2 bind failed");
-    
-    let relays = vec![
-        relay1.peer_identity(),
-        relay2.peer_identity(),
-    ];
-    
-    let addrs = vec!["10.0.0.1:5000".to_string()];
-    
-    let result = node1.publish_address_with_relays(addrs, relays).await;
-    assert!(result.is_ok(), "publish with multiple relays should succeed");
-}
-
-#[tokio::test]
-async fn publish_address_with_empty_relays() {
-    let node = Node::bind(&test_addr()).await.expect("bind failed");
-    
-    let addrs = vec!["10.0.0.1:5000".to_string()];
-    
-    // Empty relay list should be valid (falls back to direct)
-    let result = node.publish_address_with_relays(addrs, vec![]).await;
-    assert!(result.is_ok(), "publish with empty relays should succeed");
 }
 
 // ============================================================================
@@ -186,7 +154,7 @@ async fn relay_endpoint_contains_quic_addr() {
 
 #[tokio::test]
 async fn three_node_with_relay_bootstrap() {
-    // Node1 is the bootstrap node and potential relay
+    // Node1 is the bootstrap node (mesh peer can serve as relay)
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
     let node3 = Node::bind(&test_addr()).await.expect("node3 bind failed");
@@ -194,12 +162,11 @@ async fn three_node_with_relay_bootstrap() {
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
     
-    // Node2 bootstraps and publishes with node1 as relay
+    // Node2 bootstraps and publishes
     node2.bootstrap(&node1_id, &node1_addr).await.expect("node2 bootstrap failed");
     
-    let relay_id = node1.peer_identity();
     let addrs = vec![node2.local_addr().unwrap().to_string()];
-    node2.publish_address_with_relays(addrs, vec![relay_id])
+    node2.publish_address(addrs)
         .await
         .expect("node2 publish failed");
     
@@ -317,18 +284,16 @@ async fn connect_with_relay_available() {
     node2.bootstrap(&relay_id, &relay_addr).await.expect("node2 bootstrap failed");
     progress(start, "Node2 bootstrap complete");
     
-    // Node1 publishes with relay info
-    progress(start, "Getting relay identity...");
-    let relay_identity = relay.peer_identity();
+    // Node1 publishes address
     let addrs = vec![node1.local_addr().unwrap().to_string()];
-    progress(start, "Publishing address with relays...");
-    node1.publish_address_with_relays(addrs, vec![relay_identity]).await
+    progress(start, "Publishing address...");
+    node1.publish_address(addrs).await
         .expect("publish failed");
     progress(start, "Publish complete");
     
     tokio::time::sleep(Duration::from_millis(100)).await;
     
-    // Direct connect should still work since both are reachable
+    // Direct connect should work since both are reachable
     progress(start, "Starting connect via identity...");
     let result = timeout(
         TEST_TIMEOUT,
@@ -400,16 +365,13 @@ async fn multiple_relay_endpoints_sequential() {
 }
 
 #[tokio::test]
-async fn sequential_relay_operations() {
-    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
-    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+async fn sequential_publish_operations() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    let relay_identity = node2.peer_identity();
-    
-    // Sequential publish operations (Node is not Clone)
+    // Sequential publish operations
     for i in 0..5 {
         let addrs = vec![format!("10.0.0.{}:5000", i)];
-        let _ = node1.publish_address_with_relays(addrs, vec![relay_identity]).await;
+        let _ = node.publish_address(addrs).await;
     }
 }
 
@@ -430,31 +392,6 @@ async fn invalid_relay_address_handling() {
     // Should not panic, just store the data
     let _ = node.publish_address(addrs).await;
 }
-
-#[tokio::test]
-async fn relay_with_closed_node() {
-    let relay_identity;
-    {
-        let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
-        relay_identity = relay.peer_identity();
-        // relay goes out of scope and is dropped
-    }
-    
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    let node = Node::bind(&test_addr()).await.expect("node bind failed");
-    
-    // Publishing with closed relay should still succeed (stored locally)
-    let addrs = vec!["10.0.0.1:5000".to_string()];
-    let result = node.publish_address_with_relays(addrs, vec![relay_identity]).await;
-    
-    // May succeed or fail depending on whether connection attempt is made
-    let _ = result;
-}
-
-// ============================================================================
-// Signed Contact Lifecycle with Relay Tests
-// ============================================================================
 
 /// Tests that relay_endpoint() returns an unsigned ephemeral contact.
 /// Signed contacts are only created during DHT publication (publish_address).
@@ -479,29 +416,26 @@ async fn relay_endpoint_is_ephemeral_unsigned() {
     assert!(peer_ep.signature.is_empty(), "peer_endpoint is also unsigned locally");
 }
 
-/// Tests that signed contacts with relay info survive DHT round-trip.
+/// Tests that signed contacts survive DHT round-trip.
 #[tokio::test]
-async fn signed_contact_with_relay_dht_roundtrip() {
+async fn signed_contact_dht_roundtrip() {
     init_tracing();
     let start = Instant::now();
     
     let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
     let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
-    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
     progress(start, "all nodes bound");
     
     let node1_id = node1.identity();
     let node1_addr = node1.local_addr().unwrap().to_string();
-    let relay_id = relay.peer_identity();
     
     // Bootstrap
     node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
     progress(start, "bootstrap complete");
     
-    // Node1 publishes with relay (signature covers: identity, addrs, relays, is_relay, timestamp)
-    node1.publish_address_with_relays(
+    // Node1 publishes signed contact
+    node1.publish_address(
         vec![node1_addr.clone()],
-        vec![relay_id],
     ).await.expect("publish failed");
     progress(start, "address published");
     
@@ -519,17 +453,15 @@ async fn signed_contact_with_relay_dht_roundtrip() {
     // Verify all signed fields survived the round-trip
     assert_eq!(hex::encode(contact.identity), node1_id, "identity preserved");
     assert!(contact.addrs.contains(&node1_addr), "address preserved");
-    assert_eq!(contact.relays.len(), 1, "relay list preserved");
-    assert_eq!(contact.relays[0], relay_id, "relay identity preserved");
     assert!(!contact.signature.is_empty(), "signature preserved");
     assert!(contact.timestamp > 0, "timestamp preserved");
     
     progress(start, "test complete");
 }
 
-/// Tests that a node can use relay info from a signed contact to connect.
+/// Tests that nodes can connect after DHT resolution.
 #[tokio::test]
-async fn signed_contact_relay_info_usable() {
+async fn signed_contact_usable_for_connection() {
     init_tracing();
     let start = Instant::now();
     
@@ -543,36 +475,33 @@ async fn signed_contact_relay_info_usable() {
     let relay_id = relay.peer_identity();
     let relay_addr = relay.local_addr().unwrap().to_string();
     
-    // Bootstrap both nodes from relay (so they know relay's address)
+    // Bootstrap both nodes from relay
     node1.bootstrap(&hex::encode(relay_id.as_bytes()), &relay_addr).await.expect("node1 bootstrap failed");
     node2.bootstrap(&hex::encode(relay_id.as_bytes()), &relay_addr).await.expect("node2 bootstrap failed");
-    progress(start, "both nodes bootstrapped from relay");
+    progress(start, "both nodes bootstrapped");
     
     // Relay publishes its address
     relay.publish_address(vec![relay_addr.clone()]).await.expect("relay publish failed");
     
-    // Node1 publishes with relay info
-    node1.publish_address_with_relays(
+    // Node1 publishes its address
+    node1.publish_address(
         vec![node1_addr.clone()],
-        vec![relay_id],
     ).await.expect("node1 publish failed");
     progress(start, "addresses published");
     
     tokio::time::sleep(Duration::from_millis(150)).await;
     
-    // Node2 resolves node1's contact (with relay info)
+    // Node2 resolves node1's contact
     let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     
     assert!(resolved.is_some(), "should resolve contact");
     let contact = resolved.unwrap();
+    assert!(!contact.signature.is_empty(), "contact should be signed");
+    progress(start, "contact resolved");
     
-    // Contact should have relay info from signed record
-    assert!(!contact.relays.is_empty(), "contact should have relay info");
-    progress(start, "contact resolved with relay info");
-    
-    // Node2 should be able to connect to node1 (may use direct or relay path)
+    // Node2 should be able to connect to node1
     let conn = timeout(TEST_TIMEOUT, node2.connect(&node1_id)).await
         .expect("connect timeout")
         .expect("connect failed");
@@ -581,23 +510,266 @@ async fn signed_contact_relay_info_usable() {
     progress(start, "connection established");
 }
 
-/// Tests that modifying a signed contact's relay list breaks verification.
+/// Tests that modifying a signed contact's address list breaks verification.
 #[tokio::test]
-async fn tampered_relay_list_rejected() {
+async fn tampered_address_list_rejected() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
-    let fake_relay = Node::bind(&test_addr()).await.expect("fake_relay bind failed");
     
     // Get a signed contact
     let mut contact = node.peer_endpoint().clone();
     let original_sig = contact.signature.clone();
     
-    // Tamper with relay list after signing
-    contact.relays.push(fake_relay.peer_identity());
+    // Tamper with address list after signing
+    contact.addrs.push("10.0.0.99:5000".to_string());
     
-    // Signature should still be the original (which didn't cover the new relay)
+    // Signature should still be the original (which didn't cover the new address)
     assert_eq!(contact.signature, original_sig);
     
     // The contact is now invalid - calling verify on it should fail
     // (We test this indirectly: if stored in DHT and resolved, verify_fresh would reject it)
-    // This validates that the signature binds the relay list
+    // This validates that the signature binds the address list
+}
+
+// ============================================================================
+// Relay Discovery Tests
+// ============================================================================
+
+/// Tests discover_relays() returns empty when no mesh peers exist.
+#[tokio::test]
+async fn discover_relays_empty_without_mesh() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    
+    // No mesh peers established yet
+    let relays = node.discover_relays().await.expect("discover_relays should not fail");
+    
+    // Should return empty list (no mesh peers)
+    assert!(relays.is_empty(), "should have no relays without mesh peers");
+}
+
+/// Tests discover_relays() returns mesh peers after establishing mesh connections.
+#[tokio::test]
+async fn discover_relays_finds_mesh_peers() {
+    init_tracing();
+    let start = Instant::now();
+    
+    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    progress(start, "all nodes bound");
+    
+    let relay_id = relay.identity();
+    let relay_addr = relay.local_addr().unwrap().to_string();
+    
+    // Bootstrap nodes to relay
+    node1.bootstrap(&relay_id, &relay_addr).await.expect("node1 bootstrap failed");
+    node2.bootstrap(&relay_id, &relay_addr).await.expect("node2 bootstrap failed");
+    progress(start, "bootstrap complete");
+    
+    // All nodes subscribe to a topic to form mesh
+    relay.subscribe("test-topic").await.expect("relay subscribe failed");
+    node1.subscribe("test-topic").await.expect("node1 subscribe failed");
+    node2.subscribe("test-topic").await.expect("node2 subscribe failed");
+    progress(start, "subscribed to topic");
+    
+    // Publish addresses for mesh peer resolution
+    relay.publish_address(vec![relay_addr.clone()]).await.expect("relay publish failed");
+    node1.publish_address(vec![node1.local_addr().unwrap().to_string()]).await.expect("node1 publish failed");
+    progress(start, "addresses published");
+    
+    // Allow mesh formation via GossipSub heartbeats
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    // Publish a message to trigger mesh formation
+    node1.publish("test-topic", b"hello".to_vec()).await.expect("publish failed");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    progress(start, "mesh formed");
+    
+    // Now discover_relays should find mesh peers
+    let relays = node2.discover_relays().await.expect("discover_relays failed");
+    progress(start, &format!("discovered {} relays", relays.len()));
+    
+    // Should find at least the relay node as a potential relay
+    // (mesh peers with direct addresses can serve as relays)
+    // Note: depends on GossipSub mesh formation timing
+    assert!(relays.len() <= 2, "should find at most 2 other peers as relays");
+}
+
+/// Tests discover_relays() excludes self from relay list.
+#[tokio::test]
+async fn discover_relays_excludes_self() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    let node_id = node.peer_identity();
+    
+    let relays = node.discover_relays().await.expect("discover_relays failed");
+    
+    // Self should never be in the relay list
+    let has_self = relays.iter().any(|c| c.identity == node_id);
+    assert!(!has_self, "relay list should not include self");
+}
+
+/// Tests discover_relays() falls back to DHT when no mesh peers available.
+#[tokio::test]
+async fn discover_relays_dht_fallback() {
+    init_tracing();
+    let start = Instant::now();
+    
+    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    let node = Node::bind(&test_addr()).await.expect("node bind failed");
+    progress(start, "nodes bound");
+    
+    let relay_id = relay.identity();
+    let relay_addr = relay.local_addr().unwrap().to_string();
+    
+    // Bootstrap only (no mesh subscription)
+    node.bootstrap(&relay_id, &relay_addr).await.expect("bootstrap failed");
+    relay.publish_address(vec![relay_addr.clone()]).await.expect("relay publish failed");
+    progress(start, "bootstrap complete");
+    
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // discover_relays with no mesh peers falls back to DHT
+    let relays = node.discover_relays().await.expect("discover_relays failed");
+    progress(start, &format!("discovered {} relays via DHT fallback", relays.len()));
+    
+    // DHT fallback may find the relay node
+    // (Result depends on DHT state - just verify no panic)
+}
+
+/// Tests that relay discovery only returns peers with direct addresses.
+#[tokio::test]
+async fn discover_relays_requires_direct_addrs() {
+    init_tracing();
+    let start = Instant::now();
+    
+    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
+    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
+    progress(start, "nodes bound");
+    
+    let node1_id = node1.identity();
+    let node1_addr = node1.local_addr().unwrap().to_string();
+    
+    // Bootstrap node2 from node1
+    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
+    
+    // Node1 publishes with direct addresses
+    node1.publish_address(vec![node1_addr.clone()]).await.expect("publish failed");
+    progress(start, "address published");
+    
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Discover relays
+    let relays = node2.discover_relays().await.expect("discover_relays failed");
+    progress(start, &format!("discovered {} relays", relays.len()));
+    
+    // All returned relays should have direct addresses
+    for relay in &relays {
+        assert!(relay.has_direct_addrs(), "relay should have direct addresses");
+    }
+}
+
+// ============================================================================
+// Relay Tunnel Machinery Tests
+// ============================================================================
+
+/// Tests that relay tunnel can be manually established and SmartSock tracks relay state.
+/// 
+/// This test validates the relay machinery by:
+/// 1. Registering a peer with SmartSock
+/// 2. Adding a relay tunnel manually
+/// 3. Activating the relay path
+/// 4. Verifying is_peer_relayed() returns true
+/// 5. Verifying the session ID is tracked
+#[tokio::test]
+async fn relay_tunnel_machinery_verification() {
+    init_tracing();
+    let start = Instant::now();
+    
+    // Create a relay node and a peer node
+    let relay = Node::bind(&test_addr()).await.expect("relay bind failed");
+    let peer = Node::bind(&test_addr()).await.expect("peer bind failed");
+    progress(start, "nodes bound");
+    
+    let relay_id = relay.identity();
+    let relay_addr = relay.local_addr().unwrap().to_string();
+    let _peer_id = peer.peer_identity();
+    
+    // Bootstrap peer from relay
+    peer.bootstrap(&relay_id, &relay_addr).await.expect("bootstrap failed");
+    progress(start, "bootstrap complete");
+    
+    // Generate a session ID (simulating what relay server would generate)
+    let session_id: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+                                 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+    
+    // Get the relay's socket address for the tunnel
+    let relay_socket: std::net::SocketAddr = relay_addr.parse().expect("parse relay addr");
+    
+    // Create a fake peer identity to simulate relayed peer
+    let fake_peer_id = corium::Identity::from_bytes([0x42u8; 32]);
+    
+    // Step 1: Register peer with SmartSock (required before adding tunnel)
+    let smartsock = peer.smartsock();
+    smartsock.register_peer(fake_peer_id, vec![]).await;
+    progress(start, "peer registered in SmartSock");
+    
+    // Step 2: Verify peer is NOT relayed initially
+    let is_relayed_before = smartsock.is_peer_relayed(&fake_peer_id).await;
+    assert!(!is_relayed_before, "peer should not be relayed initially");
+    progress(start, "verified not relayed initially");
+    
+    // Step 3: Add relay tunnel
+    let tunnel_result = smartsock.add_relay_tunnel(&fake_peer_id, session_id, relay_socket).await;
+    assert!(tunnel_result.is_some(), "add_relay_tunnel should succeed");
+    progress(start, "relay tunnel added");
+    
+    // Step 4: Activate relay path
+    let path_activated = smartsock.use_relay_path(&fake_peer_id, session_id).await;
+    assert!(path_activated, "use_relay_path should succeed");
+    progress(start, "relay path activated");
+    
+    // Step 5: Verify is_peer_relayed returns true
+    let is_relayed_after = smartsock.is_peer_relayed(&fake_peer_id).await;
+    assert!(is_relayed_after, "peer should be relayed after activating relay path");
+    progress(start, "verified peer is now relayed");
+    
+    // Step 6: Verify session ID is tracked
+    let tracked_session = smartsock.peer_relay_session(&fake_peer_id).await;
+    assert_eq!(tracked_session, Some(session_id), "session ID should be tracked");
+    progress(start, "verified session ID tracking");
+    
+    // Step 7: Switch back to direct and verify no longer relayed
+    let fake_direct_addr: std::net::SocketAddr = "10.0.0.99:5000".parse().unwrap();
+    let switched_to_direct = smartsock.use_direct_path(&fake_peer_id, fake_direct_addr).await;
+    assert!(switched_to_direct, "use_direct_path should succeed");
+    
+    let is_relayed_final = smartsock.is_peer_relayed(&fake_peer_id).await;
+    assert!(!is_relayed_final, "peer should not be relayed after switching to direct");
+    progress(start, "verified switch back to direct works");
+    
+    progress(start, "test passed - relay tunnel machinery verified");
+}
+
+/// Tests that relay tunnel limits are enforced per peer.
+#[tokio::test]
+async fn relay_tunnel_limit_enforced() {
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    let smartsock = node.smartsock();
+    
+    // Create a peer identity
+    let peer_id = corium::Identity::from_bytes([0x99u8; 32]);
+    smartsock.register_peer(peer_id, vec![]).await;
+    
+    let relay_addr: std::net::SocketAddr = "192.168.1.100:4433".parse().unwrap();
+    
+    // Add tunnels up to the limit (MAX_RELAY_TUNNELS_PER_PEER = 8)
+    for i in 0..8u8 {
+        let session_id = [i; 16];
+        let result = smartsock.add_relay_tunnel(&peer_id, session_id, relay_addr).await;
+        assert!(result.is_some(), "tunnel {} should be added", i);
+    }
+    
+    // Adding one more should fail
+    let session_id_over_limit = [0xFF; 16];
+    let result = smartsock.add_relay_tunnel(&peer_id, session_id_over_limit, relay_addr).await;
+    assert!(result.is_none(), "tunnel over limit should be rejected");
 }

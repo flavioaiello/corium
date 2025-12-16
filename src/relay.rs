@@ -65,14 +65,6 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// Maximum relay frame size (fits in UDP MTU with headroom).
 pub const MAX_RELAY_FRAME_SIZE: usize = 1400;
 
-/// Maximum number of pending signaling notifications per channel.
-/// SECURITY: Bounds queue growth for slow/unresponsive receivers.
-pub const SIGNALING_CHANNEL_CAPACITY: usize = 16;
-
-/// Maximum number of registered signaling channels.
-/// SECURITY: Prevents memory exhaustion from channel registration spam.
-pub const MAX_SIGNALING_CHANNELS: usize = 10_000;
-
 /// Maximum sessions per IP address (rate limiting).
 /// SECURITY: Limits session table pollution from a single IP.
 pub const MAX_SESSIONS_PER_IP: usize = 50;
@@ -87,9 +79,6 @@ pub const MAX_ADDR_TO_SESSION_ENTRIES: usize = 20_000;
 /// Maximum entries in ip_session_count rate limiter.
 /// SECURITY: Bounds the rate limiter itself to prevent memory exhaustion.
 pub const MAX_IP_SESSION_COUNT_ENTRIES: usize = 10_000;
-
-/// Sender for pushing signaling notifications to registered NAT nodes.
-pub type SignalingSender = mpsc::Sender<RelayResponse>;
 
 
 // ============================================================================
@@ -242,6 +231,26 @@ pub enum NatStatus {
 
 
 // ============================================================================
+// MeshSignalOut (for sending signals via mesh)
+// ============================================================================
+
+/// Outgoing relay signal to be sent via GossipSub mesh.
+/// Phase 3: When a NAT node doesn't have a dedicated signaling connection,
+/// the relay sends signals through the mesh instead.
+#[derive(Debug, Clone)]
+pub struct MeshSignalOut {
+    /// Target peer to receive the signal.
+    pub target: Identity,
+    /// Peer requesting connection.
+    pub from_peer: Identity,
+    /// Relay session identifier.
+    pub session_id: [u8; 16],
+    /// Address for relay data packets.
+    pub relay_data_addr: String,
+}
+
+
+// ============================================================================
 // Commands sent from Handle to Actor
 // ============================================================================
 
@@ -262,13 +271,6 @@ enum RelayCommand {
     },
     SessionCount {
         reply: oneshot::Sender<usize>,
-    },
-    RegisterSignaling {
-        peer_identity: Identity,
-        reply: oneshot::Sender<Result<mpsc::Receiver<RelayResponse>, &'static str>>,
-    },
-    UnregisterSignaling {
-        peer_identity: Identity,
     },
     NotifyIncoming {
         target_peer: Identity,
@@ -313,16 +315,21 @@ impl std::fmt::Debug for RelayServer {
 
 impl RelayServer {
     /// Create a new relay server sharing the given socket.
+    /// 
+    /// # Arguments
+    /// * `socket` - UDP socket for relay data packets
+    /// * `mesh_signal_tx` - Channel for sending signals via GossipSub mesh (mesh-only signaling)
+    /// 
     /// Spawns the actor and cleanup tasks.
-    pub fn with_socket(socket: Arc<UdpSocket>) -> Self {
+    pub fn with_socket(socket: Arc<UdpSocket>, mesh_signal_tx: mpsc::Sender<MeshSignalOut>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         
         let local_addr = socket.local_addr().ok();
         if let Some(addr) = local_addr {
-            info!(addr = %addr, "RelayServer actor started");
+            info!(addr = %addr, "RelayServer actor started (mesh-only signaling)");
         }
         
-        let actor = RelayServerActor::new(socket.clone());
+        let actor = RelayServerActor::new(socket.clone(), mesh_signal_tx);
         tokio::spawn(actor.run(cmd_rx));
         
         Self { cmd_tx, socket }
@@ -386,29 +393,7 @@ impl RelayServer {
         reply_rx.await.unwrap_or(0)
     }
 
-    /// Register a signaling channel for a NAT-bound peer.
-    pub async fn register_signaling(
-        &self,
-        peer_identity: Identity,
-    ) -> Result<mpsc::Receiver<RelayResponse>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        
-        self.cmd_tx.send(RelayCommand::RegisterSignaling {
-            peer_identity,
-            reply: reply_tx,
-        }).await.map_err(|_| "relay actor closed")?;
-        
-        reply_rx.await.map_err(|_| "relay actor closed")?
-    }
-
-    /// Unregister a signaling channel.
-    pub async fn unregister_signaling(&self, peer_identity: &Identity) {
-        let _ = self.cmd_tx.send(RelayCommand::UnregisterSignaling {
-            peer_identity: *peer_identity,
-        }).await;
-    }
-
-    /// Notify a registered NAT peer about an incoming connection.
+    /// Notify a NAT peer about an incoming connection via mesh signaling.
     pub async fn notify_incoming(
         &self,
         target_peer: Identity,
@@ -490,7 +475,17 @@ pub struct RelayClient {
     /// The relay we are currently registered with, if any.
     /// Used to validate incoming connection notifications.
     registered_relay: tokio::sync::RwLock<Option<crate::identity::Contact>>,
+    /// Last time we successfully communicated with the registered relay.
+    /// Updated by `record_relay_alive()` when mesh traffic proves liveness.
+    relay_last_seen: tokio::sync::RwLock<Option<Instant>>,
+    /// Sender for mesh-mediated signals.
+    /// When set, relay signals can arrive via GossipSub mesh instead of dedicated connections.
+    mesh_signal_tx: tokio::sync::RwLock<Option<mpsc::Sender<IncomingConnection>>>,
 }
+
+/// Timeout after which a relay is considered unhealthy if no communication.
+/// Used for failover decisions.
+pub const RELAY_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl RelayClient {
     /// Create a new relay client.
@@ -508,12 +503,115 @@ impl RelayClient {
             status: tokio::sync::RwLock::new(NatStatus::Unknown),
             incoming_rx: tokio::sync::Mutex::new(None),
             registered_relay: tokio::sync::RwLock::new(None),
+            relay_last_seen: tokio::sync::RwLock::new(None),
+            mesh_signal_tx: tokio::sync::RwLock::new(None),
         }
     }
 
     /// Get the current NAT status.
     pub async fn status(&self) -> NatStatus {
         self.status.read().await.clone()
+    }
+    
+    /// Get the identity of the registered relay, if any.
+    pub async fn registered_relay_identity(&self) -> Option<Identity> {
+        self.registered_relay.read().await.as_ref().map(|c| c.identity)
+    }
+
+    /// Record that we successfully communicated with the registered relay.
+    /// 
+    /// Called by GossipSub when sending to a mesh peer that's our relay.
+    /// This proves relay liveness without dedicated health probes.
+    pub async fn record_relay_alive(&self, relay_identity: &Identity) {
+        let registered = self.registered_relay.read().await;
+        if let Some(relay) = &*registered {
+            if &relay.identity == relay_identity {
+                drop(registered);
+                *self.relay_last_seen.write().await = Some(Instant::now());
+                trace!(
+                    relay = %hex::encode(&relay_identity.as_bytes()[..8]),
+                    "relay liveness confirmed via mesh traffic"
+                );
+            }
+        }
+    }
+
+    /// Check if the registered relay is healthy (recently seen).
+    /// 
+    /// Returns `true` if we've successfully communicated with the relay
+    /// within `RELAY_HEALTH_TIMEOUT`.
+    pub async fn is_relay_healthy(&self) -> bool {
+        if let Some(last_seen) = *self.relay_last_seen.read().await {
+            last_seen.elapsed() < RELAY_HEALTH_TIMEOUT
+        } else {
+            // Never seen - might be freshly registered, give benefit of doubt
+            // or relay is not a mesh peer (can't piggyback health)
+            true
+        }
+    }
+
+    /// Get time since last relay communication, if known.
+    pub async fn relay_last_seen(&self) -> Option<Duration> {
+        self.relay_last_seen.read().await.map(|t| t.elapsed())
+    }
+
+    /// Enable mesh-mediated signaling and return a receiver for incoming connections.
+    /// 
+    /// This is an alternative to `register_with_relay()` that doesn't require
+    /// a dedicated connection to the relay. Instead, relay signals arrive via
+    /// GossipSub mesh connections.
+    /// 
+    /// # Returns
+    /// A receiver that yields incoming connection notifications.
+    pub async fn enable_mesh_signaling(&self) -> mpsc::Receiver<IncomingConnection> {
+        let (tx, rx) = mpsc::channel::<IncomingConnection>(16);
+        *self.mesh_signal_tx.write().await = Some(tx);
+        rx
+    }
+
+    /// Receive a relay signal forwarded through the GossipSub mesh.
+    /// 
+    /// This is the mesh-mediated signaling path: instead of dedicated signaling
+    /// connections, relay signals arrive via GossipSub. This reduces connection
+    /// overhead when the relay (or a peer who can reach us) is in our mesh.
+    /// 
+    /// Called by GossipSub when it receives a RelaySignal addressed to us.
+    /// 
+    /// # Arguments
+    /// * `from_peer` - The peer requesting connection
+    /// * `session_id` - Session ID for the relay connection
+    /// * `relay_data_addr` - Address to send relay data packets to
+    /// 
+    /// # Returns
+    /// Ok(()) if the signal was accepted, Err if mesh signaling is not enabled.
+    pub async fn receive_mesh_signal(
+        &self,
+        from_peer: crate::identity::Identity,
+        session_id: [u8; 16],
+        relay_data_addr: String,
+    ) -> anyhow::Result<()> {
+        debug!(
+            from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
+            session = %hex::encode(session_id),
+            "received relay signal via mesh"
+        );
+        
+        // Construct IncomingConnection
+        let incoming = IncomingConnection {
+            from_peer: hex::encode(from_peer.as_bytes()),
+            session_id,
+            relay_data_addr,
+        };
+        
+        // Send via mesh signal channel
+        let tx_guard = self.mesh_signal_tx.read().await;
+        if let Some(tx) = &*tx_guard {
+            tx.send(incoming).await
+                .map_err(|_| anyhow::anyhow!("mesh signal receiver closed"))?;
+            Ok(())
+        } else {
+            anyhow::bail!("mesh signaling not enabled - call enable_mesh_signaling() first")
+        }
     }
 
     /// Check if this node is publicly reachable by asking a peer to connect back.
@@ -524,29 +622,24 @@ impl RelayClient {
         self.rpc.check_reachability(helper, &self.local_addr.to_string()).await
     }
 
-    /// Discover relay-capable nodes in the network.
+    /// Discover peers that can serve as relays via DHT.
+    /// 
+    /// In the mesh-first relay model, any reachable peer with direct addresses
+    /// can potentially relay traffic. This is a fallback when no mesh peers
+    /// are available.
     pub async fn discover_relays(&self) -> anyhow::Result<Vec<crate::identity::Contact>> {
         let our_id = self.keypair.identity();
         let candidates = self.dht.iterative_find_node(our_id).await?;
         
-        let mut relays = Vec::new();
+        let relays: Vec<crate::identity::Contact> = candidates
+            .into_iter()
+            .filter(|c| c.identity != our_id && c.has_direct_addrs())
+            .collect();
         
-        for contact in candidates {
-            if contact.identity == our_id {
-                continue;
-            }
-            
-            match self.dht.resolve_peer(&contact.identity).await {
-                Ok(Some(record)) if record.is_relay => {
-                    debug!(
-                        peer = %hex::encode(&contact.identity.as_bytes()[..8]),
-                        "found relay-capable peer"
-                    );
-                    relays.push(contact);
-                }
-                _ => continue,
-            }
-        }
+        debug!(
+            relay_count = relays.len(),
+            "discovered potential relays via DHT"
+        );
         
         Ok(relays)
     }
@@ -595,38 +688,22 @@ impl RelayClient {
     }
 
     /// Register with a relay for incoming connection notifications.
+    /// 
+    /// **DEPRECATED**: With mesh-only signaling, NAT peers receive signals via GossipSub mesh
+    /// automatically. This method now only stores the registered relay for validation
+    /// and is called by `configure()` when needed.
     pub async fn register_with_relay(
         &self,
         relay: &crate::identity::Contact,
     ) -> anyhow::Result<()> {
-        let response_rx = self.rpc
-            .register_for_signaling(relay, self.keypair.identity())
-            .await?;
-        
         // SECURITY: Store the registered relay for later validation of incoming connections.
         // This prevents malicious actors from spoofing relay notifications.
         *self.registered_relay.write().await = Some(relay.clone());
         
-        // Transform RelayResponse into IncomingConnection
-        let (tx, rx) = mpsc::channel::<IncomingConnection>(16);
-        
-        tokio::spawn(async move {
-            let mut response_rx = response_rx;
-            while let Some(response) = response_rx.recv().await {
-                if let RelayResponse::Incoming { from_peer, session_id, relay_data_addr } = response {
-                    let incoming = IncomingConnection {
-                        from_peer: hex::encode(from_peer.as_bytes()),
-                        session_id,
-                        relay_data_addr,
-                    };
-                    if tx.send(incoming).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        
-        *self.incoming_rx.lock().await = Some(rx);
+        debug!(
+            relay = %hex::encode(&relay.identity.as_bytes()[..8]),
+            "registered with relay (mesh-only signaling active)"
+        );
         
         Ok(())
     }
@@ -758,9 +835,9 @@ impl RelayClient {
         );
         self.register_with_relay(&best_relay).await?;
         
-        // Step 5: Publish our address with relay info
+        // Step 5: Publish our address
         self.dht
-            .republish_on_network_change(&self.keypair, addresses, vec![best_relay.identity])
+            .republish_on_network_change(&self.keypair, addresses)
             .await?;
         
         let status = NatStatus::NatBound { relay: best_relay.identity };
@@ -844,22 +921,23 @@ struct RelayServerActor {
     socket: Arc<UdpSocket>,
     sessions: HashMap<[u8; 16], RelaySession>,
     addr_to_session: HashMap<SocketAddr, [u8; 16]>,
-    signaling_channels: HashMap<Identity, SignalingSender>,
     /// Per-IP session count for rate limiting. Tracks (count, window_start).
     /// SECURITY: LruCache bounds memory growth from IP address tracking.
     ip_session_count: LruCache<IpAddr, (usize, Instant)>,
+    /// Channel for sending signals via GossipSub mesh (mesh-only signaling).
+    mesh_signal_tx: mpsc::Sender<MeshSignalOut>,
 }
 
 impl RelayServerActor {
-    fn new(socket: Arc<UdpSocket>) -> Self {
+    fn new(socket: Arc<UdpSocket>, mesh_signal_tx: mpsc::Sender<MeshSignalOut>) -> Self {
         let ip_session_count_cap = NonZeroUsize::new(MAX_IP_SESSION_COUNT_ENTRIES)
             .expect("MAX_IP_SESSION_COUNT_ENTRIES must be non-zero");
         Self {
             socket,
             sessions: HashMap::new(),
             addr_to_session: HashMap::new(),
-            signaling_channels: HashMap::new(),
             ip_session_count: LruCache::new(ip_session_count_cap),
+            mesh_signal_tx,
         }
     }
 
@@ -890,13 +968,6 @@ impl RelayServerActor {
                         }
                         Some(RelayCommand::SessionCount { reply }) => {
                             let _ = reply.send(self.sessions.len());
-                        }
-                        Some(RelayCommand::RegisterSignaling { peer_identity, reply }) => {
-                            let result = self.register_signaling(peer_identity);
-                            let _ = reply.send(result);
-                        }
-                        Some(RelayCommand::UnregisterSignaling { peer_identity }) => {
-                            self.unregister_signaling(&peer_identity);
                         }
                         Some(RelayCommand::NotifyIncoming {
                             target_peer, from_peer, session_id, relay_data_addr, reply
@@ -1037,37 +1108,7 @@ impl RelayServerActor {
         Ok(())
     }
 
-    fn register_signaling(
-        &mut self,
-        peer_identity: Identity,
-    ) -> Result<mpsc::Receiver<RelayResponse>, &'static str> {
-        if self.signaling_channels.len() >= MAX_SIGNALING_CHANNELS {
-            return Err("max signaling channels reached");
-        }
-        
-        // Remove stale channel if exists (peer reconnecting)
-        self.signaling_channels.remove(&peer_identity);
-        
-        let (tx, rx) = mpsc::channel(SIGNALING_CHANNEL_CAPACITY);
-        self.signaling_channels.insert(peer_identity, tx);
-        
-        debug!(
-            peer = ?peer_identity,
-            "registered signaling channel"
-        );
-        
-        Ok(rx)
-    }
-
-    fn unregister_signaling(&mut self, peer_identity: &Identity) {
-        if self.signaling_channels.remove(peer_identity).is_some() {
-            debug!(
-                peer = ?peer_identity,
-                "unregistered signaling channel"
-            );
-        }
-    }
-
+    /// Notify a NAT peer about an incoming connection via mesh signaling.
     fn notify_incoming(
         &self,
         target_peer: Identity,
@@ -1075,44 +1116,37 @@ impl RelayServerActor {
         session_id: [u8; 16],
         relay_data_addr: String,
     ) -> bool {
-        if let Some(tx) = self.signaling_channels.get(&target_peer) {
-            let notification = RelayResponse::Incoming {
-                from_peer,
-                session_id,
-                relay_data_addr,
-            };
-            
-            match tx.try_send(notification) {
-                Ok(()) => {
-                    debug!(
-                        target = ?target_peer,
-                        from = ?from_peer,
-                        session = hex::encode(session_id),
-                        "sent incoming connection notification"
-                    );
-                    true
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        target = ?target_peer,
-                        "signaling channel full, dropping notification"
-                    );
-                    false
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!(
-                        target = ?target_peer,
-                        "signaling channel closed"
-                    );
-                    false
-                }
+        let signal = MeshSignalOut {
+            target: target_peer,
+            from_peer,
+            session_id,
+            relay_data_addr,
+        };
+        
+        match self.mesh_signal_tx.try_send(signal) {
+            Ok(()) => {
+                debug!(
+                    target = ?target_peer,
+                    from = ?from_peer,
+                    session = hex::encode(session_id),
+                    "sent incoming connection notification via mesh signaling"
+                );
+                true
             }
-        } else {
-            debug!(
-                target = ?target_peer,
-                "no signaling channel registered"
-            );
-            false
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    target = ?target_peer,
+                    "mesh signaling channel full, dropping notification"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!(
+                    target = ?target_peer,
+                    "mesh signaling channel closed"
+                );
+                false
+            }
         }
     }
 
@@ -1344,16 +1378,80 @@ pub async fn handle_relay_request(
             }
         }
         
-        RelayRequest::Register { from_peer } => {
+        // NOTE: RelayRequest::Register removed - mesh-only signaling now
+        
+        RelayRequest::MeshRelay {
+            from_peer,
+            target_peer,
+            session_id,
+        } => {
             debug!(
                 from = ?from_peer,
-                "handling RELAY_REGISTER request"
+                target = ?target_peer,
+                session = hex::encode(session_id),
+                "handling MESH_RELAY request (opportunistic relay)"
             );
 
-            // Note: Actual registration happens in handle_stream, not here.
-            // This response is just the initial acknowledgment.
-            // The stream handler will call register_signaling() and keep the stream open.
-            RelayResponse::Registered
+            // Phase 4: Mesh peer acting as relay
+            // Same logic as Connect, but explicitly for mesh peers helping each other
+            let relay = match relay {
+                Some(s) => s,
+                None => {
+                    return RelayResponse::Rejected {
+                        reason: "relay not available (node not relay-capable)".to_string(),
+                    };
+                }
+            };
+
+            let relay_data_addr = match relay_addr {
+                Some(addr) => addr.to_string(),
+                None => {
+                    return RelayResponse::Rejected {
+                        reason: "relay address not configured".to_string(),
+                    };
+                }
+            };
+
+            // Check capacity
+            let session_count = relay.session_count().await;
+            if session_count >= MAX_SESSIONS {
+                return RelayResponse::Rejected {
+                    reason: "mesh relay at capacity".to_string(),
+                };
+            }
+
+            // Register the mesh relay session
+            match relay
+                .register_session(session_id, remote_addr, from_peer, target_peer)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        session = hex::encode(session_id),
+                        from = ?from_peer,
+                        target = ?target_peer,
+                        "mesh relay session registered"
+                    );
+                    
+                    // Note: For mesh relay, we don't notify target via signaling.
+                    // The requester will forward the session info to target directly.
+                    
+                    RelayResponse::MeshRelayOffer {
+                        session_id,
+                        relay_data_addr,
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        session = hex::encode(session_id),
+                        error = e,
+                        "failed to register mesh relay session"
+                    );
+                    RelayResponse::Rejected {
+                        reason: e.to_string(),
+                    }
+                }
+            }
         }
     }
 }
@@ -1476,7 +1574,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_complete_session() {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let relay = Relay::with_socket(Arc::new(socket));
+        // Create a mesh signal channel for testing (signals are discarded)
+        let (mesh_tx, _mesh_rx) = mpsc::channel::<MeshSignalOut>(16);
+        let relay = Relay::with_socket(Arc::new(socket), mesh_tx);
         
         let session_id = [1u8; 16];
         let peer_a = Identity::from_bytes([2u8; 32]);
@@ -1502,7 +1602,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_session() {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let relay = Relay::with_socket(Arc::new(socket));
+        // Create a mesh signal channel for testing (signals are discarded)
+        let (mesh_tx, _mesh_rx) = mpsc::channel::<MeshSignalOut>(16);
+        let relay = Relay::with_socket(Arc::new(socket), mesh_tx);
         
         let session_id = [1u8; 16];
         let peer_a = Identity::from_bytes([2u8; 32]);

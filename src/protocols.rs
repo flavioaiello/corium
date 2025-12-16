@@ -1,7 +1,7 @@
 //! Protocol trait definitions for Corium's networking layer.
 //!
 //! This module defines the core protocol traits that abstract over the
-//! underlying RPC transport. Each protocol (DHT, PubSub, Membership, Relay)
+//! underlying RPC transport. Each protocol (DHT, PubSub, Relay)
 //! has its own trait that defines the operations it supports.
 //!
 //! ## Protocol Traits
@@ -9,25 +9,23 @@
 //! | Protocol | Trait | Purpose |
 //! |----------|-------|---------|
 //! | DHT | [`DhtNodeRpc`] | Distributed hash table operations |
-//! | PubSub | [`PlumTreeRpc`] | Epidemic broadcast message forwarding |
-//! | Membership | [`HyParViewRpc`] | Peer sampling and view management |
+//! | PubSub | [`GossipSubRpc`] | Epidemic broadcast message forwarding |
 //! | Relay | [`RelayRpc`] | NAT traversal via relay servers |
 //! | Direct | [`DirectRpc`] | Point-to-point messaging |
 //!
 //! ## Design
 //!
 //! Traits are defined here separately from implementations to:
-//! - Allow protocols (HyParView, PlumTree) to depend only on traits, not implementations
+//! - Allow protocols (GossipSub) to depend only on traits, not implementations
 //! - Enable DHT to be passed to protocols for contact resolution
 //! - Avoid circular dependencies between modules
 
 use anyhow::Result;
 use async_trait::async_trait;
-use quinn::Connection;
 
 use crate::identity::{Contact, Identity};
-use crate::messages::{HyParViewRequest, PlumTreeRequest, RelayResponse};
-use crate::storage::Key;
+use crate::messages::{GossipSubRequest, RelayResponse};
+use crate::dht::Key;
 
 
 /// DHT node operations for distributed routing and storage.
@@ -51,41 +49,17 @@ pub trait DhtNodeRpc: Send + Sync + 'static {
 }
 
 
-/// PlumTree epidemic broadcast protocol operations.
+/// GossipSub epidemic broadcast protocol operations.
 #[async_trait]
-pub trait PlumTreeRpc: Send + Sync {
-    /// Send a PlumTree protocol message to a peer.
-    async fn send_plumtree(&self, to: &Contact, message: PlumTreeRequest) -> Result<()>;
-}
-
-
-/// HyParView peer sampling protocol operations.
-#[async_trait]
-pub trait HyParViewRpc: Send + Sync {
-    /// Send a HyParView protocol message to a peer.
-    async fn send_hyparview(&self, to: &Contact, message: HyParViewRequest) -> Result<()>;
+pub trait GossipSubRpc: Send + Sync {
+    /// Send a GossipSub protocol message to a peer.
+    async fn send_gossipsub(&self, to: &Contact, message: GossipSubRequest) -> Result<()>;
 }
 
 
 /// Relay operations for NAT traversal.
 #[async_trait]
 pub trait RelayRpc: Send + Sync {
-    /// Request a relay session to connect to a NAT-bound peer.
-    async fn request_relay_session(
-        &self,
-        relay: &Contact,
-        from_peer: Identity,
-        target_peer: Identity,
-        session_id: [u8; 16],
-    ) -> Result<(Connection, RelayResponse)>;
-
-    /// Register with a relay for incoming connection notifications.
-    async fn register_for_signaling(
-        &self,
-        relay: &Contact,
-        our_identity: Identity,
-    ) -> Result<tokio::sync::mpsc::Receiver<RelayResponse>>;
-
     /// Complete a relay session as the receiving peer.
     async fn complete_relay_session(
         &self,
@@ -93,6 +67,18 @@ pub trait RelayRpc: Send + Sync {
         from_peer: Identity,
         session_id: [u8; 16],
     ) -> Result<()>;
+
+    /// Request a mesh peer to act as a relay (Phase 4: opportunistic mesh relay).
+    /// 
+    /// Unlike dedicated relay servers, mesh peers provide lightweight relay
+    /// for NAT-bound peers they're already connected to.
+    async fn request_mesh_relay(
+        &self,
+        mesh_peer: &Contact,
+        from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<RelayResponse>;
 }
 
 

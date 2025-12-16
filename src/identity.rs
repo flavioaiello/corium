@@ -39,6 +39,8 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::crypto::{SignatureError, CONTACT_SIGNATURE_DOMAIN};
+
 /// Returns current time as milliseconds since Unix epoch.
 /// Used for timestamp generation in signed records.
 #[inline]
@@ -89,56 +91,22 @@ impl Keypair {
         self.signing_key.verifying_key().verify(message, signature).is_ok()
     }
 
-    /// Create an endpoint record for a publicly reachable node (can serve as relay).
+    /// Create a signed endpoint record.
     pub fn create_contact(&self, addrs: Vec<String>) -> Contact {
-        self.create_contact_full(addrs, vec![], true)
-    }
-
-    /// Create an endpoint record for a NAT-bound node with designated relays.
-    pub fn create_contact_with_relays(
-        &self,
-        addrs: Vec<String>,
-        relays: Vec<Identity>,
-    ) -> Contact {
-        // NAT-bound nodes that need relays cannot serve as relays themselves
-        self.create_contact_full(addrs, relays, false)
-    }
-
-    /// Create an endpoint record with full control over all fields.
-    pub fn create_contact_full(
-        &self,
-        addrs: Vec<String>,
-        relays: Vec<Identity>,
-        is_relay: bool,
-    ) -> Contact {
         let identity = self.identity();
         let timestamp = now_ms();
         
-        let mut data = Vec::new();
-        data.extend_from_slice(identity.as_bytes());
-        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
-        for addr in &addrs {
-            let addr_bytes = addr.as_bytes();
-            data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(addr_bytes);
-        }
-        data.extend_from_slice(&(relays.len() as u32).to_le_bytes());
-        for relay in &relays {
-            data.extend_from_slice(relay.as_bytes());
-        }
-        // Include is_relay in signature
-        data.push(if is_relay { 1 } else { 0 });
-        data.extend_from_slice(&timestamp.to_le_bytes());
+        // Build the payload to sign (without domain prefix - that's added by sign_with_domain)
+        let payload = Contact::build_signed_payload(&identity, &addrs, timestamp);
         
-        let signature = self.sign(&data);
+        // Sign with domain separation
+        let signature = crate::crypto::sign_with_domain(self, CONTACT_SIGNATURE_DOMAIN, &payload);
         
         Contact {
             identity,
             addrs,
-            relays,
-            is_relay,
             timestamp,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         }
     }
 }
@@ -251,12 +219,6 @@ impl AsRef<[u8]> for Identity {
 pub struct Contact {
     pub identity: Identity,
     pub addrs: Vec<String>,
-    /// Identities of relay nodes this peer uses for NAT traversal.
-    /// When connecting, resolve each identity via DHT to get addresses.
-    pub relays: Vec<Identity>,
-    /// Whether this node can serve as a relay for other nodes.
-    /// Nodes that are publicly reachable (passed self-probe) set this to true.
-    pub is_relay: bool,
     /// Timestamp when record was created (0 = unsigned/ephemeral).
     pub timestamp: u64,
     /// Ed25519 signature (empty = unsigned/ephemeral).
@@ -270,8 +232,6 @@ impl Contact {
         Self {
             identity,
             addrs,
-            relays: vec![],
-            is_relay: false,
             timestamp: 0,
             signature: vec![],
         }
@@ -282,20 +242,9 @@ impl Contact {
         Self::unsigned(identity, vec![addr.into()])
     }
 
-    /// Check if this record is signed.
-    /// Returns true if signature is non-empty and timestamp is non-zero.
-    pub fn is_signed(&self) -> bool {
-        !self.signature.is_empty() && self.timestamp != 0
-    }
-
     /// Get the primary address (first in the list).
     pub fn primary_addr(&self) -> Option<&str> {
         self.addrs.first().map(|s| s.as_str())
-    }
-
-    /// Iterate over all addresses.
-    pub fn all_addrs(&self) -> impl Iterator<Item = &str> {
-        self.addrs.iter().map(|s| s.as_str())
     }
 
     /// Verify the cryptographic signature of this Contact record.
@@ -303,42 +252,58 @@ impl Contact {
     /// This verifies that:
     /// 1. The record has both timestamp and signature
     /// 2. The signature was created by the identity's private key
-    /// 3. The signature covers: identity + addresses + relays + is_relay + timestamp
+    /// 3. The signature covers: domain_prefix + identity + addresses + timestamp
     /// 
     /// SECURITY: Signature verification ensures addresses are bound to the identity.
     /// An attacker cannot forge a Contact pointing to their own address.
-    pub fn verify(&self) -> bool {
+    /// 
+    /// # Returns
+    /// `Ok(())` if the signature is valid, `Err(SignatureError)` otherwise.
+    pub fn verify(&self) -> Result<(), SignatureError> {
         // Unsigned records (empty signature or zero timestamp) cannot be verified
-        if self.signature.is_empty() || self.timestamp == 0 {
-            return false;
+        if self.signature.is_empty() {
+            return Err(SignatureError::Missing);
+        }
+        if self.timestamp == 0 {
+            return Err(SignatureError::Missing);
         }
 
-        // Reconstruct the signed data exactly as it was created
+        // Reconstruct the signed payload
+        let payload = Self::build_signed_payload(
+            &self.identity,
+            &self.addrs,
+            self.timestamp,
+        );
+        
+        // Verify with domain separation
+        crate::crypto::verify_with_domain(
+            &self.identity,
+            CONTACT_SIGNATURE_DOMAIN,
+            &payload,
+            &self.signature,
+        )
+    }
+    
+    /// Build the canonical payload for Contact signatures.
+    /// 
+    /// This is the data that gets signed (domain prefix is added by crypto layer).
+    /// Format: identity(32) || addr_count(4) || [addr_len(4) || addr]* || timestamp(8)
+    #[doc(hidden)]
+    pub fn build_signed_payload(
+        identity: &Identity,
+        addrs: &[String],
+        timestamp: u64,
+    ) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(self.identity.as_bytes());
-        data.extend_from_slice(&(self.addrs.len() as u32).to_le_bytes());
-        for addr in &self.addrs {
+        data.extend_from_slice(identity.as_bytes());
+        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
+        for addr in addrs {
             let addr_bytes = addr.as_bytes();
             data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(addr_bytes);
         }
-        data.extend_from_slice(&(self.relays.len() as u32).to_le_bytes());
-        for relay in &self.relays {
-            data.extend_from_slice(relay.as_bytes());
-        }
-        // Include is_relay in signature verification
-        data.push(if self.is_relay { 1 } else { 0 });
-        data.extend_from_slice(&self.timestamp.to_le_bytes());
-        
-        let Ok(verifying_key) = VerifyingKey::try_from(self.identity.as_bytes().as_slice()) else {
-            return false;
-        };
-        let Ok(sig_bytes): Result<[u8; 64], _> = self.signature.clone().try_into() else {
-            return false;
-        };
-        let signature = Signature::from_bytes(&sig_bytes);
-        
-        verifying_key.verify_strict(&data, &signature).is_ok()
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data
     }
 
     /// Verify the signature AND freshness of this Contact record.
@@ -351,7 +316,7 @@ impl Contact {
     /// - Older than max_age_secs (stale)
     /// - More than 10 seconds in the future (clock skew tolerance)
     pub fn verify_fresh(&self, max_age_secs: u64) -> bool {
-        if !self.verify() {
+        if self.verify().is_err() {
             return false;
         }
         
@@ -375,10 +340,6 @@ impl Contact {
         true
     }
 
-    pub fn has_relays(&self) -> bool {
-        !self.relays.is_empty()
-    }
-
     pub fn has_direct_addrs(&self) -> bool {
         !self.addrs.is_empty()
     }
@@ -390,33 +351,20 @@ impl Contact {
     /// 
     /// Checks:
     /// - Address count ≤ MAX_ADDRS (16)
-    /// - Relay count ≤ MAX_RELAYS (8)  
     /// - Each address ≤ MAX_ADDR_LEN (256) and non-empty
-    /// - Each relay identity is a valid Ed25519 point
     /// - Signature length is exactly 64 bytes if non-empty (signed)
     pub fn validate_structure(&self) -> bool {
         // SECURITY: These limits prevent memory exhaustion attacks when
         // deserializing untrusted Contact records from the network.
         const MAX_ADDRS: usize = 16;
-        const MAX_RELAYS: usize = 8;
         const MAX_ADDR_LEN: usize = 256;
         
         if self.addrs.len() > MAX_ADDRS {
             return false;
         }
         
-        if self.relays.len() > MAX_RELAYS {
-            return false;
-        }
-        
         for addr in &self.addrs {
             if addr.len() > MAX_ADDR_LEN || addr.is_empty() {
-                return false;
-            }
-        }
-        
-        for relay in &self.relays {
-            if !relay.is_valid() {
                 return false;
             }
         }
@@ -655,25 +603,25 @@ mod tests {
         let addrs = vec!["192.168.1.1:8080".to_string()];
         let record = kp.create_contact(addrs);
         
-        assert!(record.verify(), "P5 violation: valid record rejected");
+        assert!(record.verify().is_ok(), "P5 violation: valid record rejected");
         
         let mut tampered = record.clone();
         let mut tampered_bytes = *tampered.identity.as_bytes();
         tampered_bytes[0] ^= 1;
         tampered.identity = Identity::from_bytes(tampered_bytes);
-        assert!(!tampered.verify(), "P5 violation: identity tampering not detected");
+        assert!(tampered.verify().is_err(), "P5 violation: identity tampering not detected");
         
         let mut tampered = record.clone();
         tampered.addrs[0] = "10.0.0.1:9999".to_string();
-        assert!(!tampered.verify(), "P5 violation: address tampering not detected");
+        assert!(tampered.verify().is_err(), "P5 violation: address tampering not detected");
         
         let mut tampered = record.clone();
         tampered.timestamp += 1;
-        assert!(!tampered.verify(), "P5 violation: timestamp tampering not detected");
+        assert!(tampered.verify().is_err(), "P5 violation: timestamp tampering not detected");
         
         let mut tampered = record.clone();
         tampered.signature[0] ^= 1;
-        assert!(!tampered.verify(), "P5 violation: signature tampering not detected");
+        assert!(tampered.verify().is_err(), "P5 violation: signature tampering not detected");
     }
 
     #[test]
@@ -766,21 +714,20 @@ mod tests {
 
         let record = keypair.create_contact(addrs);
 
-        assert!(record.verify());
-        assert!(record.verify_fresh(3600));    }
+        assert!(record.verify().is_ok());
+        assert!(record.verify_fresh(3600));
+    }
 
     #[test]
-    fn record_with_relays_verifies() {
+    fn record_with_multiple_addrs_verifies() {
         let keypair = Keypair::generate();
-        let relay_keypair = Keypair::generate();
 
-        let relays = vec![relay_keypair.identity()];
+        let record = keypair.create_contact(vec![
+            "192.168.1.1:8080".to_string(),
+            "10.0.0.1:8080".to_string(),
+        ]);
 
-        let record =
-            keypair.create_contact_with_relays(vec!["192.168.1.1:8080".to_string()], relays);
-
-        assert!(record.verify());
-        assert!(record.has_relays());
+        assert!(record.verify().is_ok());
         assert!(record.has_direct_addrs());
     }
 
@@ -791,7 +738,7 @@ mod tests {
 
         record.addrs = vec!["attacker.com:8080".to_string()];
 
-        assert!(!record.verify());
+        assert!(record.verify().is_err());
     }
 
     #[test]
@@ -805,7 +752,7 @@ mod tests {
             attacker_keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
         record.signature = attacker_record.signature;
 
-        assert!(!record.verify());
+        assert!(record.verify().is_err());
     }
 
     #[test]
@@ -820,31 +767,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let old_timestamp = now_ms - (2 * 60 * 60 * 1000);
-        let mut data = Vec::new();
-        data.extend_from_slice(identity.as_bytes());
-        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
-        for addr in &addrs {
-            let addr_bytes = addr.as_bytes();
-            data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(addr_bytes);
-        }
-        data.extend_from_slice(&(0u32).to_le_bytes());        // Include is_relay in signature (false = 0)
-        data.push(0);
-        data.extend_from_slice(&old_timestamp.to_le_bytes());
-
-        let signature = keypair.sign(&data);
+        let old_timestamp = now_ms - (2 * 60 * 60 * 1000); // 2 hours ago
+        
+        // Build the payload and sign with domain separation
+        let payload = Contact::build_signed_payload(&identity, &addrs, old_timestamp);
+        let signature = crate::crypto::sign_with_domain(&keypair, crate::crypto::CONTACT_SIGNATURE_DOMAIN, &payload);
 
         let old_record = Contact {
             identity,
             addrs,
-            relays: vec![],
-            is_relay: false,
             timestamp: old_timestamp,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         };
 
-        assert!(old_record.verify());        assert!(!old_record.verify_fresh(3600));    }
+        // Signature should be valid (cryptographically correct)
+        assert!(old_record.verify().is_ok());
+        // But freshness check should fail (record is stale)
+        assert!(!old_record.verify_fresh(3600));
+    }
 
     #[test]
     fn future_dated_records_rejected() {
@@ -858,32 +798,22 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let future_timestamp = now_ms + (2 * 60 * 60 * 1000);
-        let mut data = Vec::new();
-        data.extend_from_slice(identity.as_bytes());
-        data.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
-        for addr in &addrs {
-            let addr_bytes = addr.as_bytes();
-            data.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(addr_bytes);
-        }
-        data.extend_from_slice(&(0u32).to_le_bytes());
-        // Include is_relay in signature (false = 0)
-        data.push(0);
-        data.extend_from_slice(&future_timestamp.to_le_bytes());
-
-        let signature = keypair.sign(&data);
+        let future_timestamp = now_ms + (2 * 60 * 60 * 1000); // 2 hours in future
+        
+        // Build the payload and sign with domain separation
+        let payload = Contact::build_signed_payload(&identity, &addrs, future_timestamp);
+        let signature = crate::crypto::sign_with_domain(&keypair, crate::crypto::CONTACT_SIGNATURE_DOMAIN, &payload);
 
         let future_record = Contact {
             identity,
             addrs,
-            relays: vec![],
-            is_relay: false,
             timestamp: future_timestamp,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         };
 
-        assert!(!future_record.verify_fresh(3600));    }
+        // Future-dated record should fail freshness check
+        assert!(!future_record.verify_fresh(3600));
+    }
 
     #[test]
     fn structure_validation_limits() {
@@ -909,7 +839,7 @@ mod tests {
         record.signature = record.signature[..32].to_vec();
 
         assert!(!record.validate_structure());
-        assert!(!record.verify());
+        assert!(record.verify().is_err());
     }
 
     #[test]
@@ -925,8 +855,8 @@ mod tests {
 
         assert_ne!(record1.signature, record2.signature);
 
-        assert!(record1.verify());
-        assert!(record2.verify());
+        assert!(record1.verify().is_ok());
+        assert!(record2.verify().is_ok());
     }
 
     #[test]

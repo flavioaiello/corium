@@ -4,15 +4,14 @@
 //!
 //! - **Identity**: Ed25519-based cryptographic identities (32-byte public keys)
 //! - **DHT**: Kademlia-style distributed hash table for peer discovery and data storage
-//! - **Membership**: HyParView protocol for maintaining partial mesh views
-//! - **PubSub**: PlumTree epidemic broadcast for reliable message dissemination
+//! - **PubSub**: GossipSub epidemic broadcast for reliable message dissemination
 //! - **Transport**: SmartSock with automatic path selection (direct/relay)
 //! - **NAT Traversal**: UDP relay infrastructure for NAT-bound nodes
 //!
 //! ## Architecture
 //!
 //! The codebase uses the **Actor Pattern** extensively for safe concurrent state:
-//! - Each component (DHT, HyParView, PlumTree, Relay) has a public Handle and private Actor
+//! - Each component (DHT, GossipSub, Relay) has a public Handle and private Actor
 //! - Handles are cheap to clone and communicate via async channels
 //! - Actors own all mutable state and process commands sequentially
 //!
@@ -30,11 +29,8 @@
 //! | `node` | High-level API combining all components |
 //! | `identity` | Keypairs, Identities, signed Contacts |
 //! | `crypto` | TLS certificate generation and verification |
-//! | `dht` | Kademlia DHT with adaptive parameters |
-//! | `routing` | XOR-metric routing table implementation |
-//! | `storage` | DHT value storage with pressure-based eviction |
-//! | `hyparview` | Membership protocol for partial mesh views |
-//! | `plumtree` | Epidemic broadcast tree for PubSub |
+//! | `dht` | Kademlia DHT with adaptive parameters, XOR-metric routing, and storage |
+//! | `gossipsub` | Epidemic broadcast for PubSub |
 //! | `relay` | UDP relay server/client for NAT traversal |
 //! | `transport` | SmartSock multi-path transport layer |
 //! | `protocols` | Protocol trait definitions (DhtNodeRpc, etc.) |
@@ -43,16 +39,13 @@
 
 mod crypto;
 mod dht;
-mod hyparview;
 mod identity;
 mod messages;
 mod node;
-mod plumtree;
+mod gossipsub;
 mod protocols;
 mod relay;
-mod routing;
 mod rpc;
-mod storage;
 mod transport;
 
-pub use node::Node;
+pub use node::{Identity, Node};
