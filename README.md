@@ -1,6 +1,6 @@
 # Corium
 
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/corium.svg)](https://crates.io/crates/corium)
 [![Documentation](https://docs.rs/corium/badge.svg)](https://docs.rs/corium)
