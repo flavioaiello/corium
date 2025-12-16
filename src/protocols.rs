@@ -88,5 +88,5 @@ pub trait PlainRpc: Send + Sync {
     /// Send a request directly to a peer and receive a response.
     /// 
     /// The caller sends a request and blocks until a response is received.
-    async fn send_request(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>>;
+    async fn send(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>>;
 }

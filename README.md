@@ -63,7 +63,7 @@ while let Some(msg) = rx.recv().await {
 }
 ```
 
-### Request-Response (like libp2p)
+### Request-Response
 
 ```rust
 // Set up a request handler (echo server)
@@ -73,7 +73,7 @@ node.set_request_handler(|from, request| {
 }).await?;
 
 // Send a request and get a response
-let response = node.send_request("peer_identity_hex", b"Hello!".to_vec()).await?;
+let response = node.send("peer_identity_hex", b"Hello!".to_vec()).await?;
 println!("Response: {:?}", response);
 
 // Or use the low-level API for async handling

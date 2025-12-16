@@ -86,6 +86,37 @@ async fn node_smartsock_accessor() {
 }
 
 #[tokio::test]
+async fn node_routable_addresses_specific_ip() {
+    // When binding to a specific IP, routable_addresses returns it directly
+    let node = Node::bind(&test_addr()).await.expect("bind failed");
+    
+    let addrs = node.routable_addresses();
+    assert_eq!(addrs.len(), 1);
+    assert!(addrs[0].starts_with("127.0.0.1:"), "should return the specific IP");
+}
+
+#[tokio::test]
+async fn node_routable_addresses_unspecified() {
+    // When binding to 0.0.0.0, routable_addresses returns all local interface addresses
+    let port = next_port();
+    let node = Node::bind(&format!("0.0.0.0:{}", port)).await.expect("bind failed");
+    
+    let addrs = node.routable_addresses();
+    
+    // Should have at least loopback
+    assert!(!addrs.is_empty(), "should have at least one address");
+    
+    // All addresses should have the correct port
+    for addr in &addrs {
+        assert!(addr.ends_with(&format!(":{}", port)), "all addresses should have correct port");
+    }
+    
+    // Should include loopback
+    let has_loopback = addrs.iter().any(|a| a.starts_with("127.0.0.1:"));
+    assert!(has_loopback, "should include loopback address");
+}
+
+#[tokio::test]
 async fn node_relay_capability() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
@@ -533,7 +564,7 @@ async fn request_response_echo() {
     }).await.expect("set_request_handler failed");
     
     // Node2 sends a request and receives a response
-    let response = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"hello".to_vec()))
+    let response = timeout(TEST_TIMEOUT, node2.send(&node1_id, b"hello".to_vec()))
         .await
         .expect("request timeout")
         .expect("request failed");
@@ -563,7 +594,7 @@ async fn request_response_with_incoming_requests() {
     });
     
     // Node2 sends a request
-    let response = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"test data".to_vec()))
+    let response = timeout(TEST_TIMEOUT, node2.send(&node1_id, b"test data".to_vec()))
         .await
         .expect("request timeout")
         .expect("request failed");
@@ -591,12 +622,12 @@ async fn request_response_bidirectional() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node2 → Node1
-    let resp1 = timeout(TEST_TIMEOUT, node2.send_request(&node1_id, b"ping".to_vec()))
+    let resp1 = timeout(TEST_TIMEOUT, node2.send(&node1_id, b"ping".to_vec()))
         .await.expect("timeout").expect("failed");
     assert_eq!(resp1, b"from node1".to_vec());
     
     // Node1 → Node2
-    let resp2 = timeout(TEST_TIMEOUT, node1.send_request(&node2_id, b"ping".to_vec()))
+    let resp2 = timeout(TEST_TIMEOUT, node1.send(&node2_id, b"ping".to_vec()))
         .await.expect("timeout").expect("failed");
     assert_eq!(resp2, b"from node2".to_vec());
 }

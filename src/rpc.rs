@@ -717,7 +717,7 @@ impl GossipSubRpc for RpcNode {
 
 #[async_trait]
 impl PlainRpc for RpcNode {
-    async fn send_request(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>> {
+    async fn send(&self, to: &Contact, request: Vec<u8>) -> Result<Vec<u8>> {
         let rpc_request = RpcRequest::Plain(request);
         match self.rpc_raw(to, rpc_request).await? {
             RpcResponse::Plain(response) => Ok(response),

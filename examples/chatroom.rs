@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
 
             let dm_payload = format!("{}@{}: {}", args.name, my_id_prefix, message);
             
-            match node.send_request(peer_identity, dm_payload.into_bytes()).await {
+            match node.send(peer_identity, dm_payload.into_bytes()).await {
                 Ok(response) => {
                     let response_text = String::from_utf8_lossy(&response);
                     println!("\x1b[33m[dm → {}...]\x1b[0m {} (ack: {})", &peer_identity[..8], message, response_text);

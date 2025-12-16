@@ -186,19 +186,15 @@ pub const MAX_MESSAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // ============================================================================
 
 /// Default score threshold for graylist (don't accept messages from).
-/// Per libp2p: 0 (disabled by default).
 pub const DEFAULT_GRAYLIST_THRESHOLD: f64 = -100.0;
 
 /// Default score threshold for publish (don't publish to).
-/// Per libp2p: 0 (disabled by default).
 pub const DEFAULT_PUBLISH_THRESHOLD: f64 = -50.0;
 
 /// Default score threshold for gossip (don't gossip to).
-/// Per libp2p: 0 (disabled by default).
 pub const DEFAULT_GOSSIP_THRESHOLD: f64 = -25.0;
 
 /// Default decay interval for peer scores.
-/// Per libp2p: 1 second.
 pub const DEFAULT_DECAY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default decay to zero threshold.
@@ -206,35 +202,27 @@ pub const DEFAULT_DECAY_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_DECAY_TO_ZERO: f64 = 0.01;
 
 /// Default P1 weight (time in mesh).
-/// Per libp2p: 1.0.
 pub const DEFAULT_P1_WEIGHT: f64 = 1.0;
 
 /// Default P2 weight (first message deliveries).
-/// Per libp2p: 1.0.
 pub const DEFAULT_P2_WEIGHT: f64 = 1.0;
 
 /// Default P3 weight (mesh message delivery rate).
-/// Per libp2p: 0.0 (disabled).
 pub const DEFAULT_P3_WEIGHT: f64 = 0.0;
 
 /// Default P3b weight (mesh failure penalty).
-/// Per libp2p: 0.0 (disabled).
 pub const DEFAULT_P3B_WEIGHT: f64 = 0.0;
 
 /// Default P4 weight (invalid messages).
-/// Per libp2p: -100.0 (negative).
 pub const DEFAULT_P4_WEIGHT: f64 = -100.0;
 
 /// Default P5 weight (application-specific score).
-/// Per libp2p: 1.0.
 pub const DEFAULT_P5_WEIGHT: f64 = 1.0;
 
 /// Default P6 weight (IP colocation factor).
-/// Per libp2p: 0.0 (disabled).
 pub const DEFAULT_P6_WEIGHT: f64 = 0.0;
 
 /// Default P7 weight (behavioural penalty).
-/// Per libp2p: -10.0 (negative).
 pub const DEFAULT_P7_WEIGHT: f64 = -10.0;
 
 /// Default time in mesh quantum for P1 scoring.
@@ -251,37 +239,31 @@ pub const DEFAULT_FIRST_MESSAGE_DELIVERIES_CAP: f64 = 100.0;
 pub const MAX_SCORED_PEERS: usize = 10_000;
 
 // ============================================================================
-// GossipSub v1.1 Mesh Parameters (per libp2p spec)
+// GossipSub v1.1 Mesh Parameters
 // ============================================================================
 
 /// D - Target number of peers in the mesh per topic.
-/// Per libp2p GossipSub spec: default is 6.
 pub const DEFAULT_MESH_N: usize = 6;
 
 /// D_lo - Minimum mesh size before adding peers.
-/// Per libp2p GossipSub spec: default is 5.
 pub const DEFAULT_MESH_N_LOW: usize = 5;
 
 /// D_hi - Maximum mesh size before pruning.
-/// Per libp2p GossipSub spec: default is 12.
 pub const DEFAULT_MESH_N_HIGH: usize = 12;
 
 /// D_out - Minimum outbound peers in mesh (connection direction matters).
-/// Per libp2p GossipSub spec: default is 2.
 /// SECURITY: Prevents eclipse attacks by requiring outbound connections.
 pub const DEFAULT_MESH_OUTBOUND_MIN: usize = 2;
 
 /// D_lazy - Number of peers to gossip IHAVE to during heartbeat.
-/// Per libp2p GossipSub spec: default is 6.
 pub const DEFAULT_GOSSIP_LAZY: usize = 6;
 
 /// Default PRUNE backoff duration in seconds.
-/// Per libp2p GossipSub spec: default is 60 seconds.
 pub const DEFAULT_PRUNE_BACKOFF_SECS: u64 = 60;
 
 /// GossipSub configuration.
 /// 
-/// Contains all tunable parameters per the libp2p GossipSub v1.1 spec.
+/// Contains all tunable parameters per the GossipSub v1.1 spec.
 /// Some fields may not be read internally but are exposed for library users
 /// to configure when building custom implementations.
 #[derive(Clone, Debug)]
@@ -387,7 +369,6 @@ impl Default for GossipSubConfig {
 // ============================================================================
 
 /// Topic-specific score parameters.
-/// Per libp2p GossipSub v1.1 spec.
 /// 
 /// Some fields may not be read internally but are exposed for library users
 /// to configure custom scoring policies.
@@ -1829,26 +1810,9 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             self.queue_message(&peer, publish_msg.clone()).await;
         }
 
-        if self.subscriptions.contains(topic) {
-            let received = ReceivedMessage {
-                topic: topic.to_string(),
-                source: self.local_identity,
-                seqno,
-                data,
-                msg_id,
-                received_at: Instant::now(),
-            };
-            trace!(
-                topic = %received.topic,
-                seqno = received.seqno,
-                msg_id = %hex::encode(&received.msg_id[..8]),
-                data_len = received.data.len(),
-                "delivering local message to subscriber"
-            );
-            if self.message_tx.send(received).await.is_err() {
-                warn!("message channel closed during local delivery");
-            }
-        }
+        // NOTE: We do NOT deliver to local subscriber here.
+        // GossipSub semantics: publishers do not receive their own messages.
+        // The message is only forwarded to eager peers for network delivery.
 
         debug!(
             topic = %topic,

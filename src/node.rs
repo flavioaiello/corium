@@ -33,7 +33,7 @@
 //! - **GossipSub**: Epidemic broadcast for PubSub
 //! - **RelayClient**: NAT traversal via relay servers
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -258,6 +258,87 @@ impl Node {
             .context("failed to get local address")
     }
     
+    /// Returns routable addresses for this node.
+    /// 
+    /// When bound to a specific IP (e.g., `192.168.1.10:8000`), returns that address.
+    /// When bound to `0.0.0.0` or `::`, enumerates all local network interfaces
+    /// and returns their addresses with the bound port.
+    /// 
+    /// # Returns
+    /// A vector of routable socket address strings.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // Bound to 0.0.0.0:8000 on a machine with eth0=192.168.1.10 and lo=127.0.0.1
+    /// let addrs = node.routable_addresses();
+    /// // Returns: ["192.168.1.10:8000", "127.0.0.1:8000"]
+    /// ```
+    pub fn routable_addresses(&self) -> Vec<String> {
+        let local = match self.endpoint.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => return Vec::new(),
+        };
+        
+        let ip = local.ip();
+        let port = local.port();
+        
+        // Check if bound to unspecified (0.0.0.0 or ::)
+        if ip.is_unspecified() {
+            // Enumerate all local network interfaces
+            Self::enumerate_local_addresses(port, ip.is_ipv4())
+        } else {
+            vec![local.to_string()]
+        }
+    }
+    
+    /// Enumerate all local network interface addresses.
+    fn enumerate_local_addresses(port: u16, ipv4_only: bool) -> Vec<String> {
+        let mut addresses = Vec::new();
+        
+        // Try to get network interfaces
+        if let Ok(interfaces) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            // Get local address to verify we can bind
+            if interfaces.local_addr().is_ok() {
+                // Use DNS to get all local addresses (cross-platform)
+                if let Ok(hostname) = std::process::Command::new("hostname").output() {
+                    let hostname = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+                    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
+                        &format!("{}:0", hostname)
+                    ) {
+                        for addr in addrs {
+                            if ipv4_only && !addr.is_ipv4() {
+                                continue;
+                            }
+                            if !addr.ip().is_loopback() {
+                                addresses.push(SocketAddr::new(addr.ip(), port).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Always include loopback as fallback
+        let loopback = if ipv4_only {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        };
+        
+        // Add loopback if not already present
+        let loopback_str = SocketAddr::new(loopback, port).to_string();
+        if !addresses.iter().any(|a| a == &loopback_str) {
+            addresses.push(loopback_str);
+        }
+        
+        // If no addresses found, return just loopback
+        if addresses.is_empty() {
+            addresses.push(SocketAddr::new(loopback, port).to_string());
+        }
+        
+        addresses
+    }
+    
     
     pub fn keypair(&self) -> &Keypair {
         &self.keypair
@@ -325,6 +406,17 @@ impl Node {
     }
     
     pub async fn publish_address(&self, addresses: Vec<String>) -> Result<()> {
+        // Warn if any address is unroutable (0.0.0.0 or ::)
+        for addr in &addresses {
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+                if socket_addr.ip().is_unspecified() {
+                    warn!(
+                        "publishing unroutable address '{}' - use routable_addresses() or provide explicit IPs",
+                        addr
+                    );
+                }
+            }
+        }
         self.dhtnode.publish_address(&self.keypair, addresses).await
     }
     
@@ -705,14 +797,14 @@ impl Node {
     /// 
     /// # Returns
     /// The response data from the peer
-    pub async fn send_request(&self, identity: &str, request: Vec<u8>) -> Result<Vec<u8>> {
+    pub async fn send(&self, identity: &str, request: Vec<u8>) -> Result<Vec<u8>> {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
         let contact = self.resolve(&peer_identity).await?
             .context("peer not found")?;
         
-        self.rpcnode.send_request(&contact, request).await
+        self.rpcnode.send(&contact, request).await
     }
     
     /// Set a request handler to process incoming requests.

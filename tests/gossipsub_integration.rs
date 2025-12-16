@@ -359,19 +359,20 @@ async fn message_signature_verification() {
 // Test: Publisher receives own messages (loopback)
 // =============================================================================
 
-/// Test that a node receives its own published messages (loopback delivery).
-/// This is the intended behavior in Corium's GossipSub implementation.
+/// Test that publishers do NOT receive their own messages (standard GossipSub).
+/// Only remote peers receive published messages, not the publisher itself.
 #[tokio::test]
-async fn publisher_receives_own_messages_loopback() {
+async fn publisher_does_not_receive_own_messages() {
     let node_a = Node::bind(&test_addr()).await.expect("node_a bind failed");
     let node_b = Node::bind(&test_addr()).await.expect("node_b bind failed");
     
     let node_a_id = node_a.identity();
+    let node_b_id = node_b.identity();
     let node_a_addr = node_a.local_addr().unwrap().to_string();
     
     node_b.bootstrap(&node_a_id, &node_a_addr).await.expect("bootstrap failed");
     
-    let topic = "loopback-test";
+    let topic = "no-loopback-test";
     
     node_a.subscribe(topic).await.expect("node_a subscribe failed");
     node_b.subscribe(topic).await.expect("node_b subscribe failed");
@@ -384,28 +385,26 @@ async fn publisher_receives_own_messages_loopback() {
     // Node A publishes
     node_a.publish(topic, b"from A".to_vec()).await.expect("A publish failed");
     
-    // Node A should receive its own message (loopback)
-    let msg_a = timeout(TEST_TIMEOUT, rx_a.recv()).await
-        .expect("A loopback timeout")
-        .expect("A channel closed");
-    assert_eq!(msg_a.from, node_a_id, "loopback source should be self");
-    assert_eq!(msg_a.data, b"from A".to_vec());
-    
-    // Node B should also receive
+    // Node B should receive the message
     let msg_b = timeout(TEST_TIMEOUT, rx_b.recv()).await
         .expect("B receive timeout")
         .expect("B channel closed");
     assert_eq!(msg_b.from, node_a_id);
+    assert_eq!(msg_b.data, b"from A".to_vec());
     
-    // Node B publishes
-    let node_b_id = node_b.identity();
+    // Node B publishes - Node A should receive
     node_b.publish(topic, b"from B".to_vec()).await.expect("B publish failed");
     
-    // Node A should receive from B
-    let msg_from_b = timeout(TEST_TIMEOUT, rx_a.recv()).await
+    let msg_a = timeout(TEST_TIMEOUT, rx_a.recv()).await
         .expect("A receive from B timeout")
         .expect("A channel closed");
-    assert_eq!(msg_from_b.from, node_b_id);
+    assert_eq!(msg_a.from, node_b_id);
+    assert_eq!(msg_a.data, b"from B".to_vec());
+    
+    // Verify A did NOT receive its own message (should be empty or only have B's message)
+    // Since we already consumed msg_a (from B), rx_a should be empty now
+    let extra = timeout(Duration::from_millis(100), rx_a.recv()).await;
+    assert!(extra.is_err(), "Node A should NOT have received its own message");
 }
 
 // =============================================================================
@@ -456,4 +455,28 @@ async fn chain_topology_propagation() {
     
     assert_eq!(msg.from, node_a_id);
     assert_eq!(msg.data, b"from the start".to_vec());
+}
+
+// =============================================================================
+// Test: Single node loopback (publish → receive on same node)
+// =============================================================================
+
+/// Test that a single node does NOT receive its own published message.
+/// GossipSub should not deliver messages back to the publisher.
+#[tokio::test]
+async fn single_node_no_loopback() {
+    let node = Node::bind(&test_addr()).await.expect("node bind failed");
+    
+    let topic = "loopback-test";
+    node.subscribe(topic).await.expect("subscribe failed");
+    
+    let mut rx = node.messages().await.expect("messages failed");
+    
+    // Publish a message
+    node.publish(topic, b"hello myself".to_vec()).await.expect("publish failed");
+    
+    // Wait briefly and verify NO message is received (loopback should be suppressed)
+    let result = timeout(Duration::from_millis(200), rx.recv()).await;
+    
+    assert!(result.is_err(), "single node should NOT receive its own published message");
 }
