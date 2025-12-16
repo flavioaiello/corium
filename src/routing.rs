@@ -165,7 +165,16 @@ impl Bucket {
     fn touch(&mut self, contact: Contact, k: usize) -> BucketTouchOutcome {
         if let Some(pos) = self.contacts.iter().position(|c| c.identity == contact.identity) {
             let existing = self.contacts.remove(pos);
-            self.contacts.push(existing);
+            // Prefer signed/newer contact over unsigned/older one
+            let updated = if contact.signature.len() > existing.signature.len()
+                || (contact.signature.len() == existing.signature.len()
+                    && contact.timestamp > existing.timestamp)
+            {
+                contact
+            } else {
+                existing
+            };
+            self.contacts.push(updated);
             self.mark_refreshed();
             return BucketTouchOutcome::Refreshed;
         }
@@ -384,6 +393,20 @@ impl RoutingTable {
         if bucket_idx < self.buckets.len() {
             self.buckets[bucket_idx].mark_refreshed();
         }
+    }
+
+    /// Look up a contact by identity.
+    /// Returns the contact if found in the routing table, None otherwise.
+    pub(crate) fn lookup_contact(&self, identity: &Identity) -> Option<Contact> {
+        if *identity == self.self_id {
+            return None;
+        }
+        let idx = bucket_index(&self.self_id, identity);
+        self.buckets[idx]
+            .contacts
+            .iter()
+            .find(|c| c.identity == *identity)
+            .cloned()
     }
 }
 

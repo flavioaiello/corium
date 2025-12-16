@@ -34,7 +34,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::identity::Identity;
 use crate::messages::{RelayRequest, RelayResponse};
-use crate::rpc::DhtNodeRpc;  // For check_reachability and ping;
+use crate::protocols::{DhtNodeRpc, RelayRpc};
 
 
 // ============================================================================
@@ -646,7 +646,7 @@ impl RelayClient {
         // SECURITY: Validate that the relay address matches our registered relay.
         // This prevents malicious relays or MITM attacks from directing us to send
         // UDP traffic to arbitrary third-party addresses (amplification vector).
-        {
+        let relay_identity = {
             let registered = self.registered_relay.read().await;
             let registered_relay = registered.as_ref()
                 .context("cannot accept incoming connection: not registered with any relay")?;
@@ -674,12 +674,16 @@ impl RelayClient {
                     relay_addr
                 );
             }
-        }
+            
+            // Build a contact for the relay using its identity and data address
+            registered_relay.identity
+        };
+        
+        let relay_contact = crate::identity::Contact::single(relay_identity, incoming.relay_data_addr.clone());
         
         self.rpc
             .complete_relay_session(
-                &incoming.relay_data_addr,
-                self.keypair.identity(),
+                &relay_contact,
                 from_peer,
                 incoming.session_id,
             )

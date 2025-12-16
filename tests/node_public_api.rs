@@ -410,7 +410,7 @@ async fn signed_contact_publish_and_resolve() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node2 resolves node1's contact - this verifies signature internally
-    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     
@@ -476,7 +476,7 @@ async fn signed_contact_with_relays_resolves() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node2 resolves - signature verification includes relay field
-    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     
@@ -512,7 +512,7 @@ async fn three_node_signed_contact_network() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     
     // Node3 should be able to resolve node1 through the DHT
-    let resolved = timeout(TEST_TIMEOUT, node3.resolve_peer(&node1.peer_identity())).await
+    let resolved = timeout(TEST_TIMEOUT, node3.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     

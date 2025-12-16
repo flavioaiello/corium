@@ -37,7 +37,8 @@
 //! | `plumtree` | Epidemic broadcast tree for PubSub |
 //! | `relay` | UDP relay server/client for NAT traversal |
 //! | `transport` | SmartSock multi-path transport layer |
-//! | `rpc` | QUIC-based RPC layer for all protocols |
+//! | `protocols` | Protocol trait definitions (DhtNodeRpc, etc.) |
+//! | `rpc` | QUIC-based RPC layer implementing protocols |
 //! | `messages` | Serialization types for all wire protocols |
 
 mod crypto;
@@ -47,6 +48,7 @@ mod identity;
 mod messages;
 mod node;
 mod plumtree;
+mod protocols;
 mod relay;
 mod routing;
 mod rpc;

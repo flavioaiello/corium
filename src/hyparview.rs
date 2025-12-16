@@ -44,9 +44,9 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::identity::Identity;
-use crate::messages::{HyParViewMessage, Priority};
-use crate::rpc::HyParViewRpc;
+use crate::identity::{Contact, Identity};
+use crate::messages::{HyParViewRequest, Priority};
+use crate::protocols::HyParViewRpc;
 
 
 #[derive(Clone, Debug)]
@@ -98,10 +98,9 @@ impl Default for HyParViewConfig {
 
 #[async_trait::async_trait]
 pub trait NeighborCallback: Send + Sync {
-    async fn neighbor_up(&self, peer: Identity);
+    async fn neighbor_up(&self, peer: Contact);
     async fn neighbor_down(&self, peer: &Identity);
 }
-
 
 // ============================================================================
 // Commands sent from Handle to Actor
@@ -109,8 +108,8 @@ pub trait NeighborCallback: Send + Sync {
 
 enum Command {
     SetNeighborCallback(Arc<dyn NeighborCallback>),
-    RequestJoin(Identity),
-    HandleMessage { from: Identity, message: HyParViewMessage },
+    RequestJoin(Contact),
+    HandleMessage { from: Contact, message: HyParViewRequest },
     HandlePeerDisconnected(Identity),
     Quit,
     // Test-only queries with response channels
@@ -125,15 +124,24 @@ enum Command {
 // HyParView Handle (public API - cheap to clone)
 // ============================================================================
 
-#[derive(Clone)]
-pub struct HyParView {
+pub struct HyParView<N: HyParViewRpc> {
     cmd_tx: mpsc::Sender<Command>,
+    _marker: std::marker::PhantomData<N>,
 }
 
-impl HyParView {
+impl<N: HyParViewRpc> Clone for HyParView<N> {
+    fn clone(&self) -> Self {
+        Self {
+            cmd_tx: self.cmd_tx.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: HyParViewRpc + Send + Sync + 'static> HyParView<N> {
     /// Spawn a new HyParView actor and return a handle to it.
     /// The actor runs until all handles are dropped.
-    pub fn spawn<N: HyParViewRpc + Send + Sync + 'static>(
+    pub fn spawn(
         me: Identity,
         config: HyParViewConfig,
         network: Arc<N>,
@@ -143,27 +151,29 @@ impl HyParView {
         let actor = HyParViewActor::new(me, config, network);
         tokio::spawn(actor.run(cmd_rx));
         
-        Self { cmd_tx }
+        Self { cmd_tx, _marker: std::marker::PhantomData }
     }
 
     pub async fn set_neighbor_callback(&self, callback: Arc<dyn NeighborCallback>) {
         let _ = self.cmd_tx.send(Command::SetNeighborCallback(callback)).await;
     }
 
-    pub async fn request_join(&self, bootstrap: Identity) {
+    pub async fn request_join(&self, bootstrap: Contact) {
         let _ = self.cmd_tx.send(Command::RequestJoin(bootstrap)).await;
-    }
-
-    pub async fn handle_message(&self, from: Identity, message: HyParViewMessage) {
-        let _ = self.cmd_tx.send(Command::HandleMessage { from, message }).await;
-    }
-
-    pub async fn handle_peer_disconnected(&self, peer: Identity) {
-        let _ = self.cmd_tx.send(Command::HandlePeerDisconnected(peer)).await;
     }
 
     pub async fn quit(&self) {
         let _ = self.cmd_tx.send(Command::Quit).await;
+    }
+
+    /// Handle an incoming HyParView protocol message from a peer.
+    pub async fn handle_message(&self, from: Contact, message: HyParViewRequest) {
+        let _ = self.cmd_tx.send(Command::HandleMessage { from, message }).await;
+    }
+
+    /// Handle notification that a peer has disconnected.
+    pub async fn handle_peer_disconnected(&self, peer: Identity) {
+        let _ = self.cmd_tx.send(Command::HandlePeerDisconnected(peer)).await;
     }
 
     /// Query the active view (connected peers). Test-only.
@@ -197,8 +207,13 @@ struct HyParViewActor<N: HyParViewRpc> {
     network: Arc<N>,
     neighbor_callback: Option<Arc<dyn NeighborCallback>>,
     
+    /// Active view: identities of peers we have bidirectional connections with.
     active_view: HashSet<Identity>,
+    /// Passive view: identities of backup candidates for active view repair.
     passive_view: HashSet<Identity>,
+    /// Contact cache: maps Identity → Contact for sending messages.
+    /// Contacts are learned when peers connect to us or when we connect to them.
+    contacts: HashMap<Identity, Contact>,
     pending_neighbors: HashMap<Identity, Instant>,
     /// Tracks peers that sent Disconnect { alive: true } for graceful handling.
     /// SECURITY: Bounded to MAX_ALIVE_DISCONNECTING entries with timestamp-based eviction.
@@ -216,10 +231,31 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             neighbor_callback: None,
             active_view: HashSet::new(),
             passive_view: HashSet::new(),
+            contacts: HashMap::new(),
             pending_neighbors: HashMap::new(),
             alive_disconnecting: HashMap::new(),
             last_shuffle: Instant::now(),
             rng: rand::rngs::StdRng::from_entropy(),
+        }
+    }
+
+    /// Get the contact for a peer, if known.
+    fn get_contact(&self, identity: &Identity) -> Option<&Contact> {
+        self.contacts.get(identity)
+    }
+
+    /// Store a contact for a peer.
+    fn store_contact(&mut self, contact: Contact) {
+        self.contacts.insert(contact.identity, contact);
+    }
+
+    /// Send a HyParView message to a peer by identity.
+    /// Returns Ok if sent, Err if contact not known.
+    async fn send_to_peer(&self, to: &Identity, message: HyParViewRequest) -> anyhow::Result<()> {
+        if let Some(contact) = self.get_contact(to) {
+            self.network.send_hyparview(contact, message).await
+        } else {
+            anyhow::bail!("no contact for peer {}", hex::encode(&to.as_bytes()[..8]))
         }
     }
 
@@ -275,39 +311,47 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         debug!("HyParView actor shutting down");
     }
 
-    async fn request_join(&mut self, bootstrap: Identity) {
-        if bootstrap == self.me {
+    async fn request_join(&mut self, bootstrap: Contact) {
+        let bootstrap_id = bootstrap.identity;
+        if bootstrap_id == self.me {
             return;
         }
 
-        if let Err(e) = self.network.send_hyparview(&bootstrap, self.me, HyParViewMessage::Join).await {
-            warn!(peer = %hex::encode(&bootstrap.as_bytes()[..8]), error = %e, "failed to send Join");
+        // Store the contact for future messages
+        self.store_contact(bootstrap.clone());
+
+        if let Err(e) = self.network.send_hyparview(&bootstrap, HyParViewRequest::Join).await {
+            warn!(peer = %hex::encode(&bootstrap_id.as_bytes()[..8]), error = %e, "failed to send Join");
             return;
         }
 
-        self.add_to_active(bootstrap, Priority::High, true).await;
+        self.add_to_active(bootstrap_id, Priority::High, true).await;
     }
 
-    async fn handle_message(&mut self, from: Identity, message: HyParViewMessage) {
+    async fn handle_message(&mut self, from: Contact, message: HyParViewRequest) {
+        // Store the contact so we can send messages back
+        let from_id = from.identity;
+        self.store_contact(from);
+
         match message {
-            HyParViewMessage::Join => self.on_join(from).await,
-            HyParViewMessage::ForwardJoin { new_peer, ttl } => {
-                self.on_forward_join(from, new_peer, ttl).await;
+            HyParViewRequest::Join => self.on_join(from_id).await,
+            HyParViewRequest::ForwardJoin { new_peer, ttl } => {
+                self.on_forward_join(from_id, new_peer, ttl).await;
             }
-            HyParViewMessage::Neighbor { priority } => {
-                self.on_neighbor(from, priority).await;
+            HyParViewRequest::Neighbor { priority } => {
+                self.on_neighbor(from_id, priority).await;
             }
-            HyParViewMessage::NeighborReply { accepted } => {
-                self.on_neighbor_reply(from, accepted).await;
+            HyParViewRequest::NeighborReply { accepted } => {
+                self.on_neighbor_reply(from_id, accepted).await;
             }
-            HyParViewMessage::Shuffle { origin, peers, ttl } => {
-                self.on_shuffle(from, origin, peers, ttl).await;
+            HyParViewRequest::Shuffle { origin, peers, ttl } => {
+                self.on_shuffle(from_id, origin, peers, ttl).await;
             }
-            HyParViewMessage::ShuffleReply { peers } => {
+            HyParViewRequest::ShuffleReply { peers } => {
                 self.on_shuffle_reply(peers).await;
             }
-            HyParViewMessage::Disconnect { alive } => {
-                self.on_disconnect(from, alive).await;
+            HyParViewRequest::Disconnect { alive } => {
+                self.on_disconnect(from_id, alive).await;
             }
         }
     }
@@ -335,13 +379,13 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         if let Some(target) = target {
             let peers = self.sample_for_shuffle();
 
-            let msg = HyParViewMessage::Shuffle {
+            let msg = HyParViewRequest::Shuffle {
                 origin: self.me,
                 peers,
                 ttl: self.config.forward_join_ttl,
             };
 
-            if let Err(e) = self.network.send_hyparview(&target, self.me, msg).await {
+            if let Err(e) = self.send_to_peer(&target, msg).await {
                 warn!(peer = %hex::encode(&target.as_bytes()[..8]), error = %e, "failed to send Shuffle");
             }
         }
@@ -353,10 +397,9 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         let peers: Vec<Identity> = self.active_view.iter().copied().collect();
 
         for peer in peers {
-            let _ = self.network.send_hyparview(
+            let _ = self.send_to_peer(
                 &peer,
-                self.me,
-                HyParViewMessage::Disconnect { alive: false },
+                HyParViewRequest::Disconnect { alive: false },
             ).await;
         }
 
@@ -374,13 +417,13 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             .copied()
             .collect();
 
-        let msg = HyParViewMessage::ForwardJoin {
+        let msg = HyParViewRequest::ForwardJoin {
             new_peer: from,
             ttl: self.config.forward_join_ttl,
         };
 
         for peer in peers {
-            if let Err(e) = self.network.send_hyparview(&peer, self.me, msg.clone()).await {
+            if let Err(e) = self.send_to_peer(&peer, msg.clone()).await {
                 warn!(peer = %hex::encode(&peer.as_bytes()[..8]), error = %e, "failed to forward Join");
             }
         }
@@ -412,11 +455,11 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             .copied();
 
         if let Some(next) = next {
-            let msg = HyParViewMessage::ForwardJoin {
+            let msg = HyParViewRequest::ForwardJoin {
                 new_peer,
                 ttl: ttl.saturating_sub(1),
             };
-            if let Err(e) = self.network.send_hyparview(&next, self.me, msg).await {
+            if let Err(e) = self.send_to_peer(&next, msg).await {
                 warn!(peer = %hex::encode(&next.as_bytes()[..8]), error = %e, "failed to forward ForwardJoin");
             }
         }
@@ -435,8 +478,8 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             self.add_to_active_unchecked(from).await;
         }
 
-        let reply = HyParViewMessage::NeighborReply { accepted };
-        if let Err(e) = self.network.send_hyparview(&from, self.me, reply).await {
+        let reply = HyParViewRequest::NeighborReply { accepted };
+        if let Err(e) = self.send_to_peer(&from, reply).await {
             warn!(peer = %hex::encode(&from.as_bytes()[..8]), error = %e, "failed to send NeighborReply");
         }
     }
@@ -484,8 +527,8 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             }
 
             let reply_peers = self.sample_for_shuffle();
-            let reply = HyParViewMessage::ShuffleReply { peers: reply_peers };
-            if let Err(e) = self.network.send_hyparview(&origin, self.me, reply).await {
+            let reply = HyParViewRequest::ShuffleReply { peers: reply_peers };
+            if let Err(e) = self.send_to_peer(&origin, reply).await {
                 warn!(peer = %hex::encode(&origin.as_bytes()[..8]), error = %e, "failed to send ShuffleReply");
             }
         } else {
@@ -495,12 +538,12 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
                 .copied();
 
             if let Some(next) = next {
-                let msg = HyParViewMessage::Shuffle {
+                let msg = HyParViewRequest::Shuffle {
                     origin,
                     peers,
                     ttl: ttl.saturating_sub(1),
                 };
-                if let Err(e) = self.network.send_hyparview(&next, self.me, msg).await {
+                if let Err(e) = self.send_to_peer(&next, msg).await {
                     warn!(peer = %hex::encode(&next.as_bytes()[..8]), error = %e, "failed to forward Shuffle");
                 }
             }
@@ -638,8 +681,8 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
         if send_neighbor {
             self.pending_neighbors.insert(peer, Instant::now());
 
-            let msg = HyParViewMessage::Neighbor { priority };
-            if let Err(e) = self.network.send_hyparview(&peer, self.me, msg).await {
+            let msg = HyParViewRequest::Neighbor { priority };
+            if let Err(e) = self.send_to_peer(&peer, msg).await {
                 warn!(peer = %hex::encode(&peer.as_bytes()[..8]), error = %e, "failed to send Neighbor");
             }
         }
@@ -661,16 +704,14 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
 
     async fn disconnect_peer(&mut self, peer: Identity, alive: bool) {
         let shuffle_peers = self.sample_for_shuffle();
-        let _ = self.network.send_hyparview(
+        let _ = self.send_to_peer(
             &peer,
-            self.me,
-            HyParViewMessage::ShuffleReply { peers: shuffle_peers },
+            HyParViewRequest::ShuffleReply { peers: shuffle_peers },
         ).await;
 
-        let _ = self.network.send_hyparview(
+        let _ = self.send_to_peer(
             &peer,
-            self.me,
-            HyParViewMessage::Disconnect { alive },
+            HyParViewRequest::Disconnect { alive },
         ).await;
 
         self.active_view.remove(&peer);
@@ -727,7 +768,15 @@ impl<N: HyParViewRpc + Send + Sync + 'static> HyParViewActor<N> {
             "neighbor up"
         );
         if let Some(ref callback) = self.neighbor_callback {
-            callback.neighbor_up(peer).await;
+            // Get the contact for this peer - if we don't have it, we can't notify
+            if let Some(contact) = self.get_contact(&peer) {
+                callback.neighbor_up(contact.clone()).await;
+            } else {
+                warn!(
+                    peer = %hex::encode(&peer.as_bytes()[..8]),
+                    "neighbor_up: no contact for peer, skipping callback"
+                );
+            }
         }
     }
 
@@ -755,8 +804,13 @@ mod tests {
         Identity::from_bytes([id; 32])
     }
 
+    fn make_contact(id: u8) -> Contact {
+        let identity = make_identity(id);
+        Contact::unsigned(identity, vec![format!("127.0.0.1:{}", 9000 + id as u16)])
+    }
+
     struct MockNetwork {
-        sent: Mutex<Vec<(Identity, HyParViewMessage)>>,
+        sent: Mutex<Vec<(Identity, HyParViewRequest)>>,
     }
 
     impl MockNetwork {
@@ -771,11 +825,10 @@ mod tests {
     impl HyParViewRpc for MockNetwork {
         async fn send_hyparview(
             &self,
-            to: &Identity,
-            _from: Identity,
-            message: HyParViewMessage,
+            to: &Contact,
+            message: HyParViewRequest,
         ) -> anyhow::Result<()> {
-            self.sent.lock().await.push((*to, message));
+            self.sent.lock().await.push((to.identity, message));
             Ok(())
         }
     }
@@ -796,7 +849,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NeighborCallback for MockCallback {
-        async fn neighbor_up(&self, _peer: Identity) {
+        async fn neighbor_up(&self, _peer: Contact) {
             self.up_count.fetch_add(1, Ordering::SeqCst);
         }
 
@@ -811,14 +864,15 @@ mod tests {
         let network = Arc::new(MockNetwork::new());
         let hv = HyParView::spawn(me, HyParViewConfig::default(), network.clone());
 
-        let peer1 = make_identity(1);
-        hv.handle_message(peer1, HyParViewMessage::Join).await;
+        let peer1 = make_contact(1);
+        let peer1_id = peer1.identity;
+        hv.handle_message(peer1, HyParViewRequest::Join).await;
         
         // Give actor time to process
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let active = hv.active_view().await;
-        assert!(active.contains(&peer1));
+        assert!(active.contains(&peer1_id));
     }
 
     #[tokio::test]
@@ -830,8 +884,8 @@ mod tests {
         let hv = HyParView::spawn(me, HyParViewConfig::default(), network.clone());
         hv.set_neighbor_callback(callback.clone()).await;
 
-        let peer1 = make_identity(1);
-        hv.handle_message(peer1, HyParViewMessage::Join).await;
+        let peer1 = make_contact(1);
+        hv.handle_message(peer1, HyParViewRequest::Join).await;
         
         // Give actor time to process
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -845,16 +899,17 @@ mod tests {
         let network = Arc::new(MockNetwork::new());
         let hv = HyParView::spawn(me, HyParViewConfig::default(), network.clone());
 
-        let peer1 = make_identity(1);
-        hv.handle_message(peer1, HyParViewMessage::Join).await;
+        let peer1 = make_contact(1);
+        let peer1_id = peer1.identity;
+        hv.handle_message(peer1.clone(), HyParViewRequest::Join).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(hv.active_view().await.contains(&peer1));
+        assert!(hv.active_view().await.contains(&peer1_id));
 
-        hv.handle_message(peer1, HyParViewMessage::Disconnect { alive: true }).await;
+        hv.handle_message(peer1, HyParViewRequest::Disconnect { alive: true }).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         
-        assert!(!hv.active_view().await.contains(&peer1));
-        assert!(hv.passive_view().await.contains(&peer1));
+        assert!(!hv.active_view().await.contains(&peer1_id));
+        assert!(hv.passive_view().await.contains(&peer1_id));
     }
 
     #[tokio::test]
@@ -864,7 +919,7 @@ mod tests {
         
         {
             let hv = HyParView::spawn(me, HyParViewConfig::default(), network.clone());
-            hv.handle_message(make_identity(1), HyParViewMessage::Join).await;
+            hv.handle_message(make_contact(1), HyParViewRequest::Join).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
             // hv goes out of scope here
         }

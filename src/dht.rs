@@ -52,7 +52,7 @@ use crate::routing::{
     BUCKET_REFRESH_INTERVAL, BUCKET_STALE_THRESHOLD,
 };
 use crate::storage::{Key, LocalStore};
-use crate::rpc::DhtNodeRpc;
+use crate::protocols::DhtNodeRpc;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
 /// Records older than this are not propagated during lookups.
@@ -680,6 +680,7 @@ enum Command {
     StoreLocal(Key, Vec<u8>, Identity, oneshot::Sender<Vec<(Key, Vec<u8>)>>),
     GetTelemetry(oneshot::Sender<TelemetrySnapshot>),
     GetSlowestLevel(oneshot::Sender<TieringLevel>),
+    LookupContact(Identity, oneshot::Sender<Option<Contact>>),
     
     // RPC Handlers
     HandleFindNode(Contact, Identity, oneshot::Sender<Vec<Contact>>),
@@ -737,6 +738,16 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     /// Get a reference to the network layer for making RPC calls.
     pub fn network(&self) -> &N {
         &self.network
+    }
+
+    /// Look up a contact by identity in the routing table.
+    /// Returns the contact if found, None otherwise.
+    pub async fn lookup_contact(&self, identity: &Identity) -> Option<Contact> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::LookupContact(*identity, tx)).await.is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     pub async fn observe_contact(&self, contact: Contact) {
@@ -1340,6 +1351,10 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
                 Command::GetSlowestLevel(reply) => {
                     let level = self.tiering.slowest_level();
                     let _ = reply.send(level);
+                }
+                Command::LookupContact(identity, reply) => {
+                    let contact = self.routing.lookup_contact(&identity);
+                    let _ = reply.send(contact);
                 }
                 Command::HandleFindNode(from, target, reply) => {
                     self.handle_observe_contact(from);
@@ -2173,8 +2188,6 @@ mod tests {
         for peer in &peers {
             target.node.observe_contact(peer.contact()).await;
         }
-
-        let snapshot = target.node.telemetry_snapshot().await;
 
         // tier_counts now counts /16 prefixes, not individual peers
         // The routing table should still track peers, verify via a lookup

@@ -508,7 +508,7 @@ async fn signed_contact_with_relay_dht_roundtrip() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Node2 resolves - internal verify_fresh() checks signature
-    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     progress(start, "peer resolved");
@@ -561,7 +561,7 @@ async fn signed_contact_relay_info_usable() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     
     // Node2 resolves node1's contact (with relay info)
-    let resolved = timeout(TEST_TIMEOUT, node2.resolve_peer(&node1.peer_identity())).await
+    let resolved = timeout(TEST_TIMEOUT, node2.resolve(&node1.peer_identity())).await
         .expect("resolve timeout")
         .expect("resolve failed");
     

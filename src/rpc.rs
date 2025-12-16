@@ -16,19 +16,22 @@
 //! - [`DhtNodeRpc`]: DHT operations (ping, find_node, find_value, store)
 //! - [`PlumTreeRpc`]: PubSub message forwarding
 //! - [`HyParViewRpc`]: Membership protocol messages
+//! - [`RelayRpc`]: NAT traversal relay operations
+//! - [`DirectRpc`]: Point-to-point direct messaging
 //!
 //! ## Connection Management
 //!
 //! - Connections are cached in an LRU cache (bounded by `MAX_CACHED_CONNECTIONS`)
 //! - Stale connections are cleaned up periodically
 //! - Failed connections trigger cache invalidation
-//! - Contact records are cached for identity → address resolution
+//! - Identity→contact resolution uses DHT's routing table via `ContactResolver` trait
 //!
 //! ## Security
 //!
 //! - All connections use mutual TLS with Ed25519 certificates
 //! - Peer identity is verified from the TLS certificate
 //! - Request/response sizes are bounded to prevent memory exhaustion
+//! - Message sender identity is authenticated via TLS, not message fields
 
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -43,54 +46,17 @@ use quinn::{ClientConfig, Connection, Endpoint, Incoming};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use crate::messages::{self as messages, DirectMessageSender, DirectRequest, DhtNodeRequest, DhtNodeResponse, HyParViewRequest, PlumTreeMessage, PlumTreeRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
-use crate::transport::{SmartSock, DIRECT_CONNECT_TIMEOUT};
+use crate::messages::{self as messages, DirectMessageSender, DhtNodeRequest, DhtNodeResponse, PlumTreeRequest, HyParViewRequest, RelayRequest, RelayResponse, RpcRequest, RpcResponse};
+use crate::transport::SmartSock;
 use crate::crypto::{extract_verified_identity, identity_to_sni};
-use crate::relay::{Relay, generate_session_id, handle_relay_request};
+use crate::relay::{Relay, handle_relay_request};
 use crate::dht::DhtNode;
 use crate::storage::Key;
 use crate::identity::{Contact, Identity};
 use crate::hyparview::HyParView;
-use crate::messages::HyParViewMessage;
-use crate::plumtree::PlumTreeHandler;
+use crate::plumtree::PlumTree;
+use crate::protocols::{DhtNodeRpc, PlumTreeRpc, HyParViewRpc, RelayRpc, DirectRpc};
 
-
-#[async_trait]
-pub trait DhtNodeRpc: Send + Sync + 'static {
-    async fn find_node(&self, to: &Contact, target: Identity) -> Result<Vec<Contact>>;
-
-    async fn find_value(&self, to: &Contact, key: Key) -> Result<(Option<Vec<u8>>, Vec<Contact>)>;
-
-    async fn store(&self, to: &Contact, key: Key, value: Vec<u8>) -> Result<()>;
-
-    async fn ping(&self, to: &Contact) -> Result<()>;
-    
-    /// Ask a peer to check if we are reachable by connecting back to the given address.
-    /// Returns true if the peer successfully connected back.
-    async fn check_reachability(&self, to: &Contact, probe_addr: &str) -> Result<bool>;
-}
-
-
-#[async_trait]
-
-pub trait PlumTreeRpc: Send + Sync {
-    async fn send_plumtree(&self, to: &Contact, from: Identity, message: PlumTreeMessage)
-        -> Result<()>;
-    
-    async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact>;
-}
-
-
-#[async_trait]
-
-pub trait HyParViewRpc: Send + Sync {
-    async fn send_hyparview(
-        &self,
-        to: &Identity,
-        from: Identity,
-        message: HyParViewMessage,
-    ) -> Result<()>;
-}
 
 // ============================================================================
 // Security Limits
@@ -122,9 +88,6 @@ const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for individual RPC stream operations.
 const RPC_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout when attempting relay-assisted connection establishment.
-const RELAY_ASSISTED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Command channel capacity for the RPC actor.
 /// Back-pressure applied when full to prevent unbounded queue growth.
 const RPC_COMMAND_CHANNEL_SIZE: usize = 256;
@@ -142,15 +105,6 @@ enum RpcCommand {
     GetOrConnect {
         contact: Contact,
         reply: oneshot::Sender<Result<Connection>>,
-    },
-    /// Cache a contact for future resolution
-    CacheContact {
-        contact: Contact,
-    },
-    /// Resolve an identity to a cached contact
-    ResolveContact {
-        identity: Identity,
-        reply: oneshot::Sender<Option<Contact>>,
     },
     /// Invalidate a connection after failure
     InvalidateConnection {
@@ -173,7 +127,6 @@ struct RpcNodeActor {
     endpoint: Endpoint,
     client_config: ClientConfig,
     connections: LruCache<Identity, CachedConnection>,
-    contact_cache: LruCache<Identity, Contact>,
     in_flight: std::collections::HashSet<Identity>,
 }
 
@@ -183,7 +136,6 @@ impl RpcNodeActor {
             endpoint,
             client_config,
             connections: LruCache::new(NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()),
-            contact_cache: LruCache::new(NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()),
             in_flight: std::collections::HashSet::new(),
         }
     }
@@ -199,13 +151,6 @@ impl RpcNodeActor {
                         Some(RpcCommand::GetOrConnect { contact, reply }) => {
                             let result = self.get_or_connect(contact).await;
                             let _ = reply.send(result);
-                        }
-                        Some(RpcCommand::CacheContact { contact }) => {
-                            self.contact_cache.put(contact.identity, contact);
-                        }
-                        Some(RpcCommand::ResolveContact { identity, reply }) => {
-                            let contact = self.contact_cache.get(&identity).cloned();
-                            let _ = reply.send(contact);
                         }
                         Some(RpcCommand::InvalidateConnection { peer_id }) => {
                             if self.connections.pop(&peer_id).is_some() {
@@ -391,7 +336,6 @@ pub struct RpcNode {
     pub endpoint: Endpoint,
     pub self_contact: Contact,
     client_config: ClientConfig,
-    our_peer_id: Option<Identity>,
     cmd_tx: mpsc::Sender<RpcCommand>,
     smartsock: Option<Arc<SmartSock>>,
 }
@@ -401,7 +345,7 @@ impl RpcNode {
         endpoint: Endpoint,
         self_contact: Contact,
         client_config: ClientConfig,
-        our_peer_id: Identity,
+        _our_peer_id: Identity,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(RPC_COMMAND_CHANNEL_SIZE);
         
@@ -413,7 +357,6 @@ impl RpcNode {
             endpoint,
             self_contact,
             client_config,
-            our_peer_id: Some(our_peer_id),
             cmd_tx,
             smartsock: None,
         }
@@ -427,34 +370,6 @@ impl RpcNode {
     /// Shutdown the RPC actor gracefully.
     pub async fn quit(&self) {
         let _ = self.cmd_tx.send(RpcCommand::Quit).await;
-    }
-    
-    pub async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        
-        if self.cmd_tx.send(RpcCommand::ResolveContact {
-            identity: *identity,
-            reply: reply_tx,
-        }).await.is_err() {
-            return None;
-        }
-        
-        reply_rx.await.ok().flatten()
-    }
-
-    /// Resolve an identity to its addresses via cache/DHT lookup.
-    pub async fn resolve_peer_addrs(&self, identity: &Identity) -> Result<Vec<String>> {
-        let contact = self
-            .resolve_identity_to_contact(identity)
-            .await
-            .context("failed to resolve relay identity")?;
-        Ok(contact.addrs)
-    }
-
-    pub async fn cache_contact(&self, contact: &Contact) {
-        let _ = self.cmd_tx.send(RpcCommand::CacheContact {
-            contact: contact.clone(),
-        }).await;
     }
 
     async fn get_or_connect(&self, contact: &Contact) -> Result<Connection> {
@@ -584,93 +499,6 @@ impl RpcNode {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no addresses provided for peer")))
     }
 
-    pub async fn request_relay_session(
-        &self,
-        relay_identity: &Identity,
-        relay_addrs: &[String],
-        from_peer: Identity,
-        target_peer: Identity,
-        session_id: [u8; 16],
-    ) -> Result<(Connection, RelayResponse)> {
-        let relay_conn = self
-            .connect_to_peer(relay_identity, relay_addrs)
-            .await
-            .context("failed to connect to relay")?;
-
-        let request = RelayRequest::Connect {
-            from_peer,
-            target_peer,
-            session_id,
-        };
-
-        let response = self.send_relay_rpc(&relay_conn, request).await?;
-        Ok((relay_conn, response))
-    }
-
-    /// Complete a relay session as the receiving peer (B).
-    /// 
-    /// When a NAT-bound node receives an `IncomingConnection` notification,
-    /// it calls this to complete the relay handshake with the relay server.
-    /// 
-    /// # Arguments
-    /// * `relay_addr` - The relay's data address (from IncomingConnection.relay_data_addr)
-    /// * `our_identity` - Our identity
-    /// * `from_peer` - The identity of the peer who initiated the connection
-    /// * `session_id` - The session ID (from IncomingConnection.session_id)
-    /// 
-    /// # Returns
-    /// The relay data address to use for the tunnel on success.
-    pub async fn complete_relay_session(
-        &self,
-        relay_addr: &str,
-        _our_identity: Identity,
-        from_peer: Identity,
-        session_id: [u8; 16],
-    ) -> Result<String> {
-        // Parse relay address
-        let relay_socket: std::net::SocketAddr = relay_addr.parse()
-            .context("invalid relay address")?;
-        
-        // We just need to send an initial CRLY packet to the relay to register 
-        // our address. The relay will auto-complete the session when it sees 
-        // a packet from us.
-        
-        // Configure SmartSock to route traffic to from_peer through the relay
-        let smartsock = self.smartsock.as_ref()
-            .context("SmartSock not configured")?;
-        
-        // Register the peer (we may not know their direct addresses, use empty)
-        smartsock.register_peer(from_peer, vec![]).await;
-        
-        // Add relay tunnel
-        let added = smartsock
-            .add_relay_tunnel(&from_peer, session_id, relay_socket)
-            .await
-            .is_some();
-        if !added {
-            anyhow::bail!("failed to add relay tunnel");
-        }
-        
-        // Activate relay path
-        let switched = smartsock.use_relay_path(&from_peer, session_id).await;
-        if !switched {
-            anyhow::bail!("failed to activate relay path");
-        }
-        
-        // Send an initial probe packet to the relay to register our address
-        // This completes the relay session (relay learns our address)
-        smartsock.send_relay_probe(&from_peer, session_id).await?;
-        
-        debug!(
-            session = hex::encode(session_id),
-            from_peer = ?from_peer,
-            relay = %relay_addr,
-            "completed relay session as receiver"
-        );
-        
-        Ok(relay_addr.to_string())
-    }
-
     pub async fn configure_relay_path_for_peer(
         &self,
         peer_id: Identity,
@@ -704,6 +532,9 @@ impl RpcNode {
 
         let switched = smartsock.use_relay_path(&peer_id, session_id).await;
         if !switched {
+            // Cleanup: tunnel was created but couldn't be activated.
+            // SECURITY/ROBUSTNESS: avoid leaking stale tunnels across retries.
+            smartsock.remove_relay_tunnel(&peer_id, &session_id).await;
             anyhow::bail!("failed to activate relay path");
         }
 
@@ -729,224 +560,6 @@ impl RpcNode {
         
         debug!(addr = %addr, "connection established");
         Ok(conn)
-    }
-
-    /// Connect to a peer using their published Contact.
-    /// 
-    /// Strategy:
-    /// 1. Try direct connection to advertised addresses
-    /// 2. If direct fails and peer has designated relays, connect via relay
-    pub async fn smartconnect(&self, record: &Contact) -> Result<Connection> {
-        let peer_id = &record.identity;
-
-        // Try direct connection first (SmartSock handles path probing and fallback)
-        if !record.addrs.is_empty() {
-            debug!(peer = ?peer_id, addrs = ?record.addrs, "trying direct connection");
-            
-            let direct_result = tokio::time::timeout(
-                DIRECT_CONNECT_TIMEOUT,
-                self.connect_to_peer(peer_id, &record.addrs),
-            )
-            .await;
-
-            match direct_result {
-                Ok(Ok(conn)) => {
-                    debug!(peer = ?peer_id, "direct connection successful");
-                    
-                    if let Some(smartsock) = &self.smartsock {
-                        let addrs: Vec<std::net::SocketAddr> = record.addrs.iter()
-                            .filter_map(|a| a.parse().ok())
-                            .collect();
-                        smartsock.register_peer(*peer_id, addrs).await;
-                        debug!(peer = ?peer_id, "registered peer with SmartSock (direct)");
-                    }
-                    
-                    return Ok(conn);
-                }
-                Ok(Err(e)) => {
-                    debug!(peer = ?peer_id, error = %e, "direct connection failed");
-                }
-                Err(_) => {
-                    debug!(peer = ?peer_id, "direct connection timed out");
-                }
-            }
-        }
-
-        // Use the peer's designated relays from their published record
-        if !record.relays.is_empty() {
-            debug!(
-                peer = ?peer_id,
-                relay_count = record.relays.len(),
-                "trying connection via peer's designated relays"
-            );
-            
-            let our_peer_id = self.our_peer_id.as_ref()
-                .context("cannot use relay without our_peer_id set")?;
-
-            let direct_addrs = record.addrs.clone();
-            if direct_addrs.is_empty() {
-                anyhow::bail!("cannot use relay without at least one target address");
-            }
-            
-            // Try each designated relay (resolve identity to get addresses)
-            let mut last_error = None;
-            for relay_id in &record.relays {
-                let session_id = match generate_session_id() {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                
-                debug!(
-                    peer = ?peer_id,
-                    relay = ?relay_id,
-                    "attempting connection via designated relay"
-                );
-                
-                // Resolve relay identity to get its addresses
-                let relay_addrs = match self.resolve_peer_addrs(relay_id).await {
-                    Ok(addrs) if !addrs.is_empty() => addrs,
-                    Ok(_) => {
-                        debug!(relay = ?relay_id, "relay has no addresses, trying next");
-                        last_error = Some(anyhow::anyhow!("relay has no addresses"));
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!(relay = ?relay_id, error = %e, "failed to resolve relay, trying next");
-                        last_error = Some(e);
-                        continue;
-                    }
-                };
-                
-                let relay_result = self
-                    .request_relay_session(relay_id, &relay_addrs, *our_peer_id, *peer_id, session_id)
-                    .await;
-
-                let (relay_conn, response) = match relay_result {
-                    Ok((conn, resp)) => (conn, resp),
-                    Err(e) => {
-                        debug!(
-                            relay = ?relay_id,
-                            error = %e,
-                            "failed to request relay session, trying next"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                };
-
-                let (session_id, relay_data_addr) = match response {
-                    RelayResponse::Accepted {
-                        session_id,
-                        relay_data_addr,
-                    } => {
-                        debug!(
-                            peer = ?peer_id,
-                            relay = ?relay_id,
-                            session = hex::encode(session_id),
-                            relay_data = %relay_data_addr,
-                            "relay session pending"
-                        );
-                        (session_id, relay_data_addr)
-                    }
-                    RelayResponse::Connected {
-                        session_id,
-                        relay_data_addr,
-                    } => {
-                        debug!(
-                            peer = ?peer_id,
-                            relay = ?relay_id,
-                            session = hex::encode(session_id),
-                            relay_data = %relay_data_addr,
-                            "relay session established"
-                        );
-                        (session_id, relay_data_addr)
-                    }
-                    RelayResponse::Rejected { reason } => {
-                        debug!(
-                            relay = ?relay_id,
-                            reason = %reason,
-                            "relay rejected, trying next"
-                        );
-                        last_error = Some(anyhow::anyhow!("relay rejected: {}", reason));
-                        continue;
-                    }
-                    RelayResponse::Registered => {
-                        debug!(relay = ?relay_id, "unexpected Registered response, trying next");
-                        last_error = Some(anyhow::anyhow!("unexpected Registered response"));
-                        continue;
-                    }
-                    RelayResponse::Incoming { .. } => {
-                        debug!(relay = ?relay_id, "unexpected Incoming response, trying next");
-                        last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
-                        continue;
-                    }
-                };
-
-                if let Err(e) = self.configure_relay_path_for_peer(
-                    *peer_id,
-                    &direct_addrs,
-                    session_id,
-                    &relay_data_addr,
-                ).await {
-                    debug!(
-                        relay = ?relay_id,
-                        error = %e,
-                        "failed to configure relay path, trying next"
-                    );
-                    last_error = Some(e);
-                    continue;
-                }
-
-                let peer_conn_result = tokio::time::timeout(
-                    RELAY_ASSISTED_CONNECT_TIMEOUT,
-                    self.connect_to_peer(peer_id, &direct_addrs),
-                )
-                .await;
-
-                drop(relay_conn);
-
-                match peer_conn_result {
-                    Ok(Ok(conn)) => {
-                        info!(
-                            peer = ?peer_id,
-                            relay = ?relay_id,
-                            "connection successful via designated relay"
-                        );
-                        return Ok(conn);
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(smartsock) = &self.smartsock {
-                            smartsock.remove_relay_tunnel(peer_id, &session_id).await;
-                        }
-                        debug!(
-                            relay = ?relay_id,
-                            error = %e,
-                            "relay-assisted connect failed, trying next"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    Err(_) => {
-                        if let Some(smartsock) = &self.smartsock {
-                            smartsock.remove_relay_tunnel(peer_id, &session_id).await;
-                        }
-                        debug!(
-                            relay = ?relay_id,
-                            "relay-assisted connect timed out, trying next"
-                        );
-                        last_error = Some(anyhow::anyhow!("relay-assisted connect timed out"));
-                        continue;
-                    }
-                }
-            }
-
-            // All designated relays failed
-            if let Some(e) = last_error {
-                anyhow::bail!("all relay attempts failed, last error: {}", e);
-            }
-        }
-
-        anyhow::bail!("direct connection failed and peer has no designated relays");
     }
 
     async fn send_relay_rpc(&self, conn: &Connection, request: RelayRequest) -> Result<RelayResponse> {
@@ -1093,30 +706,22 @@ impl DhtNodeRpc for RpcNode {
 
 #[async_trait]
 impl PlumTreeRpc for RpcNode {
-    async fn send_plumtree(&self, to: &Contact, from: Identity, message: PlumTreeMessage) -> Result<()> {
-        let request = RpcRequest::PlumTree(PlumTreeRequest { from, message });
+    async fn send_plumtree(&self, to: &Contact, message: PlumTreeRequest) -> Result<()> {
+        let request = RpcRequest::PlumTree(message);
         match self.rpc_raw(to, request).await? {
             RpcResponse::PlumTreeAck => Ok(()),
             RpcResponse::Error { message } => anyhow::bail!("PlumTree rejected: {}", message),
             other => anyhow::bail!("unexpected response to PlumTree: {:?}", other),
         }
     }
-    
-    async fn resolve_identity_to_contact(&self, identity: &Identity) -> Option<Contact> {
-        // Delegate to the existing method which uses the actor
-        RpcNode::resolve_identity_to_contact(self, identity).await
-    }
 }
 
 
 #[async_trait]
 impl HyParViewRpc for RpcNode {
-    async fn send_hyparview(&self, to: &Identity, from: Identity, message: HyParViewMessage) -> Result<()> {
-        let contact = self.resolve_identity_to_contact(to).await
-            .context("could not resolve identity to contact for HyParView message")?;
-        
-        let request = RpcRequest::HyParView(HyParViewRequest { from, message });
-        match self.rpc_raw(&contact, request).await? {
+    async fn send_hyparview(&self, to: &Contact, message: HyParViewRequest) -> Result<()> {
+        let request = RpcRequest::HyParView(message);
+        match self.rpc_raw(to, request).await? {
             RpcResponse::HyParViewAck => Ok(()),
             RpcResponse::Error { message } => anyhow::bail!("HyParView rejected: {}", message),
             other => anyhow::bail!("unexpected response to HyParView: {:?}", other),
@@ -1125,23 +730,90 @@ impl HyParViewRpc for RpcNode {
 }
 
 
-impl RpcNode {
-    pub async fn send_direct(&self, to: &Contact, from: Identity, data: Vec<u8>) -> Result<()> {
-        let request = RpcRequest::Direct(DirectRequest { from, data });
+#[async_trait]
+impl DirectRpc for RpcNode {
+    async fn send_direct(&self, to: &Contact, data: Vec<u8>) -> Result<()> {
+        let request = RpcRequest::Direct(data);
         match self.rpc_raw(to, request).await? {
             RpcResponse::DirectAck => Ok(()),
             RpcResponse::Error { message } => anyhow::bail!("Direct message rejected: {}", message),
             other => anyhow::bail!("unexpected response to Direct: {:?}", other),
         }
     }
-    
-    /// Register with a relay for incoming connection notifications.
-    /// Returns a receiver that yields `RelayResponse::Incoming` messages when
-    /// other peers want to connect via this relay.
-    /// 
-    /// The returned receiver must be polled continuously to receive notifications.
-    /// When the receiver is dropped, the signaling connection is closed.
-    pub async fn register_for_signaling(
+}
+
+
+#[async_trait]
+impl RelayRpc for RpcNode {
+    async fn request_relay_session(
+        &self,
+        relay: &Contact,
+        from_peer: Identity,
+        target_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<(Connection, RelayResponse)> {
+        let relay_conn = self
+            .get_or_connect(relay)
+            .await
+            .context("failed to connect to relay")?;
+
+        let request = RelayRequest::Connect {
+            from_peer,
+            target_peer,
+            session_id,
+        };
+
+        let response = self.send_relay_rpc(&relay_conn, request).await?;
+        Ok((relay_conn, response))
+    }
+
+    async fn complete_relay_session(
+        &self,
+        relay: &Contact,
+        from_peer: Identity,
+        session_id: [u8; 16],
+    ) -> Result<()> {
+        let relay_addr = relay.primary_addr()
+            .context("relay contact has no address")?;
+        let relay_socket: std::net::SocketAddr = relay_addr.parse()
+            .context("invalid relay address")?;
+        
+        // Configure SmartSock to route traffic to from_peer through the relay
+        let smartsock = self.smartsock.as_ref()
+            .context("SmartSock not configured")?;
+        
+        // Register the peer (we may not know their direct addresses, use empty)
+        smartsock.register_peer(from_peer, vec![]).await;
+        
+        // Add relay tunnel
+        let added = smartsock
+            .add_relay_tunnel(&from_peer, session_id, relay_socket)
+            .await
+            .is_some();
+        if !added {
+            anyhow::bail!("failed to add relay tunnel");
+        }
+        
+        // Activate relay path
+        let switched = smartsock.use_relay_path(&from_peer, session_id).await;
+        if !switched {
+            anyhow::bail!("failed to activate relay path");
+        }
+        
+        // Send an initial probe packet to the relay to register our address
+        smartsock.send_relay_probe(&from_peer, session_id).await?;
+        
+        debug!(
+            session = hex::encode(session_id),
+            from_peer = ?from_peer,
+            relay = %relay_addr,
+            "completed relay session as receiver"
+        );
+        
+        Ok(())
+    }
+
+    async fn register_for_signaling(
         &self,
         relay: &Contact,
         our_identity: Identity,
@@ -1249,12 +921,12 @@ const REQUEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync + 'static>(
+pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Clone + Send + Sync + 'static>(
     node: DhtNode<N>,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    plumtree: Option<PlumTree<N>>,
     smartsock: Option<Arc<SmartSock>>,
     incoming: Incoming,
-    hyparview: HyParView,
+    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
     // Extract relay from smartsock
@@ -1272,6 +944,11 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
     }
     let verified_identity = verified_identity.unwrap();
 
+    // Register incoming peer in DHT routing table for identity resolution.
+    // This enables HyParView/PlumTree to send messages to peers that connected to us.
+    let incoming_contact = Contact::unsigned(verified_identity, vec![remote.to_string()]);
+    node.observe_contact(incoming_contact).await;
+    
     if let Some(ss) = &smartsock {
         ss.register_peer(verified_identity, vec![remote]).await;
         debug!(
@@ -1336,15 +1013,16 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
         };
 
         let node = node.clone();
-        let plumtree_h = plumtree_handler.clone();
+        let plumtree_h = plumtree.clone();
         let udprelay = udprelay.clone();
         let remote_addr = remote;
         let verified_id = verified_identity;
+        let from_contact = Contact::unsigned(verified_id, vec![remote_addr.to_string()]);
         let hv = hyparview.clone();
         let direct_sender = direct_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(node, plumtree_h, udprelay, udprelay_addr, stream, remote_addr, verified_id, hv, direct_sender).await
+                handle_stream(node, plumtree_h, udprelay, udprelay_addr, stream, remote_addr, from_contact, hv, direct_sender).await
             {
                 debug!(error = ?e, "stream error");
             }
@@ -1355,17 +1033,18 @@ pub async fn handle_connection<N: DhtNodeRpc + PlumTreeRpc + Clone + Send + Sync
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
+async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    plumtree: Option<PlumTree<N>>,
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     remote_addr: SocketAddr,
-    verified_identity: Identity,
-    hyparview: HyParView,
+    from_contact: Contact,
+    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> Result<()> {
+    let verified_identity = from_contact.identity;
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(REQUEST_READ_TIMEOUT, recv.read_exact(&mut len_buf))
         .await
@@ -1530,7 +1209,8 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
             node,
             request,
             remote_addr,
-            plumtree_handler,
+            from_contact,
+            plumtree,
             udprelay,
             udprelay_addr,
             hyparview,
@@ -1556,14 +1236,15 @@ async fn handle_stream<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>(
+async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + HyParViewRpc + Send + Sync + 'static>(
     node: DhtNode<N>,
     request: RpcRequest,
     remote_addr: SocketAddr,
-    plumtree_handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+    from_contact: Contact,
+    plumtree: Option<PlumTree<N>>,
     udprelay: Option<Relay>,
     udprelay_addr: Option<SocketAddr>,
-    hyparview: HyParView,
+    hyparview: HyParView<N>,
     direct_tx: Option<DirectMessageSender>,
 ) -> RpcResponse {
     match request {
@@ -1580,15 +1261,15 @@ async fn handle_rpc_request<N: DhtNodeRpc + PlumTreeRpc + Send + Sync + 'static>
             ).await;
             RpcResponse::Relay(relay_response)
         }
-        RpcRequest::PlumTree(req) => {
-            handle_plumtree_rpc(req.from, req.message, plumtree_handler).await
+        RpcRequest::PlumTree(message) => {
+            handle_plumtree_rpc(&from_contact, message, plumtree).await
         }
-        RpcRequest::HyParView(req) => {
-            handle_hyparview_rpc(req.from, req.message, hyparview).await
+        RpcRequest::HyParView(message) => {
+            handle_hyparview_rpc(from_contact.clone(), message, hyparview).await
         }
-        RpcRequest::Direct(req) => {
+        RpcRequest::Direct(data) => {
             if let Some(tx) = direct_tx {
-                let _ = tx.send((req.from, req.data)).await;
+                let _ = tx.send((from_contact.identity, data)).await;
             }
             RpcResponse::DirectAck
         }
@@ -1727,19 +1408,19 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
     }
 }
 
-async fn handle_plumtree_rpc(
-    from: Identity,
-    message: PlumTreeMessage,
-    handler: Option<Arc<dyn PlumTreeHandler + Send + Sync>>,
+async fn handle_plumtree_rpc<N: PlumTreeRpc + Send + Sync + 'static>(
+    from: &Contact,
+    message: PlumTreeRequest,
+    plumtree: Option<PlumTree<N>>,
 ) -> RpcResponse {
-    if let Some(h) = handler {
+    if let Some(pt) = plumtree {
         trace!(
-            from = ?hex::encode(&from.as_bytes()[..8]),
+            from = ?hex::encode(&from.identity.as_bytes()[..8]),
             message = ?message,
             "dispatching PLUMTREE request to handler"
         );
-        if let Err(e) = h.handle_message(&from, message).await {
-            warn!(from = ?hex::encode(&from.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
+        if let Err(e) = pt.handle_message(from, message).await {
+            warn!(from = ?hex::encode(&from.identity.as_bytes()[..8]), error = %e, "PlumTree handler returned error");
             RpcResponse::Error {
                 message: format!("PlumTree error: {}", e),
             }
@@ -1748,7 +1429,7 @@ async fn handle_plumtree_rpc(
         }
     } else {
         warn!(
-            from = ?hex::encode(&from.as_bytes()[..8]),
+            from = ?hex::encode(&from.identity.as_bytes()[..8]),
             message = ?message,
             "received PLUMTREE request but no handler registered"
         );
@@ -1758,13 +1439,13 @@ async fn handle_plumtree_rpc(
     }
 }
 
-async fn handle_hyparview_rpc(
-    from: Identity,
-    message: HyParViewMessage,
-    hyparview: HyParView,
+async fn handle_hyparview_rpc<N: HyParViewRpc + Send + Sync + 'static>(
+    from: Contact,
+    message: HyParViewRequest,
+    hyparview: HyParView<N>,
 ) -> RpcResponse {
     trace!(
-        from = ?hex::encode(&from.as_bytes()[..8]),
+        from = ?hex::encode(&from.identity.as_bytes()[..8]),
         message = ?message,
         "handling HyParView request"
     );

@@ -36,6 +36,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quinn::{Connection, Endpoint};
@@ -46,11 +47,16 @@ use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
 use crate::storage::Key;
 use crate::hyparview::{HyParView, HyParViewConfig};
 use crate::identity::{Contact, Identity, Keypair};
-use crate::messages::Message;
-use crate::plumtree::{PlumTree, PlumTreeConfig, PlumTreeHandler, ReceivedMessage};
-use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection};
-use crate::transport::SmartSock;
+use crate::messages::{Message, RelayResponse};
+use crate::plumtree::{PlumTree, PlumTreeConfig, ReceivedMessage};
+use crate::protocols::{DirectRpc, RelayRpc};
+use crate::relay::{Relay, RelayClient, NatStatus, IncomingConnection, generate_session_id};
+use crate::transport::{SmartSock, DIRECT_CONNECT_TIMEOUT};
 use crate::rpc::{self, RpcNode};
+
+/// Timeout for relay operations (session requests and relay-assisted connections).
+/// SECURITY: Prevents hangs if a relay is unresponsive during handshake or RPC.
+const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A receiver that can be taken exactly once via `.take()`.
 /// Used for message receivers that should only have one consumer.
@@ -63,12 +69,12 @@ pub struct Node {
     contact: Contact,
     dhtnode: DhtNode<RpcNode>,
     rpcnode: RpcNode,
-    hyparview: HyParView,
+    hyparview: HyParView<RpcNode>,
     plumtree: PlumTree<RpcNode>,
     relay_client: RelayClient,
     plumtree_receiver: TakeOnce<ReceivedMessage>,
     direct_receiver: TakeOnce<(Identity, Vec<u8>)>,
-    server_handle: tokio::task::JoinHandle<Result<()>>,
+    listener: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Node {
@@ -135,17 +141,17 @@ impl Node {
             local_addr,
         );
         
-        let server_handle = {
+        let listener = {
             let endpoint = endpoint.clone();
             let dhtnode = dhtnode.clone();
             let smartsock = smartsock.clone();
-            let plumtree: Arc<dyn PlumTreeHandler + Send + Sync> = Arc::new(plumtree.clone());
+            let plumtree = plumtree.clone();
             let hyparview = hyparview.clone();
             
             let (direct_tx, direct_rx) = tokio::sync::mpsc::channel::<(Identity, Vec<u8>)>(256);
             let direct_receiver = tokio::sync::Mutex::new(Some(direct_rx));
             
-            let server_task = tokio::spawn(async move {
+            let listen = tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
                     let node = dhtnode.clone();
                     let plumtree = Some(plumtree.clone());
@@ -161,7 +167,7 @@ impl Node {
                 Ok(())
             });
             
-            (server_task, direct_receiver)
+            (listen, direct_receiver)
         };
         
         info!("Node {}/{}", local_addr, hex::encode(identity));
@@ -177,8 +183,8 @@ impl Node {
             plumtree,
             relay_client,
             plumtree_receiver,
-            direct_receiver: server_handle.1,
-            server_handle: server_handle.0,
+            direct_receiver: listener.1,
+            listener: listener.0,
         })
     }
     
@@ -293,7 +299,7 @@ impl Node {
         let relay_id = Identity::from_hex(relay_identity)
             .context("invalid relay identity: must be 64 hex characters")?;
         
-        let record = self.dhtnode.resolve_peer(&relay_id).await?
+        let record = self.resolve(&relay_id).await?
             .context("relay not found in DHT")?;
         
         let relay_contact = Contact::unsigned(relay_id, record.addrs);
@@ -335,8 +341,23 @@ impl Node {
         self.relay_client.accept_incoming(incoming).await
     }
 
-    pub async fn resolve_peer(&self, peer_id: &Identity) -> Result<Option<Contact>> {
-        self.dhtnode.resolve_peer(peer_id).await
+    /// Resolve identity to contact, trying local cache first, then network.
+    /// Prefers signed contacts over unsigned ones.
+    pub async fn resolve(&self, identity: &Identity) -> Result<Option<Contact>> {
+        // Fast path: local routing table (only if signed)
+        if let Some(contact) = self.dhtnode.lookup_contact(identity).await {
+            if !contact.signature.is_empty() {
+                return Ok(Some(contact));
+            }
+            // Unsigned contact found locally, try DHT for a signed version
+            if let Ok(Some(dht_contact)) = self.dhtnode.resolve_peer(identity).await {
+                return Ok(Some(dht_contact));
+            }
+            // Fall back to unsigned if DHT lookup fails
+            return Ok(Some(contact));
+        }
+        // Slow path: DHT network lookup
+        self.dhtnode.resolve_peer(identity).await
     }
     
     pub async fn find_peers(&self, target: Identity) -> Result<Vec<Contact>> {
@@ -344,7 +365,6 @@ impl Node {
     }
     
     pub async fn add_peer(&self, endpoint: Contact) {
-        self.rpcnode.cache_contact(&endpoint).await;
         self.dhtnode.observe_contact(endpoint).await
     }
     
@@ -354,10 +374,9 @@ impl Node {
         
         let contact = Contact::single(peer_identity, addr.to_string());
         
-        self.rpcnode.cache_contact(&contact).await;
         self.dhtnode.observe_contact(contact.clone()).await;
         
-        self.hyparview.request_join(peer_identity).await;
+        self.hyparview.request_join(contact).await;
         
         let self_identity = self.keypair.identity();
         self.dhtnode.iterative_find_node(self_identity).await?;
@@ -368,7 +387,7 @@ impl Node {
     /// Connect to a peer by identity using DHT-based address resolution.
     /// 
     /// This resolves the peer's published `Contact` from the DHT and uses
-    /// `smartconnect` which tries direct connection first, then falls back to
+    /// smart connection logic: tries direct connection first, then falls back to
     /// relay-assisted connection if the peer has designated relays.
     /// 
     /// # Arguments
@@ -382,34 +401,242 @@ impl Node {
     /// - If the peer is not found in the DHT
     /// - If connection fails (direct and relay)
     pub async fn connect(&self, identity: &str) -> Result<Connection> {
-        let peer_identity = Identity::from_hex(identity)
+        let peer_id = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
-        let record = self.dhtnode.resolve_peer(&peer_identity).await?
-            .context("peer not found in DHT")?;
+        let contact = self.resolve(&peer_id).await?
+            .context("peer not found")?;
         
         debug!(
             peer = %identity,
-            addrs = ?record.addrs,
-            relays = record.relays.len(),
-            is_relay = record.is_relay,
-            "resolved peer endpoint, attempting smartconnect"
+            addrs = ?contact.addrs,
+            relays = contact.relays.len(),
+            is_relay = contact.is_relay,
+            "resolved peer endpoint, attempting connection"
         );
-        
-        let conn = self.rpcnode.smartconnect(&record).await?;
-        Ok(conn)
+
+        // Try direct connection first
+        if !contact.addrs.is_empty() {
+            debug!(peer = ?peer_id, addrs = ?contact.addrs, "trying direct connection");
+            
+            let direct_result = tokio::time::timeout(
+                DIRECT_CONNECT_TIMEOUT,
+                self.rpcnode.connect_to_peer(&peer_id, &contact.addrs),
+            )
+            .await;
+
+            match direct_result {
+                Ok(Ok(conn)) => {
+                    debug!(peer = ?peer_id, "direct connection successful");
+                    
+                    let addrs: Vec<std::net::SocketAddr> = contact.addrs.iter()
+                        .filter_map(|a| a.parse().ok())
+                        .collect();
+                    self.smartsock.register_peer(peer_id, addrs).await;
+                    debug!(peer = ?peer_id, "registered peer with SmartSock (direct)");
+                    
+                    return Ok(conn);
+                }
+                Ok(Err(e)) => {
+                    debug!(peer = ?peer_id, error = %e, "direct connection failed");
+                }
+                Err(_) => {
+                    debug!(peer = ?peer_id, "direct connection timed out");
+                }
+            }
+        }
+
+        // Use the peer's designated relays from their published contact
+        if !contact.relays.is_empty() {
+            debug!(
+                peer = ?peer_id,
+                relay_count = contact.relays.len(),
+                "trying connection via peer's designated relays"
+            );
+            
+            let our_peer_id = self.keypair.identity();
+
+            let direct_addrs = &contact.addrs;
+            if direct_addrs.is_empty() {
+                anyhow::bail!("cannot use relay without at least one target address");
+            }
+            
+            // Try each designated relay (resolve identity from DHT)
+            let mut last_error = None;
+            for relay_id in &contact.relays {
+                let session_id = match generate_session_id() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                
+                debug!(
+                    peer = ?peer_id,
+                    relay = ?relay_id,
+                    "attempting connection via designated relay"
+                );
+                
+                // Resolve relay identity from DHT
+                let relay_contact = match self.dhtnode.lookup_contact(relay_id).await {
+                    Some(c) if !c.addrs.is_empty() => c,
+                    Some(_) => {
+                        debug!(relay = ?relay_id, "relay has no addresses, trying next");
+                        last_error = Some(anyhow::anyhow!("relay has no addresses"));
+                        continue;
+                    }
+                    None => {
+                        debug!(relay = ?relay_id, "failed to resolve relay, trying next");
+                        last_error = Some(anyhow::anyhow!("relay not found"));
+                        continue;
+                    }
+                };
+                
+                let relay_result = tokio::time::timeout(
+                    RELAY_TIMEOUT,
+                    self.rpcnode
+                        .request_relay_session(&relay_contact, our_peer_id, peer_id, session_id),
+                )
+                .await;
+
+                let (relay_conn, response) = match relay_result {
+                    Ok(Ok((conn, resp))) => (conn, resp),
+                    Ok(Err(e)) => {
+                        debug!(
+                            relay = ?relay_id,
+                            error = %e,
+                            "failed to request relay session, trying next"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(_) => {
+                        debug!(
+                            relay = ?relay_id,
+                            "relay session request timed out, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!("relay session request timed out"));
+                        continue;
+                    }
+                };
+
+                let (session_id, relay_data_addr) = match response {
+                    RelayResponse::Accepted {
+                        session_id,
+                        relay_data_addr,
+                    } => {
+                        debug!(
+                            peer = ?peer_id,
+                            relay = ?relay_id,
+                            session = hex::encode(session_id),
+                            relay_data = %relay_data_addr,
+                            "relay session pending"
+                        );
+                        (session_id, relay_data_addr)
+                    }
+                    RelayResponse::Connected {
+                        session_id,
+                        relay_data_addr,
+                    } => {
+                        debug!(
+                            peer = ?peer_id,
+                            relay = ?relay_id,
+                            session = hex::encode(session_id),
+                            relay_data = %relay_data_addr,
+                            "relay session established"
+                        );
+                        (session_id, relay_data_addr)
+                    }
+                    RelayResponse::Rejected { reason } => {
+                        debug!(
+                            relay = ?relay_id,
+                            reason = %reason,
+                            "relay rejected, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!("relay rejected: {}", reason));
+                        continue;
+                    }
+                    RelayResponse::Registered => {
+                        debug!(relay = ?relay_id, "unexpected Registered response, trying next");
+                        last_error = Some(anyhow::anyhow!("unexpected Registered response"));
+                        continue;
+                    }
+                    RelayResponse::Incoming { .. } => {
+                        debug!(relay = ?relay_id, "unexpected Incoming response, trying next");
+                        last_error = Some(anyhow::anyhow!("unexpected Incoming response"));
+                        continue;
+                    }
+                };
+
+                if let Err(e) = self.rpcnode.configure_relay_path_for_peer(
+                    peer_id,
+                    direct_addrs,
+                    session_id,
+                    &relay_data_addr,
+                ).await {
+                    debug!(
+                        relay = ?relay_id,
+                        error = %e,
+                        "failed to configure relay path, trying next"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+
+                let peer_conn_result = tokio::time::timeout(
+                    RELAY_TIMEOUT,
+                    self.rpcnode.connect_to_peer(&peer_id, &direct_addrs),
+                )
+                .await;
+
+                drop(relay_conn);
+
+                match peer_conn_result {
+                    Ok(Ok(conn)) => {
+                        info!(
+                            peer = ?peer_id,
+                            relay = ?relay_id,
+                            "connection successful via designated relay"
+                        );
+                        return Ok(conn);
+                    }
+                    Ok(Err(e)) => {
+                        self.smartsock.remove_relay_tunnel(&peer_id, &session_id).await;
+                        debug!(
+                            relay = ?relay_id,
+                            error = %e,
+                            "relay-assisted connect failed, trying next"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(_) => {
+                        self.smartsock.remove_relay_tunnel(&peer_id, &session_id).await;
+                        debug!(
+                            relay = ?relay_id,
+                            "relay-assisted connect timed out, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!("relay-assisted connect timed out"));
+                        continue;
+                    }
+                }
+            }
+
+            // All designated relays failed
+            if let Some(e) = last_error {
+                anyhow::bail!("all relay attempts failed, last error: {}", e);
+            }
+        }
+
+        anyhow::bail!("direct connection failed and peer has no designated relays");
     }
     
     pub async fn send_direct(&self, identity: &str, data: Vec<u8>) -> Result<()> {
         let peer_identity = Identity::from_hex(identity)
             .context("invalid identity: must be 64 hex characters")?;
         
-        let record = self.dhtnode.resolve_peer(&peer_identity).await?
-            .context("peer not found in DHT")?;
+        let contact = self.resolve(&peer_identity).await?
+            .context("peer not found")?;
         
-        let contact = Contact::unsigned(peer_identity, record.addrs.clone());
-        
-        self.rpcnode.send_direct(&contact, self.keypair.identity(), data).await
+        self.rpcnode.send_direct(&contact, data).await
     }
     
     pub async fn direct_messages(&self) -> Result<tokio::sync::mpsc::Receiver<(String, Vec<u8>)>> {
@@ -472,12 +699,12 @@ impl Node {
     }
     
     pub fn is_running(&self) -> bool {
-        !self.server_handle.is_finished()
+        !self.listener.is_finished()
     }
     
     pub async fn shutdown(&self) {
         // Abort the server first to stop accepting new connections
-        self.server_handle.abort();
+        self.listener.abort();
         
         // Shutdown actors in reverse dependency order
         self.hyparview.quit().await;
@@ -518,12 +745,10 @@ impl Node {
         let helper_id = Identity::from_hex(helper_identity)
             .context("invalid helper identity: must be 64 hex characters")?;
         
-        let record = self.dhtnode.resolve_peer(&helper_id).await?
+        let record = self.resolve(&helper_id).await?
             .context("helper not found in DHT")?;
         
-        let helper = Contact::unsigned(helper_id, record.addrs);
-        
-        self.relay_client.probe_reachability(&helper).await
+        self.relay_client.probe_reachability(&record).await
     }
 
     /// Discover relay-capable nodes in the network.
@@ -573,10 +798,8 @@ impl Node {
         let helper_id = Identity::from_hex(helper_identity)
             .context("invalid helper identity: must be 64 hex characters")?;
         
-        let record = self.dhtnode.resolve_peer(&helper_id).await?
+        let helper = self.resolve(&helper_id).await?
             .context("helper not found in DHT")?;
-        
-        let helper = Contact::unsigned(helper_id, record.addrs);
         
         let status = self.relay_client.configure(&helper, addresses).await?;
         

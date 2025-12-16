@@ -50,9 +50,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
 
 use crate::hyparview::NeighborCallback;
-use crate::identity::{Identity, Keypair};
-use crate::messages::{MessageId, PlumTreeMessage};
-use crate::rpc::PlumTreeRpc;
+use crate::identity::{Contact, Identity, Keypair};
+use crate::messages::{MessageId, PlumTreeRequest};
+use crate::protocols::PlumTreeRpc;
 
 // ============================================================================
 // Configuration Constants
@@ -596,12 +596,6 @@ impl std::fmt::Display for MessageRejection {
 impl std::error::Error for MessageRejection {}
 
 
-#[async_trait::async_trait]
-pub trait PlumTreeHandler: Send + Sync {
-    async fn handle_message(&self, from: &Identity, message: PlumTreeMessage) -> anyhow::Result<()>;
-}
-
-
 // ============================================================================
 // Commands sent from Handle to Actor
 // ============================================================================
@@ -610,8 +604,8 @@ enum Command {
     Subscribe(String, oneshot::Sender<anyhow::Result<()>>),
     Unsubscribe(String, oneshot::Sender<anyhow::Result<()>>),
     Publish(String, Vec<u8>, oneshot::Sender<anyhow::Result<MessageId>>),
-    HandleMessage(Identity, PlumTreeMessage, oneshot::Sender<anyhow::Result<()>>),
-    NeighborUp(Identity),
+    HandleMessage(Contact, PlumTreeRequest, oneshot::Sender<anyhow::Result<()>>),
+    NeighborUp(Contact),
     NeighborDown(Identity),
     GetSubscriptions(oneshot::Sender<Vec<String>>),
     Quit,
@@ -686,10 +680,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
 
 #[async_trait::async_trait]
 impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
-    async fn neighbor_up(&self, peer: Identity) {
+    async fn neighbor_up(&self, peer: Contact) {
+        let peer_id = peer.identity;
         if self.cmd_tx.send(Command::NeighborUp(peer)).await.is_err() {
             warn!(
-                peer = %hex::encode(&peer.as_bytes()[..8]),
+                peer = %hex::encode(&peer_id.as_bytes()[..8]),
                 "failed to notify PlumTree of neighbor_up - actor closed"
             );
         }
@@ -705,11 +700,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> NeighborCallback for PlumTree<N> {
     }
 }
 
-#[async_trait::async_trait]
-impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeHandler for PlumTree<N> {
-    async fn handle_message(&self, from: &Identity, message: PlumTreeMessage) -> anyhow::Result<()> {
+impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTree<N> {
+    /// Handle an incoming PlumTree message from a peer.
+    pub async fn handle_message(&self, from: &Contact, message: PlumTreeRequest) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::HandleMessage(*from, message, tx)).await
+        self.cmd_tx.send(Command::HandleMessage(from.clone(), message, tx)).await
             .map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?;
         rx.await.map_err(|_| anyhow::anyhow!("PlumTree actor closed"))?
     }
@@ -734,13 +729,13 @@ struct PlumTreeActor<N: PlumTreeRpc> {
     /// Uses LruCache to enforce MAX_SEQNO_TRACKING_SOURCES bound.
     seqno_tracker: LruCache<Identity, SeqnoTracker>,
     message_tx: mpsc::Sender<ReceivedMessage>,
-    outbound: HashMap<Identity, Vec<PlumTreeMessage>>,
+    outbound: HashMap<Identity, Vec<PlumTreeRequest>>,
     /// Per-peer rate limiting.
     /// Uses LruCache to enforce MAX_RATE_LIMIT_ENTRIES bound.
     rate_limits: LruCache<Identity, PeerRateLimit>,
-    /// Known peers from HyParView membership.
+    /// Known peers from HyParView membership with their contacts.
     /// Uses LruCache to enforce MAX_KNOWN_PEERS bound as defense-in-depth.
-    known_peers: LruCache<Identity, ()>,
+    contacts: LruCache<Identity, Contact>,
     /// Global count of pending IWants across all topics.
     global_pending_iwants: usize,
 }
@@ -761,7 +756,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             .expect("MAX_SEQNO_TRACKING_SOURCES must be non-zero");
         let rate_limits_cap = NonZeroUsize::new(MAX_RATE_LIMIT_ENTRIES)
             .expect("MAX_RATE_LIMIT_ENTRIES must be non-zero");
-        let known_peers_cap = NonZeroUsize::new(MAX_KNOWN_PEERS)
+        let contacts_cap = NonZeroUsize::new(MAX_KNOWN_PEERS)
             .expect("MAX_KNOWN_PEERS must be non-zero");
         
         Self {
@@ -778,8 +773,29 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             message_tx,
             outbound: HashMap::new(),
             rate_limits: LruCache::new(rate_limits_cap),
-            known_peers: LruCache::new(known_peers_cap),
+            contacts: LruCache::new(contacts_cap),
             global_pending_iwants: 0,
+        }
+    }
+
+    /// Get the contact for a peer, if known.
+    fn get_contact(&mut self, identity: &Identity) -> Option<&Contact> {
+        self.contacts.get(identity)
+    }
+
+    /// Store a contact for a peer.
+    fn store_contact(&mut self, contact: Contact) {
+        self.contacts.put(contact.identity, contact);
+    }
+
+    /// Send a PlumTree message to a peer by identity.
+    /// Returns Ok if sent, Err if contact not known.
+    async fn send_to_peer(&mut self, to: &Identity, message: PlumTreeRequest) -> anyhow::Result<()> {
+        if let Some(contact) = self.get_contact(to) {
+            let contact = contact.clone();
+            self.network.send_plumtree(&contact, message).await
+        } else {
+            anyhow::bail!("no contact for peer {}", hex::encode(&to.as_bytes()[..8]))
         }
     }
 
@@ -800,10 +816,13 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                             let _ = reply.send(self.handle_publish_cmd(&topic, data).await);
                         }
                         Some(Command::HandleMessage(from, msg, reply)) => {
-                            let _ = reply.send(self.handle_message_internal(&from, msg).await);
+                            // Store the contact for future messages
+                            self.store_contact(from.clone());
+                            let _ = reply.send(self.handle_message_internal(&from.identity, msg).await);
                         }
-                        Some(Command::NeighborUp(peer)) => {
-                            self.handle_neighbor_up(peer).await;
+                        Some(Command::NeighborUp(contact)) => {
+                            self.store_contact(contact.clone());
+                            self.handle_neighbor_up(contact.identity).await;
                         }
                         Some(Command::NeighborDown(peer)) => {
                             self.handle_neighbor_down(&peer).await;
@@ -862,7 +881,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
 
         let state = self.topics.entry(topic.to_string()).or_default();
         
-        for (peer, _) in self.known_peers.iter() {
+        for (peer, _) in self.contacts.iter() {
             if *peer != self.local_identity {
                 state.add_peer_with_limits(*peer, self.config.eager_peers, self.config.lazy_peers);
             }
@@ -871,7 +890,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         let peers: Vec<Identity> = state.eager_peers.iter().chain(state.lazy_peers.iter()).copied().collect();
 
         for peer in peers {
-            self.queue_message(&peer, PlumTreeMessage::Subscribe {
+            self.queue_message(&peer, PlumTreeRequest::Subscribe {
                 topic: topic.to_string(),
             }).await;
         }
@@ -894,7 +913,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         };
 
         for peer in all_peers {
-            self.queue_message(&peer, PlumTreeMessage::Unsubscribe {
+            self.queue_message(&peer, PlumTreeRequest::Unsubscribe {
                 topic: topic.to_string(),
             }).await;
         }
@@ -952,7 +971,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             }
         }
 
-        let publish_msg = PlumTreeMessage::Publish {
+        let publish_msg = PlumTreeRequest::Publish {
             topic: topic.to_string(),
             msg_id,
             source: self.local_identity,
@@ -1001,7 +1020,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         Ok(msg_id)
     }
 
-    async fn handle_message_internal(&mut self, from: &Identity, msg: PlumTreeMessage) -> anyhow::Result<()> {
+    async fn handle_message_internal(&mut self, from: &Identity, msg: PlumTreeRequest) -> anyhow::Result<()> {
         if let Some(topic) = msg.topic() {
             if !is_valid_topic(topic) {
                 anyhow::bail!("invalid topic name from peer");
@@ -1009,25 +1028,25 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         }
         
         match msg {
-            PlumTreeMessage::Subscribe { topic } => {
+            PlumTreeRequest::Subscribe { topic } => {
                 self.handle_subscribe(from, &topic).await;
             }
-            PlumTreeMessage::Unsubscribe { topic } => {
+            PlumTreeRequest::Unsubscribe { topic } => {
                 self.handle_unsubscribe(from, &topic).await;
             }
-            PlumTreeMessage::Graft { topic } => {
+            PlumTreeRequest::Graft { topic } => {
                 self.handle_graft(from, &topic).await;
             }
-            PlumTreeMessage::Prune { topic, .. } => {
+            PlumTreeRequest::Prune { topic, .. } => {
                 self.handle_prune(from, &topic).await;
             }
-            PlumTreeMessage::Publish { topic, msg_id, source, seqno, data, signature } => {
+            PlumTreeRequest::Publish { topic, msg_id, source, seqno, data, signature } => {
                 self.handle_publish(from, &topic, msg_id, source, seqno, data, signature).await?;
             }
-            PlumTreeMessage::IHave { topic, msg_ids } => {
+            PlumTreeRequest::IHave { topic, msg_ids } => {
                 self.handle_ihave(from, &topic, msg_ids).await;
             }
-            PlumTreeMessage::IWant { msg_ids } => {
+            PlumTreeRequest::IWant { msg_ids } => {
                 self.handle_iwant(from, msg_ids).await;
             }
         }
@@ -1063,9 +1082,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
         
-        // known_peers is bounded by LruCache with MAX_KNOWN_PEERS capacity.
-        // LRU eviction provides defense-in-depth against HyParView bugs.
-        self.known_peers.put(peer, ());
+        // Contact is already stored before this method is called
         
         if self.subscriptions.is_empty() {
             return;
@@ -1088,7 +1105,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
         
-        self.known_peers.pop(peer);
+        self.contacts.pop(peer);
         self.outbound.remove(peer);
         
         for (topic, state) in self.topics.iter_mut() {
@@ -1133,7 +1150,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
 
     async fn handle_graft(&mut self, from: &Identity, topic: &str) {
         if !self.subscriptions.contains(topic) {
-            self.queue_message(from, PlumTreeMessage::Prune {
+            self.queue_message(from, PlumTreeRequest::Prune {
                 topic: topic.to_string(),
                 peers: Vec::new(),
             }).await;
@@ -1230,7 +1247,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                 state.demote_to_lazy(*from);
             }
             
-            self.queue_message(from, PlumTreeMessage::Prune {
+            self.queue_message(from, PlumTreeRequest::Prune {
                 topic: topic.to_string(),
                 peers: Vec::new(),
             }).await;
@@ -1292,7 +1309,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             .map(|s| s.eager_peers.iter().filter(|p| **p != *from).copied().collect())
             .unwrap_or_default();
 
-        let forward_msg = PlumTreeMessage::Publish {
+        let forward_msg = PlumTreeRequest::Publish {
             topic: topic.to_string(),
             msg_id,
             source,
@@ -1351,11 +1368,11 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
             return;
         }
 
-        self.queue_message(from, PlumTreeMessage::Graft {
+        self.queue_message(from, PlumTreeRequest::Graft {
             topic: topic.to_string(),
         }).await;
 
-        self.queue_message(from, PlumTreeMessage::IWant { 
+        self.queue_message(from, PlumTreeRequest::IWant { 
             msg_ids: recorded_ids.clone() 
         }).await;
 
@@ -1394,7 +1411,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
                 }
                 bytes_sent = bytes_sent.saturating_add(cached.data.len());
 
-                self.queue_message(from, PlumTreeMessage::Publish {
+                self.queue_message(from, PlumTreeRequest::Publish {
                     topic: cached.topic.clone(),
                     msg_id,
                     source: cached.source,
@@ -1427,16 +1444,14 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         let peers_with_pending: Vec<Identity> = self.outbound.keys().copied().collect();
 
         for peer in peers_with_pending {
-            if let Some(contact) = self.network.resolve_identity_to_contact(&peer).await {
-                let messages = self.outbound.remove(&peer).unwrap_or_default();
-                for msg in messages {
-                    if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg).await {
-                        trace!(
-                            peer = %hex::encode(&peer.as_bytes()[..8]),
-                            error = %e,
-                            "failed to flush pending PlumTree message"
-                        );
-                    }
+            let messages = self.outbound.remove(&peer).unwrap_or_default();
+            for msg in messages {
+                if let Err(e) = self.send_to_peer(&peer, msg).await {
+                    trace!(
+                        peer = %hex::encode(&peer.as_bytes()[..8]),
+                        error = %e,
+                        "failed to flush pending PlumTree message"
+                    );
                 }
             }
         }
@@ -1457,7 +1472,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         };
 
         if should_push && !msg_ids.is_empty() && !lazy_peers.is_empty() {
-            let ihave = PlumTreeMessage::IHave {
+            let ihave = PlumTreeRequest::IHave {
                 topic: topic.to_string(),
                 msg_ids,
             };
@@ -1479,7 +1494,7 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
         self.global_pending_iwants = self.global_pending_iwants.saturating_sub(completed_count);
 
         for (msg_id, peer) in retries {
-            self.queue_message(&peer, PlumTreeMessage::IWant {
+            self.queue_message(&peer, PlumTreeRequest::IWant {
                 msg_ids: vec![msg_id],
             }).await;
             trace!(
@@ -1528,17 +1543,15 @@ impl<N: PlumTreeRpc + Send + Sync + 'static> PlumTreeActor<N> {
     }
 
 
-    async fn queue_message(&mut self, peer: &Identity, msg: PlumTreeMessage) {
-        if let Some(contact) = self.network.resolve_identity_to_contact(peer).await {
-            if let Err(e) = self.network.send_plumtree(&contact, self.local_identity, msg.clone()).await {
-                trace!(
-                    peer = %hex::encode(&peer.as_bytes()[..8]),
-                    error = %e,
-                    "failed to send PlumTree message, queueing for later"
-                );
-            } else {
-                return;
-            }
+    async fn queue_message(&mut self, peer: &Identity, msg: PlumTreeRequest) {
+        if let Err(e) = self.send_to_peer(peer, msg.clone()).await {
+            trace!(
+                peer = %hex::encode(&peer.as_bytes()[..8]),
+                error = %e,
+                "failed to send PlumTree message, queueing for later"
+            );
+        } else {
+            return;
         }
         
         if !self.outbound.contains_key(peer) && self.outbound.len() >= MAX_OUTBOUND_PEERS {

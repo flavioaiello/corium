@@ -11,7 +11,7 @@
 //! | PubSub | `PlumTreeRequest` | (fire-and-forget) |
 //! | Membership | `HyParViewRequest` | (fire-and-forget) |
 //! | Relay | `RelayRequest` | `RelayResponse` |
-//! | Direct | `DirectRequest` | (application-defined) |
+//! | Direct | `Vec<u8>` | (application-defined) |
 //!
 //! ## Security Limits
 //!
@@ -179,7 +179,7 @@ pub enum RelayResponse {
 pub type MessageId = [u8; 32];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum PlumTreeMessage {
+pub enum PlumTreeRequest {
     Subscribe {
         topic: String,
     },
@@ -210,16 +210,16 @@ pub enum PlumTreeMessage {
     },
 }
 
-impl PlumTreeMessage {
+impl PlumTreeRequest {
     pub fn topic(&self) -> Option<&str> {
         match self {
-            PlumTreeMessage::Subscribe { topic } => Some(topic),
-            PlumTreeMessage::Unsubscribe { topic } => Some(topic),
-            PlumTreeMessage::Graft { topic } => Some(topic),
-            PlumTreeMessage::Prune { topic, .. } => Some(topic),
-            PlumTreeMessage::Publish { topic, .. } => Some(topic),
-            PlumTreeMessage::IHave { topic, .. } => Some(topic),
-            PlumTreeMessage::IWant { .. } => None,
+            PlumTreeRequest::Subscribe { topic } => Some(topic),
+            PlumTreeRequest::Unsubscribe { topic } => Some(topic),
+            PlumTreeRequest::Graft { topic } => Some(topic),
+            PlumTreeRequest::Prune { topic, .. } => Some(topic),
+            PlumTreeRequest::Publish { topic, .. } => Some(topic),
+            PlumTreeRequest::IHave { topic, .. } => Some(topic),
+            PlumTreeRequest::IWant { .. } => None,
         }
     }
 }
@@ -232,7 +232,7 @@ pub enum Priority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HyParViewMessage {
+pub enum HyParViewRequest {
     Join,
     ForwardJoin {
         new_peer: Identity,
@@ -267,40 +267,26 @@ pub struct Message {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlumTreeRequest {
-    pub from: Identity,
-    pub message: PlumTreeMessage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyParViewRequest {
-    pub from: Identity,
-    pub message: HyParViewMessage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectRequest {
-    pub from: Identity,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {
     DhtNode(DhtNodeRequest),
     Relay(RelayRequest),
     PlumTree(PlumTreeRequest),
     HyParView(HyParViewRequest),
-    Direct(DirectRequest),
+    Direct(Vec<u8>),
 }
 
 impl RpcRequest {
+    /// Returns the claimed sender identity for request types that include one.
+    /// PlumTree, HyParView, and Direct requests no longer include identity
+    /// since TLS already provides verified identity.
     pub fn sender_identity(&self) -> Option<Identity> {
         match self {
-            RpcRequest::DhtNode(dht_req) => dht_req.sender_identity(),
+            RpcRequest::DhtNode(dht_msg) => dht_msg.sender_identity(),
             RpcRequest::Relay(relay_req) => Some(relay_req.sender_identity()),
-            RpcRequest::PlumTree(req) => Some(req.from),
-            RpcRequest::HyParView(req) => Some(req.from),
-            RpcRequest::Direct(req) => Some(req.from),
+            // These request types rely on TLS-verified identity
+            RpcRequest::PlumTree(_) => None,
+            RpcRequest::HyParView(_) => None,
+            RpcRequest::Direct(_) => None,
         }
     }
 }
@@ -491,41 +477,41 @@ mod tests {
 
     #[test]
     fn plumtree_message_variants() {
-        let sub = PlumTreeMessage::Subscribe {
+        let sub = PlumTreeRequest::Subscribe {
             topic: "test".to_string(),
         };
         assert_eq!(sub.topic(), Some("test"));
 
-        let unsub = PlumTreeMessage::Unsubscribe {
+        let unsub = PlumTreeRequest::Unsubscribe {
             topic: "test".to_string(),
         };
         assert_eq!(unsub.topic(), Some("test"));
 
-        let graft = PlumTreeMessage::Graft {
+        let graft = PlumTreeRequest::Graft {
             topic: "test".to_string(),
         };
         assert_eq!(graft.topic(), Some("test"));
 
-        let prune = PlumTreeMessage::Prune {
+        let prune = PlumTreeRequest::Prune {
             topic: "test".to_string(),
             peers: vec![],
         };
         assert_eq!(prune.topic(), Some("test"));
 
-        let ihave = PlumTreeMessage::IHave {
+        let ihave = PlumTreeRequest::IHave {
             topic: "test".to_string(),
             msg_ids: vec![],
         };
         assert_eq!(ihave.topic(), Some("test"));
 
-        let iwant = PlumTreeMessage::IWant { msg_ids: vec![] };
+        let iwant = PlumTreeRequest::IWant { msg_ids: vec![] };
         assert_eq!(iwant.topic(), None);
     }
 
     #[test]
     fn plumtree_message_serialization() {
         let identity = Identity::from_bytes([1u8; 32]);
-        let msg = PlumTreeMessage::Publish {
+        let msg = PlumTreeRequest::Publish {
             topic: "test".to_string(),
             msg_id: [0u8; 32],
             source: identity,
@@ -535,10 +521,10 @@ mod tests {
         };
 
         let encoded = bincode::serialize(&msg).expect("serialize failed");
-        let decoded: PlumTreeMessage = bincode::deserialize(&encoded).expect("deserialize failed");
+        let decoded: PlumTreeRequest = bincode::deserialize(&encoded).expect("deserialize failed");
 
         match decoded {
-            PlumTreeMessage::Publish {
+            PlumTreeRequest::Publish {
                 topic, seqno, data, ..
             } => {
                 assert_eq!(topic, "test");
@@ -582,28 +568,21 @@ mod tests {
 
     #[test]
     fn round_trip_plumtree_request() {
-        let request = RpcRequest::PlumTree(PlumTreeRequest {
-            from: test_identity(),
-            message: PlumTreeMessage::Publish {
-                topic: "test".to_string(),
-                msg_id: [0u8; 32],
-                source: test_identity(),
-                seqno: 1,
-                data: b"hello".to_vec(),
-                signature: vec![],
-            },
+        let request = RpcRequest::PlumTree(PlumTreeRequest::Publish {
+            topic: "test".to_string(),
+            msg_id: [0u8; 32],
+            source: test_identity(),
+            seqno: 1,
+            data: b"hello".to_vec(),
+            signature: vec![],
         });
 
         let bytes = serialize_request(&request).expect("serialize should succeed");
         let decoded = deserialize_request(&bytes).expect("deserialize should succeed");
 
         match decoded {
-            RpcRequest::PlumTree(req) => {
-                assert_eq!(req.from, test_identity());
-                match req.message {
-                    PlumTreeMessage::Publish { topic, .. } => assert_eq!(topic, "test"),
-                    _ => panic!("unexpected message type"),
-                }
+            RpcRequest::PlumTree(PlumTreeRequest::Publish { topic, .. }) => {
+                assert_eq!(topic, "test");
             }
             _ => panic!("unexpected variant"),
         }
@@ -654,19 +633,19 @@ mod tests {
 
     #[test]
     fn plumtree_message_topic_accessor() {
-        let subscribe = PlumTreeMessage::Subscribe { topic: "test".into() };
+        let subscribe = PlumTreeRequest::Subscribe { topic: "test".into() };
         assert_eq!(subscribe.topic(), Some("test"));
         
-        let unsubscribe = PlumTreeMessage::Unsubscribe { topic: "foo".into() };
+        let unsubscribe = PlumTreeRequest::Unsubscribe { topic: "foo".into() };
         assert_eq!(unsubscribe.topic(), Some("foo"));
         
-        let graft = PlumTreeMessage::Graft { topic: "bar".into() };
+        let graft = PlumTreeRequest::Graft { topic: "bar".into() };
         assert_eq!(graft.topic(), Some("bar"));
         
-        let prune = PlumTreeMessage::Prune { topic: "baz".into(), peers: vec![] };
+        let prune = PlumTreeRequest::Prune { topic: "baz".into(), peers: vec![] };
         assert_eq!(prune.topic(), Some("baz"));
         
-        let publish = PlumTreeMessage::Publish {
+        let publish = PlumTreeRequest::Publish {
             topic: "pub".into(),
             msg_id: [0u8; 32],
             source: test_identity(),
@@ -676,10 +655,10 @@ mod tests {
         };
         assert_eq!(publish.topic(), Some("pub"));
         
-        let ihave = PlumTreeMessage::IHave { topic: "ih".into(), msg_ids: vec![] };
+        let ihave = PlumTreeRequest::IHave { topic: "ih".into(), msg_ids: vec![] };
         assert_eq!(ihave.topic(), Some("ih"));
         
-        let iwant = PlumTreeMessage::IWant { msg_ids: vec![] };
+        let iwant = PlumTreeRequest::IWant { msg_ids: vec![] };
         assert_eq!(iwant.topic(), None);
     }
 }
