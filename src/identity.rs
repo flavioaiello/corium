@@ -339,7 +339,7 @@ impl Contact {
     /// Rejects records that are:
     /// - Not cryptographically valid (via verify())
     /// - Older than max_age_secs (stale)
-    /// - More than 10 seconds in the future (clock skew tolerance)
+    /// - More than 30 seconds in the future (clock skew tolerance)
     pub fn verify_fresh(&self, max_age_secs: u64) -> bool {
         if self.verify().is_err() {
             return false;
@@ -350,9 +350,10 @@ impl Contact {
         
         let max_age_ms = max_age_secs * 1000;
         
-        // SECURITY: Allow small clock skew (10s) for future timestamps,
-        // but reject anything too far in the future to prevent pre-dated attacks.
-        const FUTURE_TOLERANCE_MS: u64 = 10_000;
+        // SECURITY: Allow clock skew tolerance (30s) for future timestamps to
+        // accommodate nodes with poor NTP synchronization in global deployments.
+        // Reject anything too far in the future to prevent pre-dated attacks.
+        const FUTURE_TOLERANCE_MS: u64 = 30_000;
         if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
             return false;
         }

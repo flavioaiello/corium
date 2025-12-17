@@ -169,6 +169,11 @@ pub const MAX_IDONTWANT_PER_PEER: usize = 1000;
 /// Per GossipSub v1.2: entries should expire after a reasonable time.
 pub const IDONTWANT_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum peers to track IDontWant entries for.
+/// SECURITY: Bounds the idontwant tracking table to prevent memory exhaustion
+/// from attackers sending IDontWant messages from many identities.
+pub const MAX_IDONTWANT_PEERS: usize = 10_000;
+
 /// Maximum message sources to track sequence numbers for.
 /// SCALABILITY: 10K sources × 128-bit window = ~2 MB (constant, not O(N)).
 /// SECURITY: Limits replay tracking table size.
@@ -291,8 +296,10 @@ pub struct GossipSubConfig {
     // Peer Scoring Configuration (GossipSub v1.1)
     // ========================================================================
     
-    /// Enable peer scoring. When disabled, all peers score 0.
-    pub peer_scoring_enabled: bool,
+    // NOTE: Peer scoring is always enabled for security. There is no opt-out.
+    // GossipSub v1.1 peer scoring defends against grafting attacks, message
+    // flooding, and mesh manipulation.
+    
     /// Score threshold below which we won't accept messages.
     pub graylist_threshold: f64,
     /// Score threshold below which we won't publish to peer.
@@ -342,8 +349,7 @@ impl Default for GossipSubConfig {
             gossip_lazy: DEFAULT_GOSSIP_LAZY,
             prune_backoff: Duration::from_secs(DEFAULT_PRUNE_BACKOFF_SECS),
             
-            // Peer scoring (disabled by default for backward compat)
-            peer_scoring_enabled: false,
+            // Peer scoring thresholds (scoring is always enabled for security)
             graylist_threshold: DEFAULT_GRAYLIST_THRESHOLD,
             publish_threshold: DEFAULT_PUBLISH_THRESHOLD,
             gossip_threshold: DEFAULT_GOSSIP_THRESHOLD,
@@ -807,6 +813,10 @@ pub(crate) struct TopicState {
     /// SECURITY: Used for D_out enforcement to prevent eclipse attacks.
     pub outbound_peers: HashSet<Identity>,
     pub recent_messages: VecDeque<MessageId>,
+    /// Pending IWant requests awaiting message delivery.
+    /// SECURITY: Bounded by MAX_PENDING_IWANTS (100) per topic and
+    /// MAX_GLOBAL_PENDING_IWANTS (1000) globally. Uses HashMap instead of
+    /// LruCache because we need iter_mut() for timeout checking.
     pub pending_iwants: HashMap<MessageId, (Instant, Vec<Identity>)>,
     pub last_lazy_push: Instant,
 }
@@ -1266,7 +1276,8 @@ struct GossipSubActor<N: GossipSubRpc> {
     global_pending_iwants: usize,
     /// Per-peer IDONTWANT tracking (GossipSub v1.2 optimization).
     /// Tracks messages peers don't want to reduce redundant delivery.
-    idontwant: HashMap<Identity, IDontWantTracker>,
+    /// SECURITY: Uses LruCache to enforce MAX_IDONTWANT_PEERS bound.
+    idontwant: LruCache<Identity, IDontWantTracker>,
     /// Per-peer score tracking (GossipSub v1.1).
     /// Uses LruCache to enforce MAX_SCORED_PEERS bound.
     peer_scores: LruCache<Identity, PeerScore>,
@@ -1310,6 +1321,8 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             .expect("MAX_SCORED_PEERS must be non-zero");
         let backoff_cap = NonZeroUsize::new(MAX_BACKOFF_ENTRIES)
             .expect("MAX_BACKOFF_ENTRIES must be non-zero");
+        let idontwant_cap = NonZeroUsize::new(MAX_IDONTWANT_PEERS)
+            .expect("MAX_IDONTWANT_PEERS must be non-zero");
         
         Self {
             network,
@@ -1327,7 +1340,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             rate_limits: LruCache::new(rate_limits_cap),
             contacts: LruCache::new(contacts_cap),
             global_pending_iwants: 0,
-            idontwant: HashMap::new(),
+            idontwant: LruCache::new(idontwant_cap),
             peer_scores: LruCache::new(peer_scores_cap),
             topic_score_params: HashMap::new(),
             last_score_decay: Instant::now(),
@@ -1383,10 +1396,6 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Get the current score for a peer.
     fn get_peer_score(&mut self, peer: &Identity) -> f64 {
-        if !self.config.peer_scoring_enabled {
-            return 0.0;
-        }
-        
         if let Some(score) = self.peer_scores.get(peer) {
             score.calculate(&self.topic_score_params)
         } else {
@@ -1397,44 +1406,29 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     /// Check if a peer is below the graylist threshold.
     /// Peers below this threshold should have their messages rejected.
     fn is_peer_graylisted(&mut self, peer: &Identity) -> bool {
-        if !self.config.peer_scoring_enabled {
-            return false;
-        }
         self.get_peer_score(peer) < self.config.graylist_threshold
     }
 
     /// Check if a peer is below the publish threshold.
     /// Peers below this threshold should not receive published messages.
     fn is_peer_below_publish_threshold(&mut self, peer: &Identity) -> bool {
-        if !self.config.peer_scoring_enabled {
-            return false;
-        }
         self.get_peer_score(peer) < self.config.publish_threshold
     }
 
     /// Check if a peer is below the gossip threshold.
     /// Peers below this threshold should not receive IHAVE gossip.
     fn is_peer_below_gossip_threshold(&mut self, peer: &Identity) -> bool {
-        if !self.config.peer_scoring_enabled {
-            return false;
-        }
         self.get_peer_score(peer) < self.config.gossip_threshold
     }
 
     /// Record that a peer joined the mesh for a topic.
     fn score_mesh_joined(&mut self, peer: &Identity, topic: &str) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
         let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
         score.mesh_joined(topic);
     }
 
     /// Record that a peer left the mesh for a topic.
     fn score_mesh_left(&mut self, peer: &Identity, topic: &str) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
         let params = self.topic_score_params.get(topic)
             .cloned()
             .unwrap_or_default();
@@ -1445,9 +1439,6 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Record a first message delivery from a peer.
     fn score_first_message_delivered(&mut self, peer: &Identity, topic: &str) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
         let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
         score.first_message_delivered(topic);
         score.mesh_message_delivered(topic);
@@ -1455,28 +1446,18 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Record an invalid message from a peer.
     fn score_invalid_message(&mut self, peer: &Identity, topic: &str) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
         let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
         score.invalid_message(topic);
     }
 
     /// Add a behavioural penalty to a peer (P7).
     fn score_add_penalty(&mut self, peer: &Identity, penalty: f64) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
         let score = self.peer_scores.get_or_insert_mut(*peer, PeerScore::default);
         score.add_behaviour_penalty(penalty);
     }
 
     /// Apply decay to all peer scores (called from heartbeat).
     fn decay_scores(&mut self) {
-        if !self.config.peer_scoring_enabled {
-            return;
-        }
-        
         if self.last_score_decay.elapsed() < self.config.decay_interval {
             return;
         }
@@ -2355,7 +2336,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             msg_ids
         };
 
-        let tracker = self.idontwant.entry(*from).or_default();
+        let tracker = self.idontwant.get_or_insert_mut(*from, IDontWantTracker::default);
         for msg_id in msg_ids {
             tracker.add(msg_id);
         }
@@ -2368,7 +2349,8 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Check if a peer has indicated they don't want a specific message.
     fn peer_wants_message(&mut self, peer: &Identity, msg_id: &MessageId) -> bool {
-        if let Some(tracker) = self.idontwant.get(peer) {
+        // Use peek() to avoid updating LRU order on read-only checks
+        if let Some(tracker) = self.idontwant.peek(peer) {
             !tracker.contains(msg_id)
         } else {
             true // No tracker = wants all messages
@@ -2745,12 +2727,26 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
 
     /// Clean up expired IDontWant entries and remove empty trackers.
     fn cleanup_idontwant(&mut self) {
+        // Collect peer IDs first to avoid borrow conflicts with LruCache
+        let peers: Vec<Identity> = self.idontwant.iter().map(|(id, _)| *id).collect();
+        
+        // Track which trackers become empty after expiration
+        let mut empty_peers = Vec::new();
+        
         // Expire old entries in each tracker
-        for tracker in self.idontwant.values_mut() {
-            tracker.expire_old();
+        for peer in peers {
+            if let Some(tracker) = self.idontwant.get_mut(&peer) {
+                tracker.expire_old();
+                if tracker.entries.is_empty() {
+                    empty_peers.push(peer);
+                }
+            }
         }
+        
         // Remove empty trackers
-        self.idontwant.retain(|_, tracker| !tracker.entries.is_empty());
+        for peer in empty_peers {
+            self.idontwant.pop(&peer);
+        }
     }
 
     async fn flush_pending_queues(&mut self) {

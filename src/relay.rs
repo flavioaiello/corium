@@ -21,7 +21,6 @@
 //! - Automatic session cleanup for expired/inactive sessions
 //! - Automatic relay discovery and best-RTT selection
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -919,8 +918,14 @@ impl RelayTunnel {
 
 struct RelayServerActor {
     socket: Arc<UdpSocket>,
-    sessions: HashMap<[u8; 16], RelaySession>,
-    addr_to_session: HashMap<SocketAddr, [u8; 16]>,
+    /// Active relay sessions indexed by session ID.
+    /// SECURITY: Bounded by MAX_SESSIONS via LruCache. When at capacity, oldest
+    /// sessions are evicted automatically, preventing memory exhaustion attacks.
+    sessions: LruCache<[u8; 16], RelaySession>,
+    /// Reverse mapping from peer address to session ID.
+    /// SECURITY: Bounded by MAX_ADDR_TO_SESSION_ENTRIES via LruCache.
+    /// Entries are evicted LRU when capacity is reached.
+    addr_to_session: LruCache<SocketAddr, [u8; 16]>,
     /// Per-IP session count for rate limiting. Tracks (count, window_start).
     /// SECURITY: LruCache bounds memory growth from IP address tracking.
     ip_session_count: LruCache<IpAddr, (usize, Instant)>,
@@ -930,12 +935,16 @@ struct RelayServerActor {
 
 impl RelayServerActor {
     fn new(socket: Arc<UdpSocket>, mesh_signal_tx: mpsc::Sender<MeshSignalOut>) -> Self {
+        let sessions_cap = NonZeroUsize::new(MAX_SESSIONS)
+            .expect("MAX_SESSIONS must be non-zero");
+        let addr_to_session_cap = NonZeroUsize::new(MAX_ADDR_TO_SESSION_ENTRIES)
+            .expect("MAX_ADDR_TO_SESSION_ENTRIES must be non-zero");
         let ip_session_count_cap = NonZeroUsize::new(MAX_IP_SESSION_COUNT_ENTRIES)
             .expect("MAX_IP_SESSION_COUNT_ENTRIES must be non-zero");
         Self {
             socket,
-            sessions: HashMap::new(),
-            addr_to_session: HashMap::new(),
+            sessions: LruCache::new(sessions_cap),
+            addr_to_session: LruCache::new(addr_to_session_cap),
             ip_session_count: LruCache::new(ip_session_count_cap),
             mesh_signal_tx,
         }
@@ -1027,15 +1036,11 @@ impl RelayServerActor {
         }
         *count += 1;
         
-        if self.sessions.contains_key(&session_id) {
+        if self.sessions.contains(&session_id) {
             return Err("session already exists");
         }
         
-        // SECURITY: Bound addr_to_session to prevent memory exhaustion
-        if self.addr_to_session.len() >= MAX_ADDR_TO_SESSION_ENTRIES {
-            warn!("addr_to_session map at capacity, rejecting new session");
-            return Err("address mapping at capacity");
-        }
+        // NOTE: No capacity check needed for addr_to_session - LruCache auto-evicts oldest entries
         
         let session = RelaySession::new_pending(
             session_id,
@@ -1043,8 +1048,8 @@ impl RelayServerActor {
             peer_b_identity,
             peer_a_addr,
         );
-        self.sessions.insert(session_id, session);
-        self.addr_to_session.insert(peer_a_addr, session_id);
+        self.sessions.put(session_id, session);
+        self.addr_to_session.put(peer_a_addr, session_id);
         
         debug!(
             session = hex::encode(session_id),
@@ -1075,10 +1080,10 @@ impl RelayServerActor {
                 "identity mismatch in complete_session, removing session"
             );
             // Remove session and associated addr mappings
-            if let Some(removed) = self.sessions.remove(&session_id) {
-                self.addr_to_session.remove(&removed.peer_a_addr);
+            if let Some(removed) = self.sessions.pop(&session_id) {
+                self.addr_to_session.pop(&removed.peer_a_addr);
                 if let Some(peer_b) = removed.peer_b_addr {
-                    self.addr_to_session.remove(&peer_b);
+                    self.addr_to_session.pop(&peer_b);
                 }
             }
             return Err("peer identity mismatch");
@@ -1096,7 +1101,7 @@ impl RelayServerActor {
         session.peer_b_addr = Some(peer_b_addr);
         session.last_activity = Instant::now();
         
-        self.addr_to_session.insert(peer_b_addr, session_id);
+        self.addr_to_session.put(peer_b_addr, session_id);
         
         debug!(
             session = hex::encode(session_id),
@@ -1231,13 +1236,19 @@ impl RelayServerActor {
     }
 
     fn cleanup_expired(&mut self) -> usize {
-        let before = self.sessions.len();
+        // LruCache does not have retain(), so we collect expired session IDs first
+        let expired_ids: Vec<[u8; 16]> = self.sessions.iter()
+            .filter(|(_, session)| session.is_expired())
+            .map(|(id, _)| *id)
+            .collect();
         
-        self.sessions.retain(|_session_id, session| {
-            if session.is_expired() {
-                self.addr_to_session.remove(&session.peer_a_addr);
+        let removed = expired_ids.len();
+        
+        for session_id in expired_ids {
+            if let Some(session) = self.sessions.pop(&session_id) {
+                self.addr_to_session.pop(&session.peer_a_addr);
                 if let Some(peer_b) = session.peer_b_addr {
-                    self.addr_to_session.remove(&peer_b);
+                    self.addr_to_session.pop(&peer_b);
                 }
                 trace!(
                     session = session.session_id_hex(),
@@ -1246,17 +1257,13 @@ impl RelayServerActor {
                     packets_relayed = session.packets_relayed,
                     "expired relay session"
                 );
-                false
-            } else {
-                true
             }
-        });
+        }
         
         // NOTE: ip_session_count cleanup is no longer needed here.
         // The LruCache automatically evicts oldest entries when at capacity,
         // and stale rate limit windows are reset on next access in register_session().
         
-        let removed = before - self.sessions.len();
         if removed > 0 {
             debug!(removed = removed, remaining = self.sessions.len(), "cleaned up expired sessions");
         }

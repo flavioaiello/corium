@@ -831,12 +831,10 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
     let connection = incoming.await.context("failed to accept connection")?;
     let remote = connection.remote_address();
 
-    let verified_identity = extract_verified_identity(&connection);
-    if verified_identity.is_none() {
+    let Some(verified_identity) = extract_verified_identity(&connection) else {
         warn!(remote = %remote, "rejecting connection: could not verify peer identity");
         return Err(anyhow::anyhow!("could not verify peer identity from certificate"));
-    }
-    let verified_identity = verified_identity.unwrap();
+    };
 
     // Register incoming peer in DHT routing table for identity resolution.
     // This enables GossipSub to send messages to peers that connected to us.

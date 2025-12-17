@@ -63,24 +63,58 @@ const OFFLOAD_BASE_DELAY_MS: u64 = 100;
 pub type Key = [u8; 32];
 
 pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
+    // Fast path: content-addressed storage (hash of value == key)
     if hash(value).as_bytes() == key {
         return true;
     }
 
+    // Slow path: identity-keyed Contact record
     if let Ok(record) = crate::messages::deserialize_bounded::<Contact>(value) {
         // SECURITY: validate_structure() prevents malformed Contact records
         // with excessive addresses/relays from being accepted into the DHT.
         // SECURITY: is_valid() ensures the identity is a valid Ed25519 public key,
         // preventing malformed identities (all zeros, non-point values) from entering the DHT.
-        if record.identity.is_valid()
-            && record.validate_structure()
-            && record.identity.as_bytes() == key
-            && record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS)
-        {
-            return true;
+        if !record.identity.is_valid() {
+            debug!(
+                key = hex::encode(&key[..8]),
+                "DHT store rejected: invalid identity (not a valid Ed25519 point)"
+            );
+            return false;
         }
+        if !record.validate_structure() {
+            debug!(
+                key = hex::encode(&key[..8]),
+                identity = hex::encode(&record.identity.as_bytes()[..8]),
+                "DHT store rejected: Contact structure validation failed"
+            );
+            return false;
+        }
+        if record.identity.as_bytes() != key {
+            debug!(
+                key = hex::encode(&key[..8]),
+                identity = hex::encode(&record.identity.as_bytes()[..8]),
+                "DHT store rejected: identity does not match key"
+            );
+            return false;
+        }
+        if !record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS) {
+            debug!(
+                key = hex::encode(&key[..8]),
+                identity = hex::encode(&record.identity.as_bytes()[..8]),
+                timestamp = record.timestamp,
+                "DHT store rejected: Contact record stale or invalid signature"
+            );
+            return false;
+        }
+        return true;
     }
 
+    // Neither content-addressed nor valid Contact record
+    debug!(
+        key = hex::encode(&key[..8]),
+        value_len = value.len(),
+        "DHT store rejected: hash mismatch and not a valid Contact record"
+    );
     false
 }
 
