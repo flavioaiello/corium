@@ -51,10 +51,13 @@ use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use lru::LruCache;
 
 use quinn::{AsyncUdpSocket, UdpPoller};
 use quinn::udp::{RecvMeta, Transmit};
@@ -86,6 +89,12 @@ pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum peers tracked by SmartSock.
 /// SECURITY: Bounds peer state table size.
 pub const MAX_SMARTSOCK_PEERS: usize = 10_000;
+
+/// Maximum entries in the reverse address lookup map.
+/// SECURITY: Explicit bound to prevent memory exhaustion from address proliferation.
+/// Set to MAX_SMARTSOCK_PEERS × (MAX_DIRECT_ADDRS_PER_PEER + MAX_RELAY_TUNNELS_PER_PEER)
+/// = 10,000 × 24 = 240,000 entries.
+pub const MAX_REVERSE_MAP_ENTRIES: usize = 240_000;
 
 // ----------------------------------------------------------------------------
 // Path Probing Protocol
@@ -706,10 +715,9 @@ pub struct SmartSock {
     peers: RwLock<HashMap<SmartAddr, PeerPathState>>,
     
     /// Reverse lookup: SocketAddr → SmartAddr.
-    /// BOUNDED: Transitively bounded by MAX_SMARTSOCK_PEERS × 
-    /// (MAX_DIRECT_ADDRS_PER_PEER + MAX_RELAY_TUNNELS_PER_PEER + MAX_CANDIDATES_PER_PEER).
-    /// Entries are cleaned when peers are evicted or tunnels are removed.
-    reverse_map: RwLock<HashMap<SocketAddr, SmartAddr>>,
+    /// SECURITY: Bounded by MAX_REVERSE_MAP_ENTRIES with LRU eviction to prevent
+    /// memory exhaustion from address proliferation attacks.
+    reverse_map: RwLock<LruCache<SocketAddr, SmartAddr>>,
     
     local_addr: SocketAddr,
 
@@ -724,10 +732,13 @@ impl SmartSock {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         
+        let reverse_map_cap = NonZeroUsize::new(MAX_REVERSE_MAP_ENTRIES)
+            .expect("MAX_REVERSE_MAP_ENTRIES must be non-zero");
+        
         Ok(Self {
             inner: Arc::new(socket),
             peers: RwLock::new(HashMap::new()),
-            reverse_map: RwLock::new(HashMap::new()),
+            reverse_map: RwLock::new(LruCache::new(reverse_map_cap)),
             local_addr,
             udprelay: StdRwLock::new(None),
             path_event_handler: RwLock::new(None),
@@ -809,13 +820,13 @@ impl SmartSock {
                     if let Some(evicted) = peers.remove(&oldest_addr) {
                         let mut reverse = self.reverse_map.write().await;
                         for addr in &evicted.direct_addrs {
-                            reverse.remove(addr);
+                            reverse.pop(addr);
                         }
                         for tunnel in evicted.relay_tunnels.values() {
-                            reverse.remove(&tunnel.relay_addr);
+                            reverse.pop(&tunnel.relay_addr);
                         }
                         for addr in evicted.candidates.keys() {
-                            reverse.remove(addr);
+                            reverse.pop(addr);
                         }
                         debug!(
                             evicted = ?evicted.identity,
@@ -834,7 +845,7 @@ impl SmartSock {
         {
             let mut reverse = self.reverse_map.write().await;
             for addr in direct_addrs {
-                reverse.insert(addr, smart_addr);
+                reverse.put(addr, smart_addr);
             }
         }
         
@@ -871,7 +882,7 @@ impl SmartSock {
         drop(peers);
         {
             let mut reverse = self.reverse_map.write().await;
-            reverse.insert(relay_addr, smart_addr);
+            reverse.put(relay_addr, smart_addr);
         }
         
         tracing::debug!(
@@ -896,7 +907,7 @@ impl SmartSock {
             if let Some(tunnel) = state.relay_tunnels.remove(session_id) {
                 drop(peers);
                 let mut reverse = self.reverse_map.write().await;
-                reverse.remove(&tunnel.relay_addr);
+                reverse.pop(&tunnel.relay_addr);
                 
                 tracing::debug!(
                     peer = ?identity,
@@ -932,7 +943,7 @@ impl SmartSock {
         if !relay_addrs_to_remove.is_empty() {
             let mut reverse = self.reverse_map.write().await;
             for relay_addr in relay_addrs_to_remove {
-                reverse.remove(&relay_addr);
+                reverse.pop(&relay_addr);
             }
         }
         
@@ -1109,7 +1120,7 @@ impl SmartSock {
         drop(peers);
         
         let mut reverse = self.reverse_map.write().await;
-        reverse.insert(addr, smart_addr);
+        reverse.put(addr, smart_addr);
     }
     
     pub async fn add_relay_candidate(&self, identity: &Identity, relay_addr: SocketAddr, session_id: [u8; 16]) {
@@ -1237,7 +1248,7 @@ impl SmartSock {
         if removed_count > 0 {
             let mut reverse = self.reverse_map.write().await;
             for (_, _, relay_addr, _, _) in stale_tunnels {
-                reverse.remove(&relay_addr);
+                reverse.pop(&relay_addr);
             }
         }
         
@@ -1541,9 +1552,11 @@ impl AsyncUdpSocket for SmartSock {
                 }
                 
                 let (payload, translated_addr, smart_addr_for_recv) = if let Some((session_id, payload)) = RelayTunnel::decode_frame(received) {
+                    // SECURITY: Use peek() for read-only lookup without updating LRU order.
+                    // This avoids requiring mutable access in the hot path.
                     let smart_addr = match self.reverse_map.try_read() {
                         Ok(guard) => {
-                            guard.get(&src_addr).copied()
+                            guard.peek(&src_addr).copied()
                         }
                         Err(_) => None,
                     };
@@ -1573,7 +1586,7 @@ impl AsyncUdpSocket for SmartSock {
                     // rewriting this to a synthetic SmartAddr can cause handshakes and
                     // existing connections to stall or be dropped.
                     let sa = match self.reverse_map.try_read() {
-                        Ok(guard) => guard.get(&src_addr).copied(),
+                        Ok(guard) => guard.peek(&src_addr).copied(),
                         Err(_) => None,
                     };
                     (received, src_addr, sa)
