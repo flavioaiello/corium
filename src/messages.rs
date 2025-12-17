@@ -449,10 +449,10 @@ mod tests {
 
     #[test]
     fn content_addressing_integrity() {
-        use crate::dht::{hash_content, verify_key_value_pair};
+        use crate::dht::verify_key_value_pair;
 
         let data = b"original content";
-        let key = hash_content(data);
+        let key = *blake3::hash(data).as_bytes();
 
         assert!(verify_key_value_pair(&key, data));
 
@@ -462,10 +462,10 @@ mod tests {
 
     #[test]
     fn empty_data_hashing() {
-        use crate::dht::{hash_content, verify_key_value_pair};
+        use crate::dht::verify_key_value_pair;
 
         let empty = b"";
-        let key = hash_content(empty);
+        let key = *blake3::hash(empty).as_bytes();
 
         assert!(verify_key_value_pair(&key, empty));
         assert!(!verify_key_value_pair(&key, b"not empty"));
@@ -473,17 +473,15 @@ mod tests {
 
     #[test]
     fn hash_collision_resistance() {
-        use crate::dht::hash_content;
-
         let data1 = b"data one";
         let data2 = b"data two";
 
-        let hash1 = hash_content(data1);
-        let hash2 = hash_content(data2);
+        let hash1 = blake3::hash(data1);
+        let hash2 = blake3::hash(data2);
 
         assert_ne!(hash1, hash2);
 
-        let data3 = b"data onf";        let hash3 = hash_content(data3);
+        let data3 = b"data onf";        let hash3 = blake3::hash(data3);
         assert_ne!(hash1, hash3);
     }
 

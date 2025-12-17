@@ -408,13 +408,13 @@ impl Node {
     pub async fn publish_address(&self, addresses: Vec<String>) -> Result<()> {
         // Warn if any address is unroutable (0.0.0.0 or ::)
         for addr in &addresses {
-            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-                if socket_addr.ip().is_unspecified() {
-                    warn!(
-                        "publishing unroutable address '{}' - use routable_addresses() or provide explicit IPs",
-                        addr
-                    );
-                }
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>()
+                && socket_addr.ip().is_unspecified()
+            {
+                warn!(
+                    "publishing unroutable address '{}' - use routable_addresses() or provide explicit IPs",
+                    addr
+                );
             }
         }
         self.dhtnode.publish_address(&self.keypair, addresses).await

@@ -44,6 +44,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use blake3::hash;
 use lru::LruCache;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
@@ -482,14 +483,14 @@ impl TopicScore {
         score += params.first_message_deliveries_weight * p2_value;
         
         // P3: Mesh message delivery rate (only if in mesh and activated)
-        if let Some(mesh_time) = self.mesh_time {
-            if mesh_time.elapsed() >= params.mesh_message_deliveries_activation {
-                let deficit = params.mesh_message_deliveries_threshold - self.mesh_message_deliveries;
-                if deficit > 0.0 {
-                    // Below threshold = penalty (squared deficit)
-                    let p3_value = deficit * deficit;
-                    score += params.mesh_message_deliveries_weight * p3_value;
-                }
+        if let Some(mesh_time) = self.mesh_time
+            && mesh_time.elapsed() >= params.mesh_message_deliveries_activation
+        {
+            let deficit = params.mesh_message_deliveries_threshold - self.mesh_message_deliveries;
+            if deficit > 0.0 {
+                // Below threshold = penalty (squared deficit)
+                let p3_value = deficit * deficit;
+                score += params.mesh_message_deliveries_weight * p3_value;
             }
         }
         
@@ -593,14 +594,14 @@ impl PeerScore {
     fn mesh_left(&mut self, topic: &str, params: &TopicScoreParams) {
         if let Some(topic_score) = self.topic_scores.get_mut(topic) {
             // If we left mesh before activation, no penalty
-            if let Some(mesh_time) = topic_score.mesh_time {
-                if mesh_time.elapsed() >= params.mesh_message_deliveries_activation {
-                    // Below threshold at mesh exit = mesh failure penalty
-                    let deficit = params.mesh_message_deliveries_threshold 
-                        - topic_score.mesh_message_deliveries;
-                    if deficit > 0.0 {
-                        topic_score.mesh_failure_penalty += deficit * deficit;
-                    }
+            if let Some(mesh_time) = topic_score.mesh_time
+                && mesh_time.elapsed() >= params.mesh_message_deliveries_activation
+            {
+                // Below threshold at mesh exit = mesh failure penalty
+                let deficit = params.mesh_message_deliveries_threshold 
+                    - topic_score.mesh_message_deliveries;
+                if deficit > 0.0 {
+                    topic_score.mesh_failure_penalty += deficit * deficit;
                 }
             }
             topic_score.mesh_time = None;
@@ -616,10 +617,10 @@ impl PeerScore {
     
     /// Record mesh message delivery (P3, only counts if in mesh).
     fn mesh_message_delivered(&mut self, topic: &str) {
-        if let Some(topic_score) = self.topic_scores.get_mut(topic) {
-            if topic_score.mesh_time.is_some() {
-                topic_score.mesh_message_deliveries += 1.0;
-            }
+        if let Some(topic_score) = self.topic_scores.get_mut(topic)
+            && topic_score.mesh_time.is_some()
+        {
+            topic_score.mesh_message_deliveries += 1.0;
         }
     }
     
@@ -930,15 +931,14 @@ impl TopicState {
             return 0;
         }
         
-        if self.pending_iwants.len() >= MAX_PENDING_IWANTS {
-            if let Some(oldest) = self.pending_iwants
+        if self.pending_iwants.len() >= MAX_PENDING_IWANTS
+            && let Some(oldest) = self.pending_iwants
                 .iter()
                 .min_by_key(|(_, (t, _))| *t)
                 .map(|(id, _)| *id)
-            {
-                self.pending_iwants.remove(&oldest);
-                delta -= 1; // Evicted one
-            }
+        {
+            self.pending_iwants.remove(&oldest);
+            delta -= 1; // Evicted one
         }
         self.pending_iwants.insert(msg_id, (Instant::now(), vec![peer]));
         delta += 1; // Added one
@@ -1358,18 +1358,18 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         for state in self.topics.values() {
             // Collect from eager peers (active mesh)
             for peer_id in &state.eager_peers {
-                if seen.insert(*peer_id) {
-                    if let Some(contact) = self.contacts.peek(peer_id) {
-                        contacts.push(contact.clone());
-                    }
+                if seen.insert(*peer_id)
+                    && let Some(contact) = self.contacts.peek(peer_id)
+                {
+                    contacts.push(contact.clone());
                 }
             }
             // Also include lazy peers (connected but not in mesh)
             for peer_id in &state.lazy_peers {
-                if seen.insert(*peer_id) {
-                    if let Some(contact) = self.contacts.peek(peer_id) {
-                        contacts.push(contact.clone());
-                    }
+                if seen.insert(*peer_id)
+                    && let Some(contact) = self.contacts.peek(peer_id)
+                {
+                    contacts.push(contact.clone());
                 }
             }
         }
@@ -1596,10 +1596,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         let elapsed = start.elapsed();
         
         // Report RTT to DHT tiering (fire-and-forget, only on success)
-        if result.is_ok() {
-            if let Some(dht) = &self.dht {
-                dht.record_rtt(&contact, elapsed).await;
-            }
+        if result.is_ok()
+            && let Some(dht) = &self.dht
+        {
+            dht.record_rtt(&contact, elapsed).await;
         }
         
         result
@@ -1774,7 +1774,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         id_input.extend_from_slice(self.local_identity.as_bytes());
         id_input.extend_from_slice(&seqno.to_le_bytes());
         id_input.extend_from_slice(&data);
-        let msg_id = crate::dht::hash_content(&id_input);
+        let msg_id = *hash(&id_input).as_bytes();
 
         self.cache_message(msg_id, CachedMessage {
             topic: topic.to_string(),
@@ -1825,10 +1825,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     }
 
     async fn handle_message_internal(&mut self, from: &Identity, msg: GossipSubRequest) -> anyhow::Result<()> {
-        if let Some(topic) = msg.topic() {
-            if !is_valid_topic(topic) {
-                anyhow::bail!("invalid topic name from peer");
-            }
+        if let Some(topic) = msg.topic()
+            && !is_valid_topic(topic)
+        {
+            anyhow::bail!("invalid topic name from peer");
         }
         
         match msg {
@@ -2055,10 +2055,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             self.store_contact(contact.clone());
             
             // Add to topic state
-            if let Some(state) = self.topics.get_mut(topic) {
-                if state.add_peer_with_limits(contact.identity, self.config.mesh_n, self.config.gossip_lazy) {
-                    added += 1;
-                }
+            if let Some(state) = self.topics.get_mut(topic)
+                && state.add_peer_with_limits(contact.identity, self.config.mesh_n, self.config.gossip_lazy)
+            {
+                added += 1;
             }
         }
         
@@ -2550,10 +2550,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         
         for state in self.topics.values() {
             for peer_id in state.eager_peers.iter().take(2) {
-                if let Some(contact) = self.contacts.peek(peer_id) {
-                    if peers_to_report.len() < 5 {
-                        peers_to_report.push(contact.clone());
-                    }
+                if let Some(contact) = self.contacts.peek(peer_id)
+                    && peers_to_report.len() < 5
+                {
+                    peers_to_report.push(contact.clone());
                 }
             }
             if peers_to_report.len() >= 5 {
@@ -2607,19 +2607,19 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 }).await;
                 
                 // Move to mesh and mark as outbound (we initiated GRAFT)
-                if let Some(state) = self.topics.get_mut(topic) {
-                    if state.lazy_peers.remove(&peer) {
-                        state.eager_peers.insert(peer);
-                        state.mark_outbound(peer); // SECURITY: Track outbound for D_out
-                        self.score_mesh_joined(&peer, topic);
-                        grafted += 1;
-                        
-                        trace!(
-                            peer = %hex::encode(&peer.as_bytes()[..8]),
-                            topic = %topic,
-                            "GRAFT sent during mesh maintenance (outbound)"
-                        );
-                    }
+                if let Some(state) = self.topics.get_mut(topic)
+                    && state.lazy_peers.remove(&peer)
+                {
+                    state.eager_peers.insert(peer);
+                    state.mark_outbound(peer); // SECURITY: Track outbound for D_out
+                    self.score_mesh_joined(&peer, topic);
+                    grafted += 1;
+                    
+                    trace!(
+                        peer = %hex::encode(&peer.as_bytes()[..8]),
+                        topic = %topic,
+                        "GRAFT sent during mesh maintenance (outbound)"
+                    );
                 }
             }
             
@@ -2717,17 +2717,17 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 }).await;
                 
                 // Move to lazy
-                if let Some(state) = self.topics.get_mut(topic) {
-                    if state.eager_peers.remove(peer) {
-                        state.lazy_peers.insert(*peer);
-                        self.score_mesh_left(peer, topic);
-                        
-                        trace!(
-                            peer = %hex::encode(&peer.as_bytes()[..8]),
-                            topic = %topic,
-                            "PRUNE sent during mesh maintenance"
-                        );
-                    }
+                if let Some(state) = self.topics.get_mut(topic)
+                    && state.eager_peers.remove(peer)
+                {
+                    state.lazy_peers.insert(*peer);
+                    self.score_mesh_left(peer, topic);
+                    
+                    trace!(
+                        peer = %hex::encode(&peer.as_bytes()[..8]),
+                        topic = %topic,
+                        "PRUNE sent during mesh maintenance"
+                    );
                 }
             }
             
@@ -2881,16 +2881,14 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
         
         let total: usize = self.outbound.values().map(|v| v.len()).sum();
-        if total >= MAX_TOTAL_OUTBOUND_MESSAGES {
-            if let Some(largest) = self.outbound.iter()
+        if total >= MAX_TOTAL_OUTBOUND_MESSAGES
+            && let Some(largest) = self.outbound.iter()
                 .max_by_key(|(_, msgs)| msgs.len())
                 .map(|(id, _)| *id)
-            {
-                if let Some(queue) = self.outbound.get_mut(&largest) {
-                    let drain = (queue.len() / 2).max(1);
-                    queue.drain(0..drain);
-                }
-            }
+            && let Some(queue) = self.outbound.get_mut(&largest)
+        {
+            let drain = (queue.len() / 2).max(1);
+            queue.drain(0..drain);
         }
         
         let queue = self.outbound.entry(*peer).or_default();
@@ -3048,8 +3046,8 @@ mod tests {
         input.extend_from_slice(&seqno.to_le_bytes());
         input.extend_from_slice(data);
 
-        let id1 = crate::dht::hash_content(&input);
-        let id2 = crate::dht::hash_content(&input);
+        let id1 = *hash(&input).as_bytes();
+        let id2 = *hash(&input).as_bytes();
 
         assert_eq!(id1, id2);
     }

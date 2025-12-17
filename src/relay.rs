@@ -524,15 +524,15 @@ impl RelayClient {
     /// This proves relay liveness without dedicated health probes.
     pub async fn record_relay_alive(&self, relay_identity: &Identity) {
         let registered = self.registered_relay.read().await;
-        if let Some(relay) = &*registered {
-            if &relay.identity == relay_identity {
-                drop(registered);
-                *self.relay_last_seen.write().await = Some(Instant::now());
-                trace!(
-                    relay = %hex::encode(&relay_identity.as_bytes()[..8]),
-                    "relay liveness confirmed via mesh traffic"
-                );
-            }
+        if let Some(relay) = &*registered
+            && &relay.identity == relay_identity
+        {
+            drop(registered);
+            *self.relay_last_seen.write().await = Some(Instant::now());
+            trace!(
+                relay = %hex::encode(&relay_identity.as_bytes()[..8]),
+                "relay liveness confirmed via mesh traffic"
+            );
         }
     }
 

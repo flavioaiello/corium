@@ -230,10 +230,10 @@ impl RpcNodeActor {
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 
                 // Check if the connection appeared
-                if let Some(cached) = self.connections.get(&peer_id) {
-                    if !cached.is_closed() {
-                        return Ok(cached.connection.clone());
-                    }
+                if let Some(cached) = self.connections.get(&peer_id)
+                    && !cached.is_closed()
+                {
+                    return Ok(cached.connection.clone());
                 }
                 
                 // Check if in_flight cleared
@@ -637,16 +637,16 @@ impl DhtNodeRpc for RpcNode {
         };
         match self.rpc(to, request).await? {
             DhtNodeResponse::Value { value, closer } => {
-                if let Some(ref v) = value {
-                    if v.len() > MAX_VALUE_SIZE {
-                        warn!(
-                            peer = %to.primary_addr().unwrap_or("<no addr>"),
-                            size = v.len(),
-                            max = MAX_VALUE_SIZE,
-                            "peer returned oversized value, rejecting"
-                        );
-                        anyhow::bail!("value too large: {} bytes (max {})", v.len(), MAX_VALUE_SIZE);
-                    }
+                if let Some(ref v) = value
+                    && v.len() > MAX_VALUE_SIZE
+                {
+                    warn!(
+                        peer = %to.primary_addr().unwrap_or("<no addr>"),
+                        size = v.len(),
+                        max = MAX_VALUE_SIZE,
+                        "peer returned oversized value, rejecting"
+                    );
+                    anyhow::bail!("value too large: {} bytes (max {})", v.len(), MAX_VALUE_SIZE);
                 }
                 
                 let closer = if closer.len() > MAX_CONTACTS_PER_RESPONSE {
@@ -860,7 +860,7 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
         "New peer connected"
     );
 
-    let result = loop {
+    loop {
         let stream = match connection.accept_bi().await {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
@@ -917,9 +917,7 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
                 debug!(error = ?e, "stream error");
             }
         });
-    };
-
-    result
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -966,24 +964,24 @@ async fn handle_stream<N: DhtNodeRpc + GossipSubRpc + Send + Sync + 'static>(
     let request: RpcRequest =
         crate::messages::deserialize_request(&request_bytes).context("failed to deserialize request")?;
 
-    if let Some(claimed_id) = request.sender_identity() {
-        if claimed_id != verified_identity {
-            warn!(
-                remote = %remote_addr,
-                claimed = ?hex::encode(&claimed_id.as_bytes()[..8]),
-                verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
-                "rejecting request: identity mismatch (possible Sybil attack)"
-            );
-            let error_response = RpcResponse::Error {
-                message: "Identity does not match connection identity".to_string(),
-            };
-            let response_bytes = bincode::serialize(&error_response)?;
-            let len = response_bytes.len() as u32;
-            send.write_all(&len.to_be_bytes()).await?;
-            send.write_all(&response_bytes).await?;
-            send.finish()?;
-            return Ok(());
-        }
+    if let Some(claimed_id) = request.sender_identity()
+        && claimed_id != verified_identity
+    {
+        warn!(
+            remote = %remote_addr,
+            claimed = ?hex::encode(&claimed_id.as_bytes()[..8]),
+            verified = ?hex::encode(&verified_identity.as_bytes()[..8]),
+            "rejecting request: identity mismatch (possible Sybil attack)"
+        );
+        let error_response = RpcResponse::Error {
+            message: "Identity does not match connection identity".to_string(),
+        };
+        let response_bytes = bincode::serialize(&error_response)?;
+        let len = response_bytes.len() as u32;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&response_bytes).await?;
+        send.finish()?;
+        return Ok(());
     }
 
     // NOTE: RelayRequest::Register handling removed - mesh-only signaling

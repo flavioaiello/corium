@@ -780,10 +780,10 @@ impl SmartSock {
         
         // Parse all addresses
         for addr_str in &contact.addrs {
-            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
-                }
+            if let Ok(addr) = addr_str.parse::<SocketAddr>()
+                && !addrs.contains(&addr)
+            {
+                addrs.push(addr);
             }
         }
         
@@ -812,31 +812,29 @@ impl SmartSock {
         {
             let mut peers = self.peers.write().await;
             
-            if peers.len() >= MAX_SMARTSOCK_PEERS && !peers.contains_key(&smart_addr) {
-                if let Some(oldest_addr) = peers.iter()
+            if peers.len() >= MAX_SMARTSOCK_PEERS && !peers.contains_key(&smart_addr)
+                && let Some(oldest_addr) = peers.iter()
                     .min_by_key(|(_, s)| s.last_recv)
                     .map(|(k, _)| *k)
-                {
-                    if let Some(evicted) = peers.remove(&oldest_addr) {
-                        let mut reverse = self.reverse_map.write().await;
-                        for addr in &evicted.direct_addrs {
-                            reverse.pop(addr);
-                        }
-                        for tunnel in evicted.relay_tunnels.values() {
-                            reverse.pop(&tunnel.relay_addr);
-                        }
-                        for addr in evicted.candidates.keys() {
-                            reverse.pop(addr);
-                        }
-                        debug!(
-                            evicted = ?evicted.identity,
-                            direct_addrs = evicted.direct_addrs.len(),
-                            relay_tunnels = evicted.relay_tunnels.len(),
-                            candidates = evicted.candidates.len(),
-                            "evicted oldest peer from SmartSock to make room"
-                        );
-                    }
+                && let Some(evicted) = peers.remove(&oldest_addr)
+            {
+                let mut reverse = self.reverse_map.write().await;
+                for addr in &evicted.direct_addrs {
+                    reverse.pop(addr);
                 }
+                for tunnel in evicted.relay_tunnels.values() {
+                    reverse.pop(&tunnel.relay_addr);
+                }
+                for addr in evicted.candidates.keys() {
+                    reverse.pop(addr);
+                }
+                debug!(
+                    evicted = ?evicted.identity,
+                    direct_addrs = evicted.direct_addrs.len(),
+                    relay_tunnels = evicted.relay_tunnels.len(),
+                    candidates = evicted.candidates.len(),
+                    "evicted oldest peer from SmartSock to make room"
+                );
             }
             
             peers.insert(smart_addr, state);
@@ -903,18 +901,18 @@ impl SmartSock {
         let smart_addr = SmartAddr::from_identity(identity);
         
         let mut peers = self.peers.write().await;
-        if let Some(state) = peers.get_mut(&smart_addr) {
-            if let Some(tunnel) = state.relay_tunnels.remove(session_id) {
-                drop(peers);
-                let mut reverse = self.reverse_map.write().await;
-                reverse.pop(&tunnel.relay_addr);
-                
-                tracing::debug!(
-                    peer = ?identity,
-                    session = hex::encode(session_id),
-                    "removed relay tunnel"
-                );
-            }
+        if let Some(state) = peers.get_mut(&smart_addr)
+            && let Some(tunnel) = state.relay_tunnels.remove(session_id)
+        {
+            drop(peers);
+            let mut reverse = self.reverse_map.write().await;
+            reverse.pop(&tunnel.relay_addr);
+            
+            tracing::debug!(
+                peer = ?identity,
+                session = hex::encode(session_id),
+                "removed relay tunnel"
+            );
         }
     }
     
@@ -980,19 +978,20 @@ impl SmartSock {
         let smart_addr = SmartAddr::from_identity(identity);
         
         let mut peers = self.peers.write().await;
-        if let Some(state) = peers.get_mut(&smart_addr) {
-            if let Some(tunnel) = state.relay_tunnels.get(&session_id) {
-                state.active_path = Some(PathChoice::Relay {
-                    relay_addr: tunnel.relay_addr,
-                    session_id,
-                    rtt_ms: f32::MAX,                });
-                tracing::debug!(
-                    peer = ?identity,
-                    session = hex::encode(session_id),
-                    "switched to relay path"
-                );
-                return true;
-            }
+        if let Some(state) = peers.get_mut(&smart_addr)
+            && let Some(tunnel) = state.relay_tunnels.get(&session_id)
+        {
+            state.active_path = Some(PathChoice::Relay {
+                relay_addr: tunnel.relay_addr,
+                session_id,
+                rtt_ms: f32::MAX,
+            });
+            tracing::debug!(
+                peer = ?identity,
+                session = hex::encode(session_id),
+                "switched to relay path"
+            );
+            return true;
         }
         false
     }
@@ -1229,17 +1228,17 @@ impl SmartSock {
         {
             let mut peers = self.peers.write().await;
             for (smart_addr, session_id, relay_addr, age_secs, peer_id) in &stale_tunnels {
-                if let Some(state) = peers.get_mut(smart_addr) {
-                    if state.relay_tunnels.remove(session_id).is_some() {
-                        removed_count += 1;
-                        tracing::debug!(
-                            peer = ?peer_id,
-                            session = hex::encode(session_id),
-                            relay = %relay_addr,
-                            age_secs = age_secs,
-                            "removed stale relay tunnel"
-                        );
-                    }
+                if let Some(state) = peers.get_mut(smart_addr)
+                    && state.relay_tunnels.remove(session_id).is_some()
+                {
+                    removed_count += 1;
+                    tracing::debug!(
+                        peer = ?peer_id,
+                        session = hex::encode(session_id),
+                        relay = %relay_addr,
+                        age_secs = age_secs,
+                        "removed stale relay tunnel"
+                    );
                 }
             }
         }
@@ -1268,11 +1267,11 @@ impl SmartSock {
         };
         
         // Notify handler of path switches (outside of lock)
-        if !switches.is_empty() {
-            if let Some(handler) = self.get_path_event_handler().await {
-                for (peer, new_path) in switches {
-                    handler.on_path_improved(peer, new_path).await;
-                }
+        if !switches.is_empty()
+            && let Some(handler) = self.get_path_event_handler().await
+        {
+            for (peer, new_path) in switches {
+                handler.on_path_improved(peer, new_path).await;
             }
         }
     }
@@ -1511,20 +1510,19 @@ impl AsyncUdpSocket for SmartSock {
                 let received = read_buf.filled();
                 
                 // Dispatch relay packets to relay server (multiplexing)
-                if received.len() >= 4 && received[0..4] == RELAY_MAGIC {
-                    if let Ok(guard) = self.udprelay.read() {
-                        if let Some(udprelay) = guard.as_ref() {
-                            let udprelay = udprelay.clone();
-                            let data = received.to_vec();
-                            tokio::spawn(async move {
-                                udprelay.process_packet(&data, src_addr).await;
-                            });
-                            
-                            // Packet handled by relay server, skip for Quinn
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
-                    }
+                if received.len() >= 4 && received[0..4] == RELAY_MAGIC
+                    && let Ok(guard) = self.udprelay.read()
+                    && let Some(udprelay) = guard.as_ref()
+                {
+                    let udprelay = udprelay.clone();
+                    let data = received.to_vec();
+                    tokio::spawn(async move {
+                        udprelay.process_packet(&data, src_addr).await;
+                    });
+                    
+                    // Packet handled by relay server, skip for Quinn
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 
                 if PathProbeRequest::is_probe_request(received) {
@@ -1564,10 +1562,10 @@ impl AsyncUdpSocket for SmartSock {
                     let verified_smart_addr = smart_addr.and_then(|sa| {
                         match self.peers.try_read() {
                             Ok(peers) => {
-                                if let Some(state) = peers.get(&sa) {
-                                    if state.relay_tunnels.contains_key(&session_id) {
-                                        return Some(sa);
-                                    }
+                                if let Some(state) = peers.get(&sa)
+                                    && state.relay_tunnels.contains_key(&session_id)
+                                {
+                                    return Some(sa);
                                 }
                                 None
                             }
@@ -1593,12 +1591,11 @@ impl AsyncUdpSocket for SmartSock {
                 };
                 
                 // Update last_recv for LRU eviction tracking
-                if let Some(sa) = smart_addr_for_recv {
-                    if let Ok(mut peers) = self.peers.try_write() {
-                        if let Some(state) = peers.get_mut(&sa) {
-                            state.last_recv = Some(Instant::now());
-                        }
-                    }
+                if let Some(sa) = smart_addr_for_recv
+                    && let Ok(mut peers) = self.peers.try_write()
+                    && let Some(state) = peers.get_mut(&sa)
+                {
+                    state.last_recv = Some(Instant::now());
                 }
                 
                 let copy_len = payload.len().min(bufs[0].len());

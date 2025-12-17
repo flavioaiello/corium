@@ -185,6 +185,31 @@ impl Identity {
     }
 }
 
+/// Compare two XOR distances lexicographically.
+/// 
+/// Used to determine which of two identities is closer to a target
+/// in the Kademlia XOR metric space.
+/// 
+/// # Example
+/// ```ignore
+/// let dist_a = target.xor_distance(&a);
+/// let dist_b = target.xor_distance(&b);
+/// if distance_cmp(&dist_a, &dist_b) == Ordering::Less {
+///     // a is closer to target than b
+/// }
+/// ```
+#[inline]
+pub fn distance_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    for i in 0..32 {
+        if a[i] < b[i] {
+            return std::cmp::Ordering::Less;
+        } else if a[i] > b[i] {
+            return std::cmp::Ordering::Greater;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Identity({})", &self.to_hex()[..16])

@@ -104,14 +104,13 @@ async fn main() -> Result<()> {
             if msg.topic == format!("chat/{}", room_filter) {
                 let text = String::from_utf8_lossy(&msg.data);
                 
-                if let Some((name_id, _)) = text.split_once(": ") {
-                    if let Some((name, id_prefix)) = name_id.split_once('@') {
-                        if !my_identity.starts_with(id_prefix) {
-                            let mut peers = peers_for_pubsub.write().await;
-                            if !peers.contains_key(id_prefix) {
-                                peers.insert(id_prefix.to_string(), name.to_string());
-                            }
-                        }
+                if let Some((name_id, _)) = text.split_once(": ")
+                    && let Some((name, id_prefix)) = name_id.split_once('@')
+                    && !my_identity.starts_with(id_prefix)
+                {
+                    let mut peers = peers_for_pubsub.write().await;
+                    if !peers.contains_key(id_prefix) {
+                        peers.insert(id_prefix.to_string(), name.to_string());
                     }
                 }
                 

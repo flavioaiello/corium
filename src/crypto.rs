@@ -1,8 +1,12 @@
 //! # Cryptographic Infrastructure
 //!
-//! This module provides TLS certificate generation and verification for the
-//! identity-based authentication system. All peer connections use mutual TLS
-//! with Ed25519 certificates where:
+//! This module provides cryptographic primitives for Corium:
+//!
+//! - **Content Hashing**: BLAKE3 for content-addressed storage keys
+//! - **Signatures**: Domain-separated Ed25519 signing and verification
+//! - **TLS**: Certificate generation and verification for mutual auth
+//!
+//! ## Identity Model
 //!
 //! - **Identity = Public Key**: The 32-byte Ed25519 public key IS the peer's identity
 //! - **Self-Signed Certs**: Each node generates its own certificate from its keypair
@@ -14,6 +18,7 @@
 //! - Certificate CN contains hex-encoded public key for debugging
 //! - ALPN protocol "corium" prevents cross-protocol attacks
 //! - Only Ed25519 signatures are accepted (no RSA, ECDSA fallback)
+//! - Domain separation prevents cross-protocol signature replay
 //!
 //! ## SECURITY WARNING
 //!
