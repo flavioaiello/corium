@@ -1,15 +1,13 @@
 # Corium
-
-**Batteries-included adaptive mesh networking**
+<img align="right" src="assets/logo.svg" alt="Corium Logo" width="128" height="128">
 
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/corium.svg)](https://crates.io/crates/corium)
 [![Documentation](https://docs.rs/corium/badge.svg)](https://docs.rs/corium)
 
+**Batteries-included adaptive mesh networking**
 
-
-<img align="right" src="assets/logo.svg" alt="Corium Logo" width="128" height="128">
 Corium is a high-performance, secure, and adaptive mesh networking library written in Rust. It provides a robust foundation for building decentralized applications, scale-out fabrics, and distributed services with built-in NAT traversal, efficient PubSub, and a cryptographic identity system.
 
 ## Why Corium?
