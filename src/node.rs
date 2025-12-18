@@ -72,7 +72,6 @@ pub use crate::identity::{Identity, IdentityProof, PoWError, POW_DIFFICULTY};
 
 pub struct Node {
     keypair: Keypair,
-    pow_proof: IdentityProof,
     endpoint: Endpoint,
     smartsock: Arc<SmartSock>,
     contact: Contact,
@@ -252,7 +251,6 @@ impl Node {
         
         Ok(Self {
             keypair,
-            pow_proof,
             endpoint,
             smartsock,
             contact,

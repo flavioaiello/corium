@@ -32,7 +32,7 @@
 //! - Request/response sizes are bounded to prevent memory exhaustion
 //! - Message sender identity is authenticated via TLS, not message fields
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1227,6 +1227,50 @@ async fn handle_dht_rpc<N: DhtNodeRpc + Send + Sync + 'static>(
                     probe_addr_len = probe_addr.len(),
                     remote_addr = %_remote_addr,
                     "CHECK_REACHABILITY rejected: probe IP does not match connection IP"
+                );
+                return DhtNodeResponse::Reachable { reachable: false };
+            }
+            
+            // SECURITY: Validate that probe_addr is in the requesting peer's own address list.
+            // This ensures CheckReachability is only used for self-checks (NAT detection),
+            // not for probing arbitrary ports on the same IP (port scanning defense).
+            if !from.addrs.contains(&probe_addr) {
+                warn!(
+                    from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                    probe_addr = %probe_addr_log.as_ref(),
+                    from_addrs = ?from.addrs,
+                    "CHECK_REACHABILITY rejected: probe_addr not in from.addrs (only self-checks allowed)"
+                );
+                return DhtNodeResponse::Reachable { reachable: false };
+            }
+            
+            // SECURITY: Reject probes to private/internal IP ranges.
+            // Even if the attacker uses their own IP, we don't want to be used to probe
+            // their internal network (could leak information about our network topology).
+            let probe_ip = probe_socket.ip();
+            let is_private_or_internal = match probe_ip {
+                IpAddr::V4(ip) => {
+                    ip.is_private()           // 10.x, 172.16-31.x, 192.168.x
+                        || ip.is_loopback()   // 127.x
+                        || ip.is_link_local() // 169.254.x
+                        || ip.is_broadcast()  // 255.255.255.255
+                        || ip.is_unspecified() // 0.0.0.0
+                }
+                IpAddr::V6(ip) => {
+                    ip.is_loopback()          // ::1
+                        || ip.is_unspecified() // ::
+                        // Note: is_unique_local (fc00::/7) and is_unicast_link_local (fe80::/10)
+                        // are unstable, so we check manually
+                        || (ip.segments()[0] & 0xfe00) == 0xfc00  // fc00::/7 (unique local)
+                        || (ip.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 (link-local)
+                }
+            };
+            
+            if is_private_or_internal {
+                warn!(
+                    from = ?hex::encode(&from.identity.as_bytes()[..8]),
+                    probe_addr = %probe_addr_log.as_ref(),
+                    "CHECK_REACHABILITY rejected: cannot probe private/internal addresses"
                 );
                 return DhtNodeResponse::Reachable { reachable: false };
             }

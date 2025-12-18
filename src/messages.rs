@@ -455,26 +455,26 @@ mod tests {
 
     #[test]
     fn content_addressing_integrity() {
-        use crate::dht::verify_key_value_pair;
+        use crate::dht::{classify_key_value_pair, ValueType};
 
         let data = b"original content";
         let key = *blake3::hash(data).as_bytes();
 
-        assert!(verify_key_value_pair(&key, data));
+        assert!(classify_key_value_pair(&key, data) != ValueType::Invalid);
 
         let corrupted = b"corrupted content";
-        assert!(!verify_key_value_pair(&key, corrupted));
+        assert!(classify_key_value_pair(&key, corrupted) == ValueType::Invalid);
     }
 
     #[test]
     fn empty_data_hashing() {
-        use crate::dht::verify_key_value_pair;
+        use crate::dht::{classify_key_value_pair, ValueType};
 
         let empty = b"";
         let key = *blake3::hash(empty).as_bytes();
 
-        assert!(verify_key_value_pair(&key, empty));
-        assert!(!verify_key_value_pair(&key, b"not empty"));
+        assert!(classify_key_value_pair(&key, empty) != ValueType::Invalid);
+        assert!(classify_key_value_pair(&key, b"not empty") == ValueType::Invalid);
     }
 
     #[test]

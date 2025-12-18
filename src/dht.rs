@@ -182,10 +182,6 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
     ValueType::Invalid
 }
 
-pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
-    classify_key_value_pair(key, value) != ValueType::Invalid
-}
-
 
 // ============================================================================
 // Routing Table (XOR-Metric)
@@ -2006,10 +2002,11 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         let (k_initial, alpha, mut shortlist) = rx.await.map_err(|_| anyhow!("Actor closed"))?;
 
         // Add seed contact for bootstrap (used before routing table is populated)
-        if let Some(seed) = seed_contact {
-            if seed.identity != self.id && !shortlist.iter().any(|c| c.identity == seed.identity) {
-                shortlist.push(seed);
-            }
+        if let Some(seed) = seed_contact
+            && seed.identity != self.id
+            && !shortlist.iter().any(|c| c.identity == seed.identity)
+        {
+            shortlist.push(seed);
         }
 
         let mut seen: HashSet<Identity> = HashSet::new();
@@ -3501,15 +3498,15 @@ mod tests {
         let data = b"payload";
         let key = *hash(data).as_bytes();
         assert!(
-            verify_key_value_pair(&key, data),
-            "verify_key_value_pair should accept matching key/value pairs"
+            classify_key_value_pair(&key, data) != ValueType::Invalid,
+            "classify_key_value_pair should accept matching key/value pairs"
         );
 
         let mut wrong_key = key;
         wrong_key[0] ^= 0xFF;
         assert!(
-            !verify_key_value_pair(&wrong_key, data),
-            "verify_key_value_pair should reject non-matching key/value pairs"
+            classify_key_value_pair(&wrong_key, data) == ValueType::Invalid,
+            "classify_key_value_pair should reject non-matching key/value pairs"
         );
     }
 
