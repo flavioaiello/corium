@@ -67,11 +67,12 @@ type RequestTuple = (
     tokio::sync::oneshot::Sender<Vec<u8>>,
 );
 
-// Re-export Identity for public API consumers
-pub use crate::identity::Identity;
+// Re-export Identity and PoW types for public API consumers
+pub use crate::identity::{Identity, IdentityProof, POW_DIFFICULTY};
 
 pub struct Node {
     keypair: Keypair,
+    pow_proof: IdentityProof,
     endpoint: Endpoint,
     smartsock: Arc<SmartSock>,
     contact: Contact,
@@ -85,16 +86,31 @@ pub struct Node {
 }
 
 impl Node {
+    /// Create a new node with a fresh identity (includes PoW generation).
+    /// 
+    /// This generates a new Ed25519 keypair and computes a Proof-of-Work
+    /// for Sybil resistance. PoW computation takes ~1-4 seconds.
     pub async fn bind(addr: &str) -> Result<Self> {
-        let keypair = Keypair::generate();
-        Self::create(addr, keypair).await
+        let (keypair, pow_proof) = Keypair::generate_with_pow();
+        Self::create(addr, keypair, pow_proof).await
     }
 
+    /// Create a new node with an existing keypair.
+    /// 
+    /// **WARNING**: The keypair must have a valid PoW proof, otherwise
+    /// this node's contacts will be rejected by other nodes.
+    /// Use `bind_with_keypair_and_pow` for production.
     pub async fn bind_with_keypair(addr: &str, keypair: Keypair) -> Result<Self> {
-        Self::create(addr, keypair).await
+        // No PoW proof - contacts from this node will be rejected
+        Self::create(addr, keypair, IdentityProof::empty()).await
     }
 
-    async fn create(addr: &str, keypair: Keypair) -> Result<Self> {
+    /// Create a new node with an existing keypair and its PoW proof.
+    pub async fn bind_with_keypair_and_pow(addr: &str, keypair: Keypair, pow_proof: IdentityProof) -> Result<Self> {
+        Self::create(addr, keypair, pow_proof).await
+    }
+
+    async fn create(addr: &str, keypair: Keypair, pow_proof: IdentityProof) -> Result<Self> {
         let addr: SocketAddr = addr.parse()
             .context("invalid socket address")?;
         
@@ -111,7 +127,9 @@ impl Node {
             .context("failed to bind SmartSock endpoint")?;
         let local_addr = endpoint.local_addr()?;
         
-        let contact = Contact::single(identity, local_addr.to_string());
+        // Create contact with PoW proof for Sybil resistance
+        let mut contact = Contact::single(identity, local_addr.to_string());
+        contact.pow_proof = pow_proof;
         
         let rpcnode = RpcNode::with_identity(
             endpoint.clone(),
@@ -230,6 +248,7 @@ impl Node {
         
         Ok(Self {
             keypair,
+            pow_proof,
             endpoint,
             smartsock,
             contact,
@@ -580,6 +599,8 @@ impl Node {
     }
     
     pub async fn add_peer(&self, endpoint: Contact) {
+        // SECURITY: Require PoW for externally-provided contacts.
+        // The contact must have a valid PoW proof to be added to routing table.
         self.dhtnode.observe_contact(endpoint).await
     }
     
@@ -589,10 +610,12 @@ impl Node {
         
         let contact = Contact::single(peer_identity, addr.to_string());
         
-        self.dhtnode.observe_contact(contact).await;
-        
+        // SECURITY: Bootstrap contacts are NOT added to routing table without PoW.
+        // Instead, we pass the seed contact directly to the lookup.
+        // Once we successfully connect via mTLS, the peer will be added
+        // to routing via observe_direct_peer in the RPC layer.
         let self_identity = self.keypair.identity();
-        self.dhtnode.iterative_find_node(self_identity).await?;
+        self.dhtnode.bootstrap(contact, self_identity).await?;
         
         Ok(())
     }

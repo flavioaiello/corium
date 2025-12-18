@@ -78,7 +78,15 @@ const MAX_CACHED_CONNECTIONS: usize = 1_000;
 
 /// Maximum concurrent in-flight connection attempts.
 /// SECURITY: Prevents memory exhaustion from parallel connection floods.
+/// NOTE: The in_flight set is bounded to this size via LruCache to ensure
+/// the bound is enforced even under pathological conditions.
 const MAX_IN_FLIGHT_CONNECTIONS: usize = 100;
+
+/// Timeout for in-flight connection tracking entries.
+/// Entries older than this are considered stale and can be evicted.
+/// SECURITY: Prevents in-flight entries from accumulating indefinitely
+/// if connection attempts hang without completion.
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout after which idle connections are considered stale.
 const CONNECTION_STALE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -125,16 +133,22 @@ struct RpcNodeActor {
     endpoint: Endpoint,
     client_config: ClientConfig,
     connections: LruCache<Identity, CachedConnection>,
-    in_flight: std::collections::HashSet<Identity>,
+    /// In-flight connection attempts, bounded by MAX_IN_FLIGHT_CONNECTIONS.
+    /// SECURITY: Uses LruCache instead of HashSet to enforce hard memory bound.
+    /// Each entry tracks the timestamp when the connection attempt started,
+    /// enabling cleanup of stale entries that never completed.
+    in_flight: LruCache<Identity, Instant>,
 }
 
 impl RpcNodeActor {
     fn new(endpoint: Endpoint, client_config: ClientConfig) -> Self {
+        let in_flight_cap = NonZeroUsize::new(MAX_IN_FLIGHT_CONNECTIONS)
+            .expect("MAX_IN_FLIGHT_CONNECTIONS must be non-zero");
         Self {
             endpoint,
             client_config,
             connections: LruCache::new(NonZeroUsize::new(MAX_CACHED_CONNECTIONS).unwrap()),
-            in_flight: std::collections::HashSet::new(),
+            in_flight: LruCache::new(in_flight_cap),
         }
     }
 
@@ -191,6 +205,29 @@ impl RpcNodeActor {
                 "cleaned up stale connection"
             );
         }
+        
+        // Also cleanup stale in-flight entries
+        self.cleanup_stale_in_flight();
+    }
+
+    /// Remove in-flight entries that have exceeded IN_FLIGHT_TIMEOUT.
+    /// SECURITY: Prevents hung connection attempts from permanently consuming
+    /// in-flight slots, which could lead to connection starvation.
+    fn cleanup_stale_in_flight(&mut self) {
+        let now = Instant::now();
+        let stale_peers: Vec<Identity> = self.in_flight
+            .iter()
+            .filter(|(_, started_at)| now.duration_since(**started_at) > IN_FLIGHT_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for peer_id in stale_peers {
+            self.in_flight.pop(&peer_id);
+            debug!(
+                peer = hex::encode(&peer_id.as_bytes()[..8]),
+                "cleaned up stale in-flight connection attempt"
+            );
+        }
     }
 
     async fn get_or_connect(&mut self, contact: Contact) -> Result<Connection> {
@@ -218,6 +255,10 @@ impl RpcNodeActor {
             }
         }
 
+        // Clean up stale in-flight entries before checking
+        // SECURITY: Prevents hung connection attempts from blocking new ones indefinitely
+        self.cleanup_stale_in_flight();
+
         // Check if connection is already in flight
         if self.in_flight.contains(&peer_id) {
             // Wait and retry - but we need to release the lock
@@ -236,7 +277,7 @@ impl RpcNodeActor {
                     return Ok(cached.connection.clone());
                 }
                 
-                // Check if in_flight cleared
+                // Check if in_flight cleared (or expired)
                 if !self.in_flight.contains(&peer_id) {
                     break;
                 }
@@ -247,19 +288,26 @@ impl RpcNodeActor {
             }
         }
 
-        // SECURITY: Bound in-flight set to prevent memory exhaustion from connection floods
+        // SECURITY: LruCache enforces MAX_IN_FLIGHT_CONNECTIONS bound automatically.
+        // If at capacity, the oldest entry is evicted (likely a stale/hung attempt).
+        // We still check capacity to provide a clear error message rather than
+        // silently evicting potentially valid in-flight attempts.
         if self.in_flight.len() >= MAX_IN_FLIGHT_CONNECTIONS {
-            anyhow::bail!("too many concurrent connection attempts (max {})", MAX_IN_FLIGHT_CONNECTIONS);
+            // Try to reclaim space by cleaning stale entries first
+            self.cleanup_stale_in_flight();
+            if self.in_flight.len() >= MAX_IN_FLIGHT_CONNECTIONS {
+                anyhow::bail!("too many concurrent connection attempts (max {})", MAX_IN_FLIGHT_CONNECTIONS);
+            }
         }
 
-        // Mark in-flight
-        self.in_flight.insert(peer_id);
+        // Mark in-flight with current timestamp
+        self.in_flight.put(peer_id, Instant::now());
 
         // Establish connection
         let result = self.connect(&contact).await;
 
         // Clear in-flight
-        self.in_flight.remove(&peer_id);
+        self.in_flight.pop(&peer_id);
 
         let conn = result?;
         
@@ -838,8 +886,10 @@ pub async fn handle_connection<N: DhtNodeRpc + GossipSubRpc + Clone + Send + Syn
 
     // Register incoming peer in DHT routing table for identity resolution.
     // This enables GossipSub to send messages to peers that connected to us.
+    // SECURITY: Use observe_direct_peer() because the peer's identity was verified
+    // via mTLS certificate, bypassing the S/Kademlia PoW requirement.
     let incoming_contact = Contact::unsigned(verified_identity, vec![remote.to_string()]);
-    node.observe_contact(incoming_contact).await;
+    node.observe_direct_peer(incoming_contact).await;
     
     if let Some(ss) = &smartsock {
         ss.register_peer(verified_identity, vec![remote]).await;

@@ -10,6 +10,11 @@ keywords = ["dht", "pubsub", "quic", "distributed", "mesh"]
 categories = ["network-programming"]
 authors = ["Flavio Aiello"]
 
+[features]
+default = []
+# Reduced PoW difficulty for faster tests. NEVER use in production.
+test-pow = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
@@ -31,6 +36,7 @@ bincode = "1.3"
 getrandom = "0.2"
 
 [dev-dependencies]
+corium = { path = ".", features = ["test-pow"] }
 
 
 [[example]]

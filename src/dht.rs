@@ -62,10 +62,35 @@ const OFFLOAD_BASE_DELAY_MS: u64 = 100;
 /// Key type for DHT storage (32-byte hash).
 pub type Key = [u8; 32];
 
-pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
+/// Classification of DHT value types for differentiated rate limiting.
+/// 
+/// SECURITY: Content-addressed values bypass PoW verification and are therefore
+/// subject to stricter rate limiting than identity-keyed Contact records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueType {
+    /// Content-addressed: key = hash(value). No PoW required.
+    /// Subject to stricter rate limiting (CONTENT_ADDRESSED_RATE_DIVISOR).
+    ContentAddressed,
+    /// Identity-keyed: key = identity, value = signed Contact record.
+    /// PoW-verified, standard rate limiting.
+    IdentityKeyed,
+    /// Invalid: value doesn't match key and isn't a valid Contact.
+    Invalid,
+}
+
+/// Classify a key-value pair and validate it.
+/// 
+/// Returns `ValueType::Invalid` if the value cannot be stored.
+/// Returns `ValueType::ContentAddressed` for hash(value) == key (no PoW).
+/// Returns `ValueType::IdentityKeyed` for valid, fresh, PoW-verified Contact records.
+/// 
+/// SECURITY: This classification is used to apply differentiated rate limiting.
+/// Content-addressed stores are rate-limited more strictly since they bypass
+/// the computational cost of PoW identity generation.
+pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
     // Fast path: content-addressed storage (hash of value == key)
     if hash(value).as_bytes() == key {
-        return true;
+        return ValueType::ContentAddressed;
     }
 
     // Slow path: identity-keyed Contact record
@@ -79,7 +104,7 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
                 key = hex::encode(&key[..8]),
                 "DHT store rejected: invalid identity (not a valid Ed25519 point)"
             );
-            return false;
+            return ValueType::Invalid;
         }
         if !record.validate_structure() {
             debug!(
@@ -87,7 +112,7 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
                 identity = hex::encode(&record.identity.as_bytes()[..8]),
                 "DHT store rejected: Contact structure validation failed"
             );
-            return false;
+            return ValueType::Invalid;
         }
         if record.identity.as_bytes() != key {
             debug!(
@@ -95,7 +120,7 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
                 identity = hex::encode(&record.identity.as_bytes()[..8]),
                 "DHT store rejected: identity does not match key"
             );
-            return false;
+            return ValueType::Invalid;
         }
         if !record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS) {
             debug!(
@@ -104,9 +129,9 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
                 timestamp = record.timestamp,
                 "DHT store rejected: Contact record stale or invalid signature"
             );
-            return false;
+            return ValueType::Invalid;
         }
-        return true;
+        return ValueType::IdentityKeyed;
     }
 
     // Neither content-addressed nor valid Contact record
@@ -115,7 +140,11 @@ pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
         value_len = value.len(),
         "DHT store rejected: hash mismatch and not a valid Contact record"
     );
-    false
+    ValueType::Invalid
+}
+
+pub fn verify_key_value_pair(key: &Key, value: &[u8]) -> bool {
+    classify_key_value_pair(key, value) != ValueType::Invalid
 }
 
 
@@ -162,6 +191,13 @@ const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum peers to track for insertion rate limiting.
 /// Uses LRU eviction when full.
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
+
+/// Whether to enforce Proof-of-Work verification for routing table insertion.
+/// 
+/// SECURITY (S/Kademlia): When enabled, contacts must have a valid PoW proof
+/// (`contact.verify_pow() == true`) to be accepted into the routing table.
+/// This prevents Sybil attacks by making identity generation computationally expensive.
+pub const ENFORCE_POW_FOR_ROUTING: bool = true;
 
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +615,13 @@ const PER_PEER_ENTRY_LIMIT: usize = 100;
 /// SECURITY: Rate limits storage operations per peer.
 const PER_PEER_RATE_LIMIT: usize = 20;
 
+/// Rate limit divisor for content-addressed stores.
+/// SECURITY: Content-addressed values bypass PoW verification, making bulk storage
+/// computationally cheap for attackers. This divisor makes content-addressed stores
+/// 4x more restricted than identity-keyed stores (which require PoW).
+/// Effective rate: PER_PEER_RATE_LIMIT / CONTENT_ADDRESSED_RATE_DIVISOR = 5 per window.
+const CONTENT_ADDRESSED_RATE_DIVISOR: usize = 4;
+
 /// Time window for per-peer rate limiting.
 const PER_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -690,6 +733,10 @@ struct PeerStorageStats {
     bytes_stored: usize,
     entry_count: usize,
     store_requests: VecDeque<Instant>,
+    /// Separate tracking for content-addressed stores (stricter limit).
+    /// SECURITY: Content-addressed stores bypass PoW and are rate-limited
+    /// at PER_PEER_RATE_LIMIT / CONTENT_ADDRESSED_RATE_DIVISOR.
+    content_addressed_requests: VecDeque<Instant>,
 }
 
 impl PeerStorageStats {
@@ -698,8 +745,12 @@ impl PeerStorageStats {
             && self.entry_count < PER_PEER_ENTRY_LIMIT
     }
 
-    fn is_rate_limited(&mut self) -> bool {
+    /// Check if the peer is rate limited for the given value type.
+    /// Content-addressed stores have a stricter limit since they bypass PoW.
+    fn is_rate_limited(&mut self, value_type: ValueType) -> bool {
         let now = Instant::now();
+        
+        // Clean up expired entries from general store requests
         while let Some(front) = self.store_requests.front() {
             if now.duration_since(*front) > PER_PEER_RATE_WINDOW {
                 self.store_requests.pop_front();
@@ -707,13 +758,48 @@ impl PeerStorageStats {
                 break;
             }
         }
-        self.store_requests.len() >= PER_PEER_RATE_LIMIT
+        
+        // Check general rate limit
+        if self.store_requests.len() >= PER_PEER_RATE_LIMIT {
+            return true;
+        }
+        
+        // For content-addressed values, apply stricter rate limit
+        if value_type == ValueType::ContentAddressed {
+            // Clean up expired entries from content-addressed requests
+            while let Some(front) = self.content_addressed_requests.front() {
+                if now.duration_since(*front) > PER_PEER_RATE_WINDOW {
+                    self.content_addressed_requests.pop_front();
+                } else {
+                    break;
+                }
+            }
+            
+            // SECURITY: Stricter limit for content-addressed (no PoW)
+            let content_limit = PER_PEER_RATE_LIMIT / CONTENT_ADDRESSED_RATE_DIVISOR;
+            if self.content_addressed_requests.len() >= content_limit {
+                debug!(
+                    "content-addressed store rejected: stricter rate limit ({}/{} per {} secs)",
+                    self.content_addressed_requests.len(),
+                    content_limit,
+                    PER_PEER_RATE_WINDOW.as_secs()
+                );
+                return true;
+            }
+        }
+        
+        false
     }
 
-    fn record_store(&mut self, value_size: usize) {
+    fn record_store(&mut self, value_size: usize, value_type: ValueType) {
         self.bytes_stored = self.bytes_stored.saturating_add(value_size);
         self.entry_count = self.entry_count.saturating_add(1);
         self.store_requests.push_back(Instant::now());
+        
+        // Track content-addressed stores separately for stricter limiting
+        if value_type == ValueType::ContentAddressed {
+            self.content_addressed_requests.push_back(Instant::now());
+        }
     }
 
     fn record_evict(&mut self, value_size: usize) {
@@ -776,7 +862,8 @@ impl LocalStore {
     }
 
     /// Check if a store request from the given peer would be allowed.
-    pub fn check_store_allowed(&mut self, peer_id: &Identity, value_size: usize) -> Result<(), StoreRejection> {
+    /// The value_type determines which rate limit is applied (stricter for content-addressed).
+    pub fn check_store_allowed(&mut self, peer_id: &Identity, value_size: usize, value_type: ValueType) -> Result<(), StoreRejection> {
         if value_size > MAX_VALUE_SIZE {
             debug!(
                 peer = ?hex::encode(&peer_id.as_bytes()[..8]),
@@ -789,9 +876,10 @@ impl LocalStore {
 
         let stats = self.peer_stats.get_or_insert_mut(*peer_id, PeerStorageStats::default);
 
-        if stats.is_rate_limited() {
+        if stats.is_rate_limited(value_type) {
             debug!(
                 peer = ?hex::encode(&peer_id.as_bytes()[..8]),
+                value_type = ?value_type,
                 "store rejected: rate limited"
             );
             return Err(StoreRejection::RateLimited);
@@ -811,7 +899,8 @@ impl LocalStore {
     }
 
     /// Store a key-value pair, returning any entries that were evicted due to pressure.
-    pub fn store(&mut self, key: Key, value: &[u8], stored_by: Identity) -> Vec<(Key, Vec<u8>)> {
+    /// The value_type determines rate limiting (stricter for content-addressed values).
+    pub fn store(&mut self, key: Key, value: &[u8], stored_by: Identity, value_type: ValueType) -> Vec<(Key, Vec<u8>)> {
         if value.len() > MAX_VALUE_SIZE {
             warn!(
                 size = value.len(),
@@ -822,8 +911,8 @@ impl LocalStore {
             return Vec::new();
         }
 
-        if let Err(rejection) = self.check_store_allowed(&stored_by, value.len()) {
-            info!(peer = ?stored_by, reason = ?rejection, "store request rejected");
+        if let Err(rejection) = self.check_store_allowed(&stored_by, value.len(), value_type) {
+            info!(peer = ?stored_by, reason = ?rejection, value_type = ?value_type, "store request rejected");
             return Vec::new();
         }
 
@@ -844,7 +933,7 @@ impl LocalStore {
         };
 
         let stats = self.peer_stats.get_or_insert_mut(stored_by, PeerStorageStats::default);
-        stats.record_store(entry.value.len());
+        stats.record_store(entry.value.len(), value_type);
 
         self.pressure.record_store(entry.value.len());
         self.cache.put(key, entry);
@@ -1567,6 +1656,8 @@ struct DhtNodeActor<N: DhtNodeRpc> {
 enum Command {
     // State updates
     ObserveContact(Contact),
+    /// Observe a directly-connected peer (mTLS verified, bypasses PoW check)
+    ObserveDirectPeer(Contact),
     ObserveContactFromPeer(Contact, Identity, oneshot::Sender<bool>),
     RecordRtt(Contact, Duration),
     AdjustK(bool),
@@ -1574,7 +1665,7 @@ enum Command {
     // Queries
     GetLookupParams(Identity, Option<TieringLevel>, oneshot::Sender<(usize, usize, Vec<Contact>)>),
     GetLocal(Key, oneshot::Sender<Option<Vec<u8>>>),
-    StoreLocal(Key, Vec<u8>, Identity, oneshot::Sender<Vec<(Key, Vec<u8>)>>),
+    StoreLocal(Key, Vec<u8>, Identity, ValueType, oneshot::Sender<Vec<(Key, Vec<u8>)>>),
     GetTelemetry(oneshot::Sender<TelemetrySnapshot>),
     GetSlowestLevel(oneshot::Sender<TieringLevel>),
     LookupContact(Identity, oneshot::Sender<Option<Contact>>),
@@ -1649,6 +1740,18 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
 
     pub async fn observe_contact(&self, contact: Contact) {
         let _ = self.cmd_tx.send(Command::ObserveContact(contact)).await;
+    }
+
+    /// Observe a directly connected peer (bypasses PoW check).
+    /// 
+    /// Use this for peers whose identity has been verified via mTLS.
+    /// Direct peers are trusted because they've proven possession of the
+    /// private key during the TLS handshake.
+    /// 
+    /// SECURITY: Only call this for peers you've directly connected to via QUIC/mTLS.
+    /// Do NOT use for contacts received via DHT gossip.
+    pub async fn observe_direct_peer(&self, contact: Contact) {
+        let _ = self.cmd_tx.send(Command::ObserveDirectPeer(contact)).await;
     }
 
     pub async fn observe_contact_from_peer(&self, contact: Contact, from_peer: &Identity) -> bool {
@@ -1735,7 +1838,17 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     pub async fn iterative_find_node(&self, target: Identity) -> Result<Vec<Contact>> {
-        let result = self.iterative_find_node_full(target, None).await?;
+        let result = self.iterative_find_node_full(target, None, None).await?;
+        Ok(result.closest)
+    }
+
+    /// Bootstrap into the network using a seed contact.
+    /// 
+    /// The seed contact is used to initiate the lookup even if it doesn't
+    /// have a valid PoW proof. Once we successfully connect via mTLS,
+    /// the peer will be added to routing via `observe_direct_peer`.
+    pub async fn bootstrap(&self, seed: Contact, self_id: Identity) -> Result<Vec<Contact>> {
+        let result = self.iterative_find_node_full(self_id, None, Some(seed)).await?;
         Ok(result.closest)
     }
 
@@ -1744,7 +1857,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         target: Identity,
         level_filter: Option<TieringLevel>,
     ) -> Result<Vec<Contact>> {
-        let result = self.iterative_find_node_full(target, level_filter).await?;
+        let result = self.iterative_find_node_full(target, level_filter, None).await?;
         Ok(result.closest)
     }
 
@@ -1752,6 +1865,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         &self,
         target: Identity,
         level_filter: Option<TieringLevel>,
+        seed_contact: Option<Contact>,
     ) -> Result<LookupResult> {
         const MAX_LOOKUP_ITERATIONS: usize = 20;
         /// Total timeout for the entire lookup operation.
@@ -1765,6 +1879,13 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             return Err(anyhow!("Actor closed"));
         }
         let (k_initial, alpha, mut shortlist) = rx.await.map_err(|_| anyhow!("Actor closed"))?;
+
+        // Add seed contact for bootstrap (used before routing table is populated)
+        if let Some(seed) = seed_contact {
+            if seed.identity != self.id && !shortlist.iter().any(|c| c.identity == seed.identity) {
+                shortlist.push(seed);
+            }
+        }
 
         let mut seen: HashSet<Identity> = HashSet::new();
         let mut seen_addrs: HashSet<String> = HashSet::new();
@@ -1858,7 +1979,8 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                     Ok(nodes) => {
                         rpc_success = true;
                         self.record_rtt(&contact, elapsed).await;
-                        self.observe_contact(contact.clone()).await;
+                        // Use observe_direct_peer: we just did mTLS-verified RPC with this peer
+                        self.observe_direct_peer(contact.clone()).await;
                         let from_peer = contact.identity;
                         for n in &nodes {
                             self.observe_contact_from_peer(n.clone(), &from_peer).await;
@@ -1923,7 +2045,8 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
     }
 
     async fn store_local(&self, key: Key, value: Vec<u8>, stored_by: Identity) {
-        if !verify_key_value_pair(&key, &value) {
+        let value_type = classify_key_value_pair(&key, &value);
+        if matches!(value_type, ValueType::Invalid) {
             trace!(
                 key = hex::encode(&key[..8]),
                 value_len = value.len(),
@@ -1934,7 +2057,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
         }
         
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::StoreLocal(key, value, stored_by, tx)).await.is_ok()
+        if self.cmd_tx.send(Command::StoreLocal(key, value, stored_by, value_type, tx)).await.is_ok()
             && let Ok(spilled) = rx.await
             && !spilled.is_empty()
         {
@@ -2020,7 +2143,8 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                 let elapsed = start.elapsed();
                 self.record_rtt(contact, elapsed).await;
                 self.adjust_k(true).await;
-                self.observe_contact(contact.clone()).await;
+                // Use observe_direct_peer: we just did mTLS-verified RPC with this peer
+                self.observe_direct_peer(contact.clone()).await;
                 true
             }
             Ok(Err(_)) | Err(_) => {
@@ -2202,6 +2326,10 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
                 Command::ObserveContact(contact) => {
                     self.handle_observe_contact(contact);
                 }
+                Command::ObserveDirectPeer(contact) => {
+                    // Bypass PoW check for mTLS-verified direct connections
+                    self.handle_observe_direct_peer(contact);
+                }
                 Command::ObserveContactFromPeer(contact, from_peer, reply) => {
                     let allowed = self.handle_observe_contact_from_peer(contact, &from_peer);
                     let _ = reply.send(allowed);
@@ -2228,9 +2356,9 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
                     let val = self.store.get(&key);
                     let _ = reply.send(val);
                 }
-                Command::StoreLocal(key, value, stored_by, reply) => {
+                Command::StoreLocal(key, value, stored_by, value_type, reply) => {
                     self.store.record_request();
-                    let spilled = self.store.store(key, &value, stored_by);
+                    let spilled = self.store.store(key, &value, stored_by, value_type);
                     let _ = reply.send(spilled);
                 }
                 Command::GetTelemetry(reply) => {
@@ -2273,7 +2401,8 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
                 Command::HandleStore(from, key, value) => {
                     self.handle_observe_contact(from.clone());
                     self.store.record_request();
-                    self.store.store(key, &value, from.identity);
+                    let value_type = classify_key_value_pair(&key, &value);
+                    self.store.store(key, &value, from.identity, value_type);
                 }
                 Command::GetStaleBuckets(threshold, reply) => {
                     let buckets = self.routing.stale_bucket_indices(threshold);
@@ -2299,7 +2428,37 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
         if !contact.identity.is_valid() {
             return;
         }
+        // SECURITY (S/Kademlia): Reject contacts without valid Proof-of-Work.
+        // This prevents Sybil attacks by ensuring identity generation is expensive.
+        if ENFORCE_POW_FOR_ROUTING && !contact.verify_pow() {
+            trace!(
+                identity = ?hex::encode(&contact.identity.as_bytes()[..8]),
+                nonce = contact.pow_proof.nonce,
+                "rejecting contact: invalid PoW proof"
+            );
+            return;
+        }
 
+        self.insert_contact_into_routing(contact);
+    }
+
+    /// Handle a directly-connected peer (mTLS verified).
+    /// 
+    /// SECURITY: Bypasses PoW check because the peer has proven identity
+    /// via mTLS certificate verification during QUIC handshake.
+    fn handle_observe_direct_peer(&mut self, contact: Contact) {
+        if contact.identity == self.id {
+            return;
+        }
+        if !contact.identity.is_valid() {
+            return;
+        }
+        // No PoW check - peer identity was verified via mTLS
+        self.insert_contact_into_routing(contact);
+    }
+
+    /// Common routing table insertion logic.
+    fn insert_contact_into_routing(&mut self, contact: Contact) {
         self.tiering.register_contact(&contact);
         let k = self.params.current_k();
         self.routing.set_k(k);
@@ -2353,6 +2512,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use tokio::sync::{Mutex, RwLock};
     use tokio::time::sleep;
+    use crate::identity::{IdentityProof, POW_DIFFICULTY};
 
     #[derive(Clone)]
     struct TestNetwork {
@@ -2513,7 +2673,12 @@ mod tests {
         // Use index to create different /16 prefixes: 10.{hi}.{lo}.1
         let hi = ((index >> 8) & 0xFF) as u8;
         let lo = (index & 0xFF) as u8;
-        Contact::single(make_identity(index), format!("10.{hi}.{lo}.1:9001"))
+        let identity = make_identity(index);
+        // Compute valid PoW proof at production difficulty
+        let pow_proof = IdentityProof::compute_for_identity(&identity, POW_DIFFICULTY);
+        let mut contact = Contact::single(identity, format!("10.{hi}.{lo}.1:9001"));
+        contact.pow_proof = pow_proof;
+        contact
     }
 
     /// Find three indices whose generated identities have peers 2 and 3 in the same bucket
@@ -3615,7 +3780,12 @@ mod tests {
     }
 
     fn make_test_contact(seed: u8) -> Contact {
-        Contact::single(make_test_identity(seed), format!("node-{seed}"))
+        let identity = make_test_identity(seed);
+        // Compute valid PoW proof at production difficulty
+        let pow_proof = IdentityProof::compute_for_identity(&identity, POW_DIFFICULTY);
+        let mut contact = Contact::single(identity, format!("node-{seed}"));
+        contact.pow_proof = pow_proof;
+        contact
     }
 
     #[test]
@@ -3643,7 +3813,7 @@ mod tests {
         let value = b"test value";
         let peer = make_test_identity(0x01);
 
-        let spilled = store.store(key, value, peer);
+        let spilled = store.store(key, value, peer, ValueType::ContentAddressed);
         assert!(spilled.is_empty());
 
         let retrieved = store.get(&key);
@@ -3657,7 +3827,7 @@ mod tests {
         let value = vec![0u8; MAX_VALUE_SIZE + 1];
         let peer = make_test_identity(0x01);
 
-        let spilled = store.store(key, &value, peer);
+        let spilled = store.store(key, &value, peer, ValueType::ContentAddressed);
         assert!(spilled.is_empty());
         assert!(store.get(&key).is_none());
     }
@@ -3667,17 +3837,17 @@ mod tests {
         let mut store = LocalStore::new();
         let peer = make_test_identity(0x01);
 
-        // Exhaust rate limit
+        // Exhaust rate limit using IdentityKeyed (full limit applies)
         for i in 0..PER_PEER_RATE_LIMIT {
             let mut key: Key = [0u8; 32];
             key[0] = i as u8;
-            store.store(key, b"value", peer);
+            store.store(key, b"value", peer, ValueType::IdentityKeyed);
         }
 
         // Next store should be rate limited
         let mut key: Key = [0u8; 32];
         key[0] = 0xFF;
-        let result = store.check_store_allowed(&peer, 5);
+        let result = store.check_store_allowed(&peer, 5, ValueType::IdentityKeyed);
         assert_eq!(result, Err(StoreRejection::RateLimited));
     }
 
@@ -3686,17 +3856,17 @@ mod tests {
         let mut store = LocalStore::new();
         let peer = make_test_identity(0x01);
 
-        // Store up to entry limit
+        // Store up to entry limit using IdentityKeyed
         for i in 0..PER_PEER_ENTRY_LIMIT {
             let mut key: Key = [0u8; 32];
             key[0] = i as u8;
             key[1] = (i >> 8) as u8;
-            store.store(key, b"v", peer);
+            store.store(key, b"v", peer, ValueType::IdentityKeyed);
         }
 
         // Check that further stores would exceed quota
         // Note: rate limiting may trigger first depending on timing
-        let result = store.check_store_allowed(&peer, 1);
+        let result = store.check_store_allowed(&peer, 1, ValueType::IdentityKeyed);
         assert!(result.is_err());
     }
 

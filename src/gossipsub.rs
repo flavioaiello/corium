@@ -2544,8 +2544,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
         
         // Fire-and-forget: notify DHT of these contacts
+        // SECURITY: Use observe_direct_peer() because these peers are already
+        // connected via mTLS, bypassing the S/Kademlia PoW requirement.
         for contact in peers_to_report {
-            dht.observe_contact(contact).await;
+            dht.observe_direct_peer(contact).await;
         }
     }
 

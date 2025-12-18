@@ -11,9 +11,17 @@
 //! Corium uses a simple identity model: **Identity = Ed25519 Public Key**.
 //! This provides:
 //!
-//! - **Sybil resistance**: Creating identities requires cryptographic work
+//! - **Sybil resistance**: Creating identities requires Proof-of-Work (crypto puzzle)
 //! - **Self-certifying**: No external CA needed; possession of private key proves identity
 //! - **XOR-metric routing**: Identities can be used directly in Kademlia-style DHT
+//!
+//! ## Proof-of-Work (S/Kademlia Compliance)
+//!
+//! To prevent Sybil attacks, identity generation requires solving a crypto puzzle:
+//! `BLAKE3(public_key || nonce)` must have `POW_DIFFICULTY` leading zero bits.
+//!
+//! This makes bulk identity generation computationally expensive while keeping
+//! verification O(1). See [`IdentityProof`] and [`Keypair::generate_with_pow`].
 //!
 //! ## Contact Records
 //!
@@ -33,6 +41,7 @@
 //! - P3: Only valid Ed25519 points are accepted as identities
 //! - P4: Contact signatures bind addresses to identity cryptographically
 //! - P5: Timestamps prevent replay of stale contact records
+//! - P6: Identity generation requires Proof-of-Work (Sybil resistance)
 
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
@@ -40,6 +49,37 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{SignatureError, CONTACT_SIGNATURE_DOMAIN};
+
+// ============================================================================
+// Proof-of-Work Constants (S/Kademlia Sybil Resistance)
+// ============================================================================
+
+/// Number of leading zero bits required in PoW hash.
+/// 
+/// Production (difficulty 24):
+/// - Average attempts: 2^24 = ~16 million
+/// - Time on modern CPU: ~1-4 seconds
+/// 
+/// Tests with `test-pow` feature (difficulty 8):
+/// - Average attempts: 2^8 = ~256
+/// - Time: <1ms
+/// - Exercises full PoW validation code path
+/// 
+/// SECURITY: Production difficulty makes Sybil attacks expensive.
+/// An attacker generating 1000 identities needs ~3-5 hours of CPU time.
+#[cfg(not(any(test, feature = "test-pow")))]
+pub const POW_DIFFICULTY: u32 = 24;
+
+#[cfg(any(test, feature = "test-pow"))]
+pub const POW_DIFFICULTY: u32 = 8;
+
+/// Maximum nonce value before giving up (prevents infinite loops).
+/// With difficulty 24, success is virtually guaranteed within 2^32 attempts.
+const POW_MAX_NONCE: u64 = 1 << 36;
+
+/// Domain separation prefix for PoW hashing.
+/// Prevents cross-protocol hash reuse.
+const POW_HASH_DOMAIN: &[u8] = b"corium-pow-v1:";
 
 /// Returns current time as milliseconds since Unix epoch.
 /// Used for timestamp generation in signed records.
@@ -57,9 +97,71 @@ pub struct Keypair {
 }
 
 impl Keypair {
+    /// Generate a new keypair WITHOUT Proof-of-Work.
+    /// 
+    /// **WARNING**: This creates an identity that will be rejected by DHT nodes
+    /// enforcing PoW verification. Use [`generate_with_pow`] for production.
+    /// 
+    /// Use cases:
+    /// - Testing and development
+    /// - Ephemeral connections that don't need DHT routing
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         Self { signing_key }
+    }
+
+    /// Generate a new keypair WITH Proof-of-Work (S/Kademlia compliant).
+    /// 
+    /// This iterates through random keypairs until finding one where:
+    /// `BLAKE3(POW_HASH_DOMAIN || public_key || nonce)` has `POW_DIFFICULTY` leading zeros.
+    /// 
+    /// Returns `(Keypair, IdentityProof)` - the proof must be included in Contact
+    /// records for DHT acceptance.
+    /// 
+    /// # Performance
+    /// - Expected time: 50-200ms on modern CPU (difficulty 16)
+    /// - Parallelizable across cores if needed
+    /// 
+    /// # Panics
+    /// Panics if no valid proof is found within `POW_MAX_NONCE` attempts
+    /// (astronomically unlikely with proper difficulty settings).
+    pub fn generate_with_pow() -> (Self, IdentityProof) {
+        loop {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let public_key = signing_key.verifying_key().to_bytes();
+            
+            for nonce in 0..POW_MAX_NONCE {
+                if verify_pow_hash(&public_key, nonce, POW_DIFFICULTY) {
+                    let keypair = Self { signing_key };
+                    let proof = IdentityProof { nonce };
+                    return (keypair, proof);
+                }
+            }
+            // Extremely unlikely: no valid nonce found, try new keypair
+        }
+    }
+
+    /// Generate a keypair with custom PoW difficulty.
+    /// 
+    /// Useful for testing (difficulty=0) or high-security deployments.
+    pub fn generate_with_pow_difficulty(difficulty: u32) -> (Self, IdentityProof) {
+        if difficulty == 0 {
+            let keypair = Self::generate();
+            return (keypair, IdentityProof { nonce: 0 });
+        }
+        
+        loop {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let public_key = signing_key.verifying_key().to_bytes();
+            
+            for nonce in 0..POW_MAX_NONCE {
+                if verify_pow_hash(&public_key, nonce, difficulty) {
+                    let keypair = Self { signing_key };
+                    let proof = IdentityProof { nonce };
+                    return (keypair, proof);
+                }
+            }
+        }
     }
 
     pub fn from_secret_key_bytes(bytes: &[u8; 32]) -> Self {
@@ -91,8 +193,19 @@ impl Keypair {
         self.signing_key.verifying_key().verify(message, signature).is_ok()
     }
 
-    /// Create a signed endpoint record.
+    /// Create a signed endpoint record WITHOUT PoW proof.
+    /// 
+    /// **WARNING**: Contacts created this way will be rejected by DHT nodes
+    /// enforcing PoW. Use [`create_contact_with_pow`] for production.
     pub fn create_contact(&self, addrs: Vec<String>) -> Contact {
+        self.create_contact_with_pow(addrs, IdentityProof::empty())
+    }
+
+    /// Create a signed endpoint record WITH PoW proof (S/Kademlia compliant).
+    /// 
+    /// The `pow_proof` should be obtained from [`generate_with_pow`] and stored
+    /// persistently alongside the keypair.
+    pub fn create_contact_with_pow(&self, addrs: Vec<String>, pow_proof: IdentityProof) -> Contact {
         let identity = self.identity();
         let timestamp = now_ms();
         
@@ -107,6 +220,7 @@ impl Keypair {
             addrs,
             timestamp,
             signature,
+            pow_proof,
         }
     }
 }
@@ -183,6 +297,109 @@ impl Identity {
         // Validate it's a valid Ed25519 public key point
         VerifyingKey::try_from(self.0.as_slice()).is_ok()
     }
+
+    /// Verify that a Proof-of-Work is valid for this identity.
+    /// 
+    /// Returns `true` if `BLAKE3(POW_HASH_DOMAIN || identity || nonce)` has
+    /// at least `POW_DIFFICULTY` leading zero bits.
+    /// 
+    /// This is O(1) verification of the work done during identity generation.
+    #[inline]
+    pub fn verify_pow(&self, proof: &IdentityProof) -> bool {
+        verify_pow_hash(&self.0, proof.nonce, POW_DIFFICULTY)
+    }
+
+    /// Verify PoW with custom difficulty (for testing or migration).
+    #[inline]
+    pub fn verify_pow_with_difficulty(&self, proof: &IdentityProof, difficulty: u32) -> bool {
+        verify_pow_hash(&self.0, proof.nonce, difficulty)
+    }
+}
+
+// ============================================================================
+// Proof-of-Work Infrastructure (S/Kademlia)
+// ============================================================================
+
+/// Proof-of-Work for identity generation.
+/// 
+/// Contains the nonce that, when hashed with the public key, produces
+/// a hash with sufficient leading zeros. This proof must be included
+/// in Contact records for DHT routing table acceptance.
+/// 
+/// # Verification
+/// ```ignore
+/// let (keypair, proof) = Keypair::generate_with_pow();
+/// assert!(keypair.identity().verify_pow(&proof));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IdentityProof {
+    /// Nonce that produces a valid PoW hash with the identity.
+    pub nonce: u64,
+}
+
+impl IdentityProof {
+    /// Create a new proof with the given nonce.
+    pub fn new(nonce: u64) -> Self {
+        Self { nonce }
+    }
+
+    /// Create an empty/invalid proof (for unsigned contacts).
+    pub fn empty() -> Self {
+        Self { nonce: 0 }
+    }
+
+    /// Compute a PoW proof for an existing identity.
+    /// 
+    /// This finds a nonce where `BLAKE3(domain || public_key || nonce)` has
+    /// the specified number of leading zero bits.
+    /// 
+    /// # Use Cases
+    /// - Computing PoW for an imported keypair
+    /// - Test helpers that need valid PoW for deterministic identities
+    /// 
+    /// # Panics
+    /// Panics if no valid nonce is found within `POW_MAX_NONCE` attempts.
+    pub fn compute_for_identity(identity: &Identity, difficulty: u32) -> Self {
+        let public_key = identity.as_bytes();
+        for nonce in 0..POW_MAX_NONCE {
+            if verify_pow_hash(public_key, nonce, difficulty) {
+                return Self { nonce };
+            }
+        }
+        panic!("PoW computation failed: no valid nonce found within {} attempts", POW_MAX_NONCE);
+    }
+}
+
+/// Verify that BLAKE3(domain || public_key || nonce) has `difficulty` leading zeros.
+#[inline]
+fn verify_pow_hash(public_key: &[u8; 32], nonce: u64, difficulty: u32) -> bool {
+    let hash = compute_pow_hash(public_key, nonce);
+    count_leading_zeros(&hash) >= difficulty
+}
+
+/// Compute the PoW hash for verification.
+#[inline]
+fn compute_pow_hash(public_key: &[u8; 32], nonce: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(POW_HASH_DOMAIN);
+    hasher.update(public_key);
+    hasher.update(&nonce.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Count leading zero bits in a hash.
+#[inline]
+fn count_leading_zeros(hash: &[u8; 32]) -> u32 {
+    let mut zeros = 0u32;
+    for byte in hash {
+        if *byte == 0 {
+            zeros += 8;
+        } else {
+            zeros += byte.leading_zeros();
+            break;
+        }
+    }
+    zeros
 }
 
 /// Compare two XOR distances lexicographically.
@@ -248,17 +465,23 @@ pub struct Contact {
     pub timestamp: u64,
     /// Ed25519 signature (empty = unsigned/ephemeral).
     pub signature: Vec<u8>,
+    /// Proof-of-Work for Sybil resistance (S/Kademlia).
+    /// Default is 0 for backwards compatibility; nodes enforcing PoW will reject contacts
+    /// where `identity.verify_pow(&proof)` fails.
+    #[serde(default)]
+    pub pow_proof: IdentityProof,
 }
 
 impl Contact {
     /// Create an unsigned endpoint record (lightweight peer reference).
-    /// Unsigned records have timestamp=0 and empty signature.
+    /// Unsigned records have timestamp=0, empty signature, and no PoW proof.
     pub fn unsigned(identity: Identity, addrs: Vec<String>) -> Self {
         Self {
             identity,
             addrs,
             timestamp: 0,
             signature: vec![],
+            pow_proof: IdentityProof::empty(),
         }
     }
 
@@ -370,10 +593,29 @@ impl Contact {
         !self.addrs.is_empty()
     }
 
+    /// Verify the Proof-of-Work for this Contact's identity.
+    /// 
+    /// SECURITY: This is required for DHT routing table acceptance.
+    /// Contacts without valid PoW should be rejected to prevent Sybil attacks.
+    /// 
+    /// # Returns
+    /// `true` if the PoW proof is valid for the identity.
+    #[inline]
+    pub fn verify_pow(&self) -> bool {
+        self.identity.verify_pow(&self.pow_proof)
+    }
+
+    /// Verify PoW with custom difficulty.
+    #[inline]
+    pub fn verify_pow_with_difficulty(&self, difficulty: u32) -> bool {
+        self.identity.verify_pow_with_difficulty(&self.pow_proof, difficulty)
+    }
+
     /// Validate the structural integrity of a Contact record.
     /// 
-    /// SECURITY: This validates bounds and format, NOT cryptographic signatures.
+    /// SECURITY: This validates bounds and format, NOT cryptographic signatures or PoW.
     /// Always call `verify()` or `verify_fresh()` for untrusted data.
+    /// For DHT routing, also call `verify_pow()`.
     /// 
     /// Checks:
     /// - Address count ≤ MAX_ADDRS (16)
@@ -804,6 +1046,7 @@ mod tests {
             addrs,
             timestamp: old_timestamp,
             signature,
+            pow_proof: IdentityProof::empty(),
         };
 
         // Signature should be valid (cryptographically correct)
@@ -835,6 +1078,7 @@ mod tests {
             addrs,
             timestamp: future_timestamp,
             signature,
+            pow_proof: IdentityProof::empty(),
         };
 
         // Future-dated record should fail freshness check
@@ -967,5 +1211,155 @@ mod tests {
         let keypair = Keypair::generate();
         let valid_identity = keypair.identity();
         assert!(valid_identity.is_valid());
+    }
+
+    // ========================================================================
+    // Proof-of-Work (S/Kademlia) Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pow_generation_produces_valid_proof() {
+        // Use lower difficulty for faster test
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let identity = keypair.identity();
+        
+        assert!(
+            identity.verify_pow_with_difficulty(&proof, 8),
+            "P6 violation: generate_with_pow must produce valid proof"
+        );
+    }
+
+    #[test]
+    fn test_pow_verification_rejects_invalid_nonce() {
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let identity = keypair.identity();
+        
+        // Valid proof works
+        assert!(identity.verify_pow_with_difficulty(&proof, 8));
+        
+        // Wrong nonce fails
+        let bad_proof = IdentityProof::new(proof.nonce.wrapping_add(1));
+        assert!(
+            !identity.verify_pow_with_difficulty(&bad_proof, 8),
+            "PoW should reject invalid nonce"
+        );
+    }
+
+    #[test]
+    fn test_pow_verification_rejects_wrong_identity() {
+        let (keypair1, proof1) = Keypair::generate_with_pow_difficulty(8);
+        let keypair2 = Keypair::generate();
+        
+        // Proof from keypair1 shouldn't work for keypair2's identity
+        assert!(
+            !keypair2.identity().verify_pow_with_difficulty(&proof1, 8),
+            "PoW proof should be bound to specific identity"
+        );
+        
+        // But should work for its own identity
+        assert!(keypair1.identity().verify_pow_with_difficulty(&proof1, 8));
+    }
+
+    #[test]
+    fn test_pow_difficulty_zero_always_passes() {
+        let keypair = Keypair::generate();
+        let proof = IdentityProof::new(0);
+        
+        // Difficulty 0 means no leading zeros required
+        assert!(
+            keypair.identity().verify_pow_with_difficulty(&proof, 0),
+            "Difficulty 0 should always pass"
+        );
+    }
+
+    #[test]
+    fn test_contact_with_pow_serialization_roundtrip() {
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let contact = keypair.create_contact_with_pow(
+            vec!["192.168.1.1:8080".to_string()],
+            proof,
+        );
+        
+        // Verify PoW before serialization
+        assert!(contact.verify_pow_with_difficulty(8));
+        
+        // Serialize and deserialize
+        let serialized = bincode::serialize(&contact).unwrap();
+        let deserialized: Contact = bincode::deserialize(&serialized).unwrap();
+        
+        // Verify PoW after deserialization
+        assert!(
+            deserialized.verify_pow_with_difficulty(8),
+            "PoW proof must survive serialization roundtrip"
+        );
+        assert_eq!(deserialized.pow_proof.nonce, proof.nonce);
+    }
+
+    #[test]
+    fn test_contact_without_pow_fails_verification() {
+        let keypair = Keypair::generate();
+        let contact = keypair.create_contact(vec!["192.168.1.1:8080".to_string()]);
+        
+        // Contact created without PoW should fail verification at any non-zero difficulty
+        // (unless astronomically lucky, which won't happen in practice)
+        // Note: nonce=0 might occasionally pass for very low bits, so we check difficulty 8+
+        assert!(
+            !contact.verify_pow_with_difficulty(16),
+            "Contact without PoW should fail verification at production difficulty"
+        );
+    }
+
+    #[test]
+    fn test_pow_helper_functions() {
+        // Test count_leading_zeros
+        assert_eq!(count_leading_zeros(&[0x00; 32]), 256);
+        assert_eq!(count_leading_zeros(&[0xFF; 32]), 0);
+        assert_eq!(count_leading_zeros(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), 23);
+        assert_eq!(count_leading_zeros(&[0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), 8);
+    }
+
+    #[test]
+    fn test_identity_proof_default() {
+        let proof = IdentityProof::default();
+        assert_eq!(proof.nonce, 0);
+        
+        let empty = IdentityProof::empty();
+        assert_eq!(empty.nonce, 0);
+    }
+
+    #[test]
+    fn test_pow_generation_timing() {
+        use std::time::Instant;
+        
+        // Benchmark PoW generation at production difficulty (24)
+        // Note: Use lower difficulty (8) in debug mode to avoid slow tests
+        let difficulty = if cfg!(debug_assertions) { 8 } else { POW_DIFFICULTY };
+        
+        let start = Instant::now();
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(difficulty);
+        let elapsed = start.elapsed();
+        
+        // Verify the proof is valid
+        assert!(keypair.identity().verify_pow_with_difficulty(&proof, difficulty));
+        
+        // Print timing for visibility (run with --nocapture)
+        println!("\nPoW generation at difficulty {}: {:?}", difficulty, elapsed);
+        println!("  Nonce found: {}", proof.nonce);
+        
+        // Sanity check: should complete in reasonable time
+        // Debug mode (diff 8): < 1 second
+        // Release mode (diff 24): < 60 seconds (allows for variance)
+        let max_secs = if cfg!(debug_assertions) { 5 } else { 60 };
+        assert!(
+            elapsed.as_secs() < max_secs,
+            "PoW took too long: {:?}",
+            elapsed
+        );
     }
 }

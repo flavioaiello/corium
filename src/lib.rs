@@ -21,6 +21,7 @@
 //! - Identity = Public Key (no separate identity layer)
 //! - All stored data is content-addressed or cryptographically signed
 //! - Rate limiting and bounded data structures prevent resource exhaustion
+//! - **S/Kademlia PoW**: Identity generation requires Proof-of-Work (Sybil resistance)
 //!
 //! ## Module Overview
 //!
@@ -48,4 +49,4 @@ mod relay;
 mod rpc;
 mod transport;
 
-pub use node::{Identity, Node};
+pub use node::{Identity, IdentityProof, POW_DIFFICULTY, Node};
