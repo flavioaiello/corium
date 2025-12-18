@@ -239,6 +239,20 @@ pub const DEFAULT_P5_WEIGHT: f64 = 1.0;
 /// SECURITY: Negative weight penalizes peers sharing an IP prefix.
 pub const DEFAULT_P6_WEIGHT: f64 = -10.0;
 
+/// Maximum P6 penalty before capping.
+/// 
+/// SECURITY: P6 (IP colocation) is a *soft* signal for Sybil resistance, not proof
+/// of malicious behavior. It should degrade peer priority but NOT graylist peers
+/// on its own. Actual misbehavior (P4: invalid messages, P7: protocol violations)
+/// should be required for graylisting.
+/// 
+/// This cap ensures P6 alone cannot exceed the graylist threshold (-100), allowing
+/// collocated peers (e.g., local development, data center deployments) to function
+/// while still being deprioritized relative to geographically diverse peers.
+/// 
+/// Set to 90% of graylist threshold to leave headroom for accumulating positive scores.
+pub const MAX_P6_PENALTY: f64 = 90.0;
+
 /// Number of peers from same /16 prefix before P6 penalty applies.
 /// Per GossipSub v1.1: peers below this threshold are not penalized.
 pub const IP_COLOCATION_THRESHOLD: usize = 1;
@@ -707,7 +721,11 @@ impl PeerScore {
         score += DEFAULT_P5_WEIGHT * self.app_specific_score;
         
         // P6: IP colocation penalty (computed by IpColocationTracker)
-        score += DEFAULT_P6_WEIGHT * p6_factor;
+        // SECURITY: Cap P6 penalty to MAX_P6_PENALTY to prevent graylisting from
+        // IP colocation alone. This allows collocated peers (local dev, data centers)
+        // to function while still being deprioritized.
+        let p6_penalty = (DEFAULT_P6_WEIGHT * p6_factor).max(-MAX_P6_PENALTY);
+        score += p6_penalty;
         
         // P7: Behavioural penalty (squared)
         score += DEFAULT_P7_WEIGHT * self.behaviour_penalty * self.behaviour_penalty;
@@ -1644,8 +1662,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         if let Some(score) = self.peer_scores.get(peer) {
             score.calculate(&self.topic_score_params, p6_factor)
         } else {
-            // No peer score entry, but may still have P6 penalty
-            DEFAULT_P6_WEIGHT * p6_factor
+            // No peer score entry, but may still have P6 penalty.
+            // SECURITY: Cap P6 penalty to MAX_P6_PENALTY to prevent graylisting
+            // peers solely based on IP colocation (e.g., local dev, data centers).
+            (DEFAULT_P6_WEIGHT * p6_factor).max(-MAX_P6_PENALTY)
         }
     }
 
@@ -3848,8 +3868,12 @@ mod tests {
         tracker.register_peer(&peer5, provenance);
         assert_eq!(tracker.calculate_p6_factor(&peer1), 16.0);
         
-        // With DEFAULT_P6_WEIGHT = -10.0, actual score impact:
+        // With DEFAULT_P6_WEIGHT = -10.0, raw P6 penalty would be:
         // 5 peers → -10.0 * 16.0 = -160.0 penalty per peer
+        //
+        // However, MAX_P6_PENALTY (90.0) caps the actual penalty to -90.0,
+        // ensuring P6 alone cannot graylist peers (threshold = -100.0).
+        // This allows collocated peers (local dev, data centers) to function.
     }
 
     #[test]
