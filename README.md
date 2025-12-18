@@ -17,7 +17,7 @@ Corium is a high-performance, secure, and adaptive mesh networking library writt
 - **NAT Traversal** — Built-in relay infrastructure and path probing via SmartSock
 - **Secure by Default** — Ed25519 identities with mutual TLS on every connection
 - **Adaptive Performance** — Latency-tiered DHT with automatic path optimization
-- **Complete Stack** — DHT storage, PubSub messaging, direct messaging, and membership management
+- **Complete Stack** — PubSub messaging, request-response, direct connections, and membership management
 
 ## Quick Start
 
@@ -25,7 +25,7 @@ Add Corium to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-corium = "0.3"
+corium = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -87,19 +87,17 @@ while let Some((from, request, response_tx)) = requests.recv().await {
 }
 ```
 
-### DHT Storage
+### Peer Discovery
 
 ```rust
-// Store content-addressed data (key = blake3 hash)
-let key = node.put(b"my data".to_vec()).await?;
+// Find peers near a target identity
+let peers = node.find_peers(target_identity).await?;
 
-// Store at a specific key
-node.put_at(key, b"updated data".to_vec()).await?;
+// Resolve a peer's published contact record
+let contact = node.resolve(&peer_identity).await?;
 
-// Retrieve data
-if let Some(data) = node.get(&key).await? {
-    println!("Retrieved: {:?}", data);
-}
+// Publish your address for others to discover
+node.publish_address(vec!["192.168.1.100:4433".to_string()]).await?;
 ```
 
 ### NAT Traversal
@@ -136,7 +134,7 @@ while let Some(incoming) = rx.recv().await {
 │                              Node                                   │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │
 │  │  GossipSub  │  │   Crypto    │  │     DHT     │  │   Relay    │  │
-│  │   (PubSub)  │  │ (Identity)  │  │  (Storage)  │  │  (Client)  │  │
+│  │   (PubSub)  │  │ (Identity)  │  │ (Discovery) │  │  (Client)  │  │
 │  └──────┬──────┘  └─────────────┘  └──────┬──────┘  └─────┬──────┘  │
 │         │                                 │                │        │
 │  ┌──────┴─────────────────────────────────┴────────────────┴──────┐ │
@@ -162,8 +160,8 @@ while let Some(incoming) = rx.recv().await {
 | `node` | High-level facade exposing the complete public API |
 | `transport` | SmartSock with path probing, relay tunnels, and virtual addresses |
 | `rpc` | Connection pooling, RPC dispatch, and actor-based state management |
-| `dht` | Kademlia-style DHT with latency tiering, adaptive parameters, routing table, and storage |
-| `gossipsub` | GossipSub epidemic broadcast for efficient PubSub |
+| `dht` | Kademlia-style DHT with latency tiering, adaptive parameters, and peer discovery |
+| `gossipsub` | GossipSub v1.1/v1.2 epidemic broadcast with peer scoring |
 | `relay` | UDP relay server and client with mesh-mediated signaling for NAT traversal |
 | `crypto` | Ed25519 certificates, identity verification, custom TLS |
 | `identity` | Keypairs, endpoint records, and signed address publication |
@@ -274,22 +272,23 @@ elif relay_path.rtt + 50ms < direct_path.rtt:
 
 ### Kademlia Implementation
 
+The DHT is used internally for peer discovery and address publication:
+
 - **256 k-buckets** with configurable k (default: 20, adaptive: 10-30)
 - **Iterative lookups** with configurable α (default: 3, adaptive: 2-5)
-- **Content-addressed storage** using blake3 hashing
+- **S/Kademlia PoW**: Identity generation requires Proof-of-Work for Sybil resistance
 
 ### Key Operations
 
 ```rust
-// Store and retrieve
-let key = node.put(data).await?;
-let value = node.get(&key).await?;
-
-// Find peers near a target
+// Find peers near a target identity
 let peers = node.find_peers(target_identity).await?;
 
-// Resolve peer's published endpoint record
-let record = node.resolve_peer(&peer_id).await?;
+// Resolve peer's published contact record
+let contact = node.resolve(&peer_id).await?;
+
+// Publish your address for discovery
+node.publish_address(vec!["192.168.1.100:4433".to_string()]).await?;
 ```
 
 ### Latency Tiering
@@ -305,16 +304,19 @@ The DHT implements Coral-inspired latency tiering:
 
 Corium is designed to scale to millions of concurrent peers. Key design decisions enable efficient operation at scale:
 
-### Memory Efficiency
+### Memory Efficiency (Per-Node at 10M Network)
 
-| Component | At 10M Peers | Design |
-|-----------|--------------|--------|
+Each node uses constant memory regardless of network size:
+
+| Component | Memory | Design |
+|-----------|--------|--------|
 | **Routing table** | ~640 KB | 256 buckets × 20 contacts |
 | **RTT tiering** | ~1 MB | /16 prefix-based (not per-peer) |
 | **Passive view** | ~13 KB | 100 recovery candidates |
 | **Connection cache** | ~200 KB | 1,000 LRU connections |
+| **Peer scoring** | ~1 MB | 10K active peers scored |
 | **Message dedup** | ~2 MB | 10K source sequence windows |
-| **Total** | **~4 MB** | Bounded, independent of network size |
+| **Total** | **~5 MB** | Bounded, scales to 10M+ nodes |
 
 ### DHT Performance
 
@@ -332,20 +334,23 @@ Corium is designed to scale to millions of concurrent peers. Key design decision
 | **Bucket size** | Fixed k=20 | Adaptive 10-30 | Handles churn spikes |
 | **Concurrency** | Fixed α=3 | Adaptive 2-5 | Load shedding |
 | **RTT optimization** | ❌ None | /16 prefix tiering | Lower latency paths |
-| **Sybil protection** | ❌ Basic | Per-peer insertion limits | Eclipse resistant |
-| **Gossip layer** | ❌ None | GossipSub | Fast broadcast, recovery |
-| **NAT traversal** | ❌ None | SmartSock + relays | Works behind NAT |
-| **Identity** | SHA-1 node IDs | Ed25519 public keys | Self-certifying |
+| **Sybil protection** | ❌ Basic | S/Kademlia PoW + per-peer limits | Eclipse resistant |
+| **Gossip layer** | ❌ None | GossipSub v1.1/v1.2 | Fast broadcast, scoring |
+| **NAT traversal** | ❌ None | SmartSock + mesh relays | Works behind NAT |
+| **Identity** | SHA-1 node IDs | Ed25519 + PoW | Self-certifying, Sybil-resistant |
 
-### Scaling Boundaries
+### Scaling Boundaries (Per-Node)
 
-| Parameter | Limit | Bottleneck |
-|-----------|-------|------------|
-| **Peers tracked** | Unlimited | Routing table is O(log N) |
-| **DHT storage** | 100K entries | Memory-bounded LRU |
-| **PubSub topics** | 10,000 | Per-node limit |
-| **Peers per topic** | 1,000 | Gossip efficiency |
-| **Relay sessions** | 10,000 | Per-relay server |
+These limits are per-node, not network-wide. With 10M nodes, the network's aggregate capacity scales linearly:
+
+| Parameter | Per-Node Limit | At 10M Nodes | Notes |
+|-----------|----------------|--------------|-------|
+| **Routing contacts** | ~5,120 | N/A | O(log N) = 23 hops at 10M |
+| **Contact records** | 100K entries | 1 trillion | Distributed across DHT |
+| **Scored peers** | 10,000 | 100 billion | Per-node active peer set |
+| **PubSub topics** | 10,000 | 100 billion | Topics span multiple nodes |
+| **Peers per topic** | 1,000 | N/A | Gossip efficiency bound |
+| **Relay sessions** | 10,000 | 100 billion | Per-relay server |
 
 ### Key Design Decisions
 
@@ -357,11 +362,22 @@ Corium is designed to scale to millions of concurrent peers. Key design decision
 
 ## GossipSub (PubSub)
 
+### GossipSub v1.1/v1.2 Implementation
+
+Corium implements the full GossipSub v1.1 specification with v1.2 extensions:
+
+- **Peer Scoring (P1-P7)**: Time in mesh, message delivery, invalid messages, IP colocation
+- **Adaptive Gossip**: D_score mesh quotas, Opportunistic Grafting, Flood Publishing
+- **IDontWant (v1.2)**: Bandwidth optimization for large messages
+- **Mesh Management**: D, D_lo, D_hi, D_out, D_score parameters
+- **Prune Backoff**: Exponential backoff for pruned peers
+
 ### Epidemic Broadcast
 
 GossipSub implements efficient topic-based publish/subscribe:
 - **Mesh overlay** — Each topic maintains a mesh of connected peers
 - **Eager push** — Messages forwarded immediately to mesh peers
+- **Flood publishing** — Publishers send to all peers above publish threshold
 - **Gossip protocol** — IHave/IWant metadata exchange for reliability
 - **Relay signaling** — NAT traversal signals forwarded through mesh peers
 
@@ -410,7 +426,7 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 | **RPC** | Identity verification on every request |
 | **Storage** | Per-peer quotas, rate limiting, content validation |
 | **Routing** | Rate-limited insertions, ping verification, S/Kademlia PoW |
-| **PubSub** | Message signatures, replay protection, P6 IP colocation scoring |
+| **PubSub** | Message signatures, replay detection, peer scoring (P1-P7), IP colocation (P6) |
 
 ### Security Constants
 
@@ -423,6 +439,7 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 | `PER_PEER_STORAGE_QUOTA` | 1 MB | DHT storage per peer |
 | `PER_PEER_ENTRY_LIMIT` | 100 | DHT entries per peer |
 | `MAX_CONCURRENT_STREAMS` | 64 | QUIC streams per connection |
+| `POW_DIFFICULTY` | 24 bits | Identity PoW (Sybil resistance) |
 
 ## CLI Usage
 
@@ -508,11 +525,15 @@ cargo test --test relay_infrastructure
 
   Introduced "sloppy" DHT with latency-based clustering—inspiration for Corium's tiering system.
 
+- **Baumgart, I. & Mies, S.** (2007). *S/Kademlia: A Practicable Approach Towards Secure Key-Based Routing*. ICPP '07.
+
+  The S/Kademlia specification that Corium implements for Sybil-resistant identity generation via Proof-of-Work.
+
 ### GossipSub / PlumTree
 
 - **Vyzovitis, D., et al.** (2020). *GossipSub: Attack-Resilient Message Propagation in the Filecoin and ETH2.0 Networks*.
 
-  The GossipSub v1.1 specification that Corium's PubSub implementation follows.
+  The GossipSub v1.1 specification that Corium's PubSub implementation follows, including peer scoring (P1-P7), Adaptive Gossip, and mesh management.
 
 - **Leitão, J., Pereira, J., & Rodrigues, L.** (2007). *Epidemic Broadcast Trees*. SRDS '07.
 
