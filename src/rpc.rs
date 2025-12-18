@@ -55,7 +55,6 @@ use crate::identity::{Contact, Identity};
 use crate::gossipsub::GossipSub;
 use crate::protocols::{DhtNodeRpc, GossipSubRpc, RelayRpc, PlainRpc};
 
-
 // ============================================================================
 // Security Limits
 // ============================================================================

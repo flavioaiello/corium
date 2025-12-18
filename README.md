@@ -409,8 +409,8 @@ let msg = rx.recv().await?;  // msg.from is verified sender
 | **Transport** | Mutual TLS on all QUIC connections |
 | **RPC** | Identity verification on every request |
 | **Storage** | Per-peer quotas, rate limiting, content validation |
-| **Routing** | Rate-limited insertions, ping verification |
-| **PubSub** | Message signatures, replay protection |
+| **Routing** | Rate-limited insertions, ping verification, S/Kademlia PoW |
+| **PubSub** | Message signatures, replay protection, P6 IP colocation scoring |
 
 ### Security Constants
 

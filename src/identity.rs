@@ -46,9 +46,91 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{SignatureError, CONTACT_SIGNATURE_DOMAIN};
+
+// ============================================================================
+// Network Provenance (IP-based locality detection)
+// ============================================================================
+
+/// Network provenance for colocation detection and locality-based operations.
+/// 
+/// Extracts a coarse identifier representing the peer's network origin:
+/// - **IPv4**: `/16` prefix (first two octets) — ISP/regional level
+/// - **IPv6**: `/32` prefix (first two segments) — similar regional scope
+/// 
+/// # Use Cases
+/// 
+/// - **GossipSub P6**: Detect peers in same datacenter → colocation penalty (Sybil resistance)
+/// - **DHT Tiering**: Group peers by network region → latency estimation
+/// - **Rate Limiting**: Bound requests per network block → abuse prevention
+/// 
+/// # Design Rationale
+/// 
+/// - `/16` catches datacenter co-tenancy (AWS, GCP share /16 blocks)
+/// - Coarser than `/24` to detect VPS in same datacenter
+/// - Matches statistical assumption: same /16 ≈ similar latency
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Provenance(u16);
+
+impl Provenance {
+    /// Extract provenance from a socket address.
+    #[inline]
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        Self::from_ip(addr.ip())
+    }
+    
+    /// Extract provenance from an IP address.
+    #[inline]
+    pub fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                // /16: first two octets
+                Self(((octets[0] as u16) << 8) | (octets[1] as u16))
+            }
+            IpAddr::V6(v6) => {
+                // /32: first two segments (ISP-level granularity)
+                let segs = v6.segments();
+                Self(segs[0].wrapping_add(segs[1]))
+            }
+        }
+    }
+    
+    /// Parse from "host:port" string format.
+    /// 
+    /// Handles:
+    /// - IPv4: "192.168.1.1:8080"
+    /// - IPv6: "[::1]:8080"
+    /// - Host only: "192.168.1.1"
+    pub fn from_addr_str(addr: &str) -> Option<Self> {
+        // Try parsing as SocketAddr first (most common case)
+        if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            return Some(Self::from_socket_addr(socket_addr));
+        }
+        
+        // Fall back to manual parsing for "host:port" or just "host"
+        let host = if let Some(bracket_end) = addr.find(']') {
+            // IPv6: [::1]:port
+            &addr[1..bracket_end]
+        } else if let Some(colon_pos) = addr.rfind(':') {
+            // IPv4 or hostname:port - take part before last colon
+            &addr[..colon_pos]
+        } else {
+            addr
+        };
+        
+        host.parse::<IpAddr>().ok().map(Self::from_ip)
+    }
+    
+    /// Get the raw prefix value (for debugging/testing).
+    #[cfg(test)]
+    pub fn value(&self) -> u16 {
+        self.0
+    }
+}
 
 // ============================================================================
 // Proof-of-Work Constants (S/Kademlia Sybil Resistance)
@@ -558,6 +640,19 @@ impl Contact {
     /// Get the primary address (first in the list).
     pub fn primary_addr(&self) -> Option<&str> {
         self.addrs.first().map(|s| s.as_str())
+    }
+
+    /// Get the network provenance of this contact's primary address.
+    /// 
+    /// Returns the coarse network origin identifier used for:
+    /// - P6 IP colocation scoring (Sybil resistance)
+    /// - RTT-based latency tiering
+    /// - Per-prefix rate limiting
+    /// 
+    /// Returns `None` if no primary address or address cannot be parsed.
+    #[inline]
+    pub(crate) fn provenance(&self) -> Option<Provenance> {
+        self.primary_addr().and_then(Provenance::from_addr_str)
     }
 
     /// Verify the cryptographic signature of this Contact record.

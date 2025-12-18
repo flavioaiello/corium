@@ -46,7 +46,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use crate::identity::{distance_cmp, Contact, FreshnessError, Identity, Keypair};
+use crate::identity::{distance_cmp, Contact, FreshnessError, Identity, Keypair, Provenance};
 use crate::protocols::DhtNodeRpc;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
@@ -1368,39 +1368,8 @@ pub struct TieringStats {
     pub counts: Vec<usize>,
 }
 
-/// /16 prefix key: first two octets of IPv4 or first segment of IPv6.
-/// 
-/// Used for latency-based grouping - all IPs in the same /16 typically
-/// have similar latency (same ISP/region).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Prefix16(u16);
-
-impl Prefix16 {
-    fn from_addr_str(addr: &str) -> Option<Self> {
-        // Parse "host:port" or just "host" format
-        let host = if let Some(bracket_end) = addr.find(']') {
-            // IPv6: [::1]:port
-            &addr[1..bracket_end]
-        } else if let Some(colon_pos) = addr.rfind(':') {
-            // IPv4 or hostname:port - take part before last colon
-            &addr[..colon_pos]
-        } else {
-            addr
-        };
-        
-        host.parse::<IpAddr>().ok().map(|ip| match ip {
-            IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                Self(((octets[0] as u16) << 8) | (octets[1] as u16))
-            }
-            IpAddr::V6(v6) => {
-                // Use /32 (first two segments) for ISP-level granularity
-                let segs = v6.segments();
-                Self(segs[0].wrapping_add(segs[1]))
-            }
-        })
-    }
-}
+// NOTE: Provenance (network origin detection) is now defined in identity.rs alongside Contact,
+// as it's a derived attribute of Contact.primary_addr(). Used for P6 colocation scoring and RTT tiering.
 
 /// RTT statistics for a /16 prefix
 #[derive(Clone, Debug)]
@@ -1439,11 +1408,11 @@ impl PrefixRttStats {
 /// - Linear scaling to millions of nodes
 struct TieringManager {
     /// /16 prefix → RTT statistics (LRU cache, bounded by MAX_TIERING_TRACKED_PREFIXES)
-    prefix_rtt: LruCache<Prefix16, PrefixRttStats>,
+    prefix_rtt: LruCache<Provenance, PrefixRttStats>,
     /// /16 prefix → tier assignment.
     /// BOUNDED: Only populated from prefix_rtt.iter() during recompute_if_needed(),
     /// so size is transitively bounded by MAX_TIERING_TRACKED_PREFIXES.
-    prefix_tiers: HashMap<Prefix16, TieringLevel>,
+    prefix_tiers: HashMap<Provenance, TieringLevel>,
     /// Tier centroids (sorted by latency)
     centroids: Vec<f32>,
     /// Last recomputation time
@@ -1468,13 +1437,11 @@ impl TieringManager {
 
     /// Register a contact and return its tiering level based on /16 prefix.
     pub fn register_contact(&mut self, contact: &Contact) -> TieringLevel {
-        if let Some(primary) = contact.primary_addr()
-            && let Some(prefix) = Prefix16::from_addr_str(primary)
-        {
-            // Ensure prefix is in LRU (touch it)
-            self.prefix_rtt.get_or_insert_mut(prefix, PrefixRttStats::default);
+        if let Some(provenance) = contact.provenance() {
+            // Ensure provenance is in LRU (touch it)
+            self.prefix_rtt.get_or_insert_mut(provenance, PrefixRttStats::default);
             return self.prefix_tiers
-                .get(&prefix)
+                .get(&provenance)
                 .copied()
                 .unwrap_or_else(|| self.default_level());
         }
@@ -1483,11 +1450,9 @@ impl TieringManager {
 
     /// Record an RTT sample for a contact's /16 prefix.
     pub fn record_sample(&mut self, contact: &Contact, rtt_ms: f32) {
-        if let Some(primary) = contact.primary_addr()
-            && let Some(prefix) = Prefix16::from_addr_str(primary)
-        {
+        if let Some(provenance) = contact.provenance() {
             self.prefix_rtt
-                .get_or_insert_mut(prefix, PrefixRttStats::default)
+                .get_or_insert_mut(provenance, PrefixRttStats::default)
                 .update(rtt_ms);
             self.recompute_if_needed();
         }
@@ -1495,9 +1460,8 @@ impl TieringManager {
 
     /// Get tiering level for a contact based on its /16 prefix.
     pub fn level_for(&self, contact: &Contact) -> TieringLevel {
-        contact.primary_addr()
-            .and_then(Prefix16::from_addr_str)
-            .and_then(|prefix| self.prefix_tiers.get(&prefix).copied())
+        contact.provenance()
+            .and_then(|provenance| self.prefix_tiers.get(&provenance).copied())
             .unwrap_or_else(|| self.default_level())
     }
 
@@ -1522,7 +1486,7 @@ impl TieringManager {
         }
 
         // Collect per-prefix average RTTs
-        let per_prefix: Vec<(Prefix16, f32)> = self
+        let per_prefix: Vec<(Provenance, f32)> = self
             .prefix_rtt
             .iter()
             .filter_map(|(prefix, stats)| {
