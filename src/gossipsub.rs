@@ -2143,17 +2143,94 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         self.message_cache_bytes = self.message_cache_bytes.saturating_add(message_size);
     }
 
+    /// Handle incoming SUBSCRIBE from a peer.
+    /// 
+    /// GossipSub v1.1 Enhancement: Eagerly GRAFT known-good peers when mesh is
+    /// under-populated. This accelerates mesh formation while maintaining security:
+    /// 
+    /// SECURITY: Only peers with positive score (proven track record) are eligible
+    /// for eager GRAFT. Fresh/unknown peers are added as lazy and must prove
+    /// themselves through successful message delivery before promotion.
     async fn handle_subscribe(&mut self, from: &Identity, topic: &str) {
         if !self.subscriptions.contains(topic) {
             return;
         }
 
-        if let Some(state) = self.topics.get_mut(topic) {
-            state.add_peer_with_limits(*from, self.config.mesh_n, self.config.gossip_lazy);
-            trace!(
+        // Get peer score before mutable borrow of topics
+        // SECURITY: Score > 0 required for eager GRAFT (Sybil resistance)
+        let peer_score = self.get_peer_score(from);
+        
+        // Check backoff before mutable borrow
+        let in_backoff = self.is_in_backoff(from, topic);
+        
+        // Determine action and modify state in one borrow scope
+        let (should_graft, mesh_size) = {
+            let Some(state) = self.topics.get_mut(topic) else {
+                return;
+            };
+            
+            // Already tracking this peer
+            if state.contains(from) {
+                return;
+            }
+            
+            // === SECURITY CHECKS FOR EAGER GRAFT ===
+            
+            // 1. Mesh must be under-populated (below target D)
+            let mesh_under_target = state.eager_peers.len() < self.config.mesh_n;
+            
+            // 2. Respect PRUNE backoff (prevents prune→immediate-rejoin attack)
+            // 3. Peer score must be positive (prevents unknown/Sybil peers)
+            //    Fresh peers start at 0, must have prior positive interaction
+            let eligible_for_eager = mesh_under_target 
+                && !in_backoff 
+                && peer_score > 0.0;
+            
+            // 4. SECURITY: D_out enforcement - ensure minimum outbound peers before
+            //    accepting more inbound. Prevents eclipse attacks.
+            let outbound_count = state.outbound_mesh_count();
+            let inbound_mesh = state.eager_peers.len().saturating_sub(outbound_count);
+            let max_inbound = self.config.mesh_n.saturating_sub(self.config.mesh_outbound_min);
+            let inbound_quota_available = inbound_mesh < max_inbound 
+                || outbound_count >= self.config.mesh_outbound_min;
+            
+            if eligible_for_eager && inbound_quota_available {
+                // === EAGER GRAFT: Known-good peer, mesh needs members ===
+                state.eager_peers.insert(*from);
+                // Note: NOT marking as outbound (they initiated, not us)
+                (true, state.eager_peers.len())
+            } else {
+                // === LAZY ADD: New/unknown peer or mesh is full ===
+                state.add_peer_with_limits(*from, self.config.mesh_n, self.config.gossip_lazy);
+                
+                trace!(
+                    peer = %hex::encode(&from.as_bytes()[..8]),
+                    topic = %topic,
+                    score = %format!("{:.2}", peer_score),
+                    mesh_full = !mesh_under_target,
+                    in_backoff = in_backoff,
+                    "peer subscribed, added as lazy"
+                );
+                (false, 0)
+            }
+        };
+        
+        // Perform async operations outside the borrow scope
+        if should_graft {
+            // Queue GRAFT message
+            self.queue_message(from, GossipSubRequest::Graft {
+                topic: topic.to_string(),
+            }).await;
+            
+            // Record mesh join for peer scoring (P1: time in mesh)
+            self.score_mesh_joined(from, topic);
+            
+            debug!(
                 peer = %hex::encode(&from.as_bytes()[..8]),
                 topic = %topic,
-                "peer subscribed, added to topic"
+                score = %format!("{:.2}", peer_score),
+                mesh_size = mesh_size,
+                "eagerly grafted subscribing peer (positive score)"
             );
         }
     }
