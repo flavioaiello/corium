@@ -280,8 +280,19 @@ pub const DEFAULT_MESH_N_HIGH: usize = 12;
 /// SECURITY: Prevents eclipse attacks by requiring outbound connections.
 pub const DEFAULT_MESH_OUTBOUND_MIN: usize = 2;
 
+/// D_score - Minimum high-scoring peers in mesh (GossipSub v1.1 Adaptive Gossip).
+/// SECURITY: Ensures mesh contains quality peers, not just quantity.
+pub const DEFAULT_MESH_D_SCORE: usize = 4;
+
 /// D_lazy - Number of peers to gossip IHAVE to during heartbeat.
 pub const DEFAULT_GOSSIP_LAZY: usize = 6;
+
+/// Opportunistic grafting threshold (GossipSub v1.1).
+/// If median mesh peer score falls below this, graft high-scoring lazy peers.
+pub const DEFAULT_OPPORTUNISTIC_GRAFT_THRESHOLD: f64 = 1.0;
+
+/// Number of peers to opportunistically graft per heartbeat.
+pub const DEFAULT_OPPORTUNISTIC_GRAFT_PEERS: usize = 2;
 
 /// Default PRUNE backoff duration in seconds.
 pub const DEFAULT_PRUNE_BACKOFF_SECS: u64 = 60;
@@ -305,10 +316,17 @@ pub struct GossipSubConfig {
     pub mesh_n_high: usize,
     /// D_out - Minimum outbound peers in mesh.
     pub mesh_outbound_min: usize,
+    /// D_score - Minimum high-scoring peers in mesh (Adaptive Gossip).
+    pub mesh_d_score: usize,
     /// D_lazy - Number of peers to gossip IHAVE to.
     pub gossip_lazy: usize,
     /// PRUNE backoff duration before re-grafting.
     pub prune_backoff: Duration,
+    /// Opportunistic grafting threshold. If median mesh score falls below this,
+    /// proactively graft high-scoring lazy peers to improve mesh quality.
+    pub opportunistic_graft_threshold: f64,
+    /// Number of peers to opportunistically graft per heartbeat.
+    pub opportunistic_graft_peers: usize,
     
     // ========================================================================
     // Peer Scoring Configuration (GossipSub v1.1)
@@ -364,8 +382,11 @@ impl Default for GossipSubConfig {
             mesh_n_low: DEFAULT_MESH_N_LOW,
             mesh_n_high: DEFAULT_MESH_N_HIGH,
             mesh_outbound_min: DEFAULT_MESH_OUTBOUND_MIN,
+            mesh_d_score: DEFAULT_MESH_D_SCORE,
             gossip_lazy: DEFAULT_GOSSIP_LAZY,
             prune_backoff: Duration::from_secs(DEFAULT_PRUNE_BACKOFF_SECS),
+            opportunistic_graft_threshold: DEFAULT_OPPORTUNISTIC_GRAFT_THRESHOLD,
+            opportunistic_graft_peers: DEFAULT_OPPORTUNISTIC_GRAFT_PEERS,
             
             // Peer scoring thresholds (scoring is always enabled for security)
             graylist_threshold: DEFAULT_GRAYLIST_THRESHOLD,
@@ -533,11 +554,11 @@ impl IpColocationTracker {
     
     /// Unregister a peer, decrementing their prefix's colocation count.
     fn unregister_peer(&mut self, peer: &Identity) {
-        if let Some(prefix) = self.peer_prefixes.pop(peer) {
-            if let Some(count) = self.prefix_counts.get_mut(&prefix) {
-                *count = count.saturating_sub(1);
-                // Don't remove zero entries - LRU will handle cleanup
-            }
+        if let Some(prefix) = self.peer_prefixes.pop(peer)
+            && let Some(count) = self.prefix_counts.get_mut(&prefix)
+        {
+            *count = count.saturating_sub(1);
+            // Don't remove zero entries - LRU will handle cleanup
         }
     }
     
@@ -1628,20 +1649,6 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
     }
 
-    /// Register a peer's IP prefix for P6 colocation scoring.
-    /// Call this when a peer connection is established.
-    #[allow(dead_code)] // Available for direct connection handling
-    fn register_peer_ip(&mut self, peer: &Identity, provenance: Provenance) {
-        self.ip_colocation.register_peer(peer, provenance);
-    }
-
-    /// Unregister a peer from IP colocation tracking.
-    /// Call this when a peer disconnects.
-    #[allow(dead_code)] // Available for connection cleanup
-    fn unregister_peer_ip(&mut self, peer: &Identity) {
-        self.ip_colocation.unregister_peer(peer);
-    }
-
     /// Check if a peer is below the graylist threshold.
     /// Peers below this threshold should have their messages rejected.
     fn is_peer_graylisted(&mut self, peer: &Identity) -> bool {
@@ -2031,24 +2038,43 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             signature,
         };
 
-        let eager_peers: Vec<Identity> = self.topics.get(topic)
-            .map(|s| s.eager_peers.iter().copied().collect())
+        // GossipSub v1.1 Flood Publishing: Send to ALL peers above publish_threshold,
+        // not just mesh peers. This improves reliability in volatile networks.
+        // 
+        // Collect mesh peers (eager) and non-mesh peers (lazy) separately
+        let (eager_peers, lazy_peers): (Vec<Identity>, Vec<Identity>) = self.topics.get(topic)
+            .map(|s| (
+                s.eager_peers.iter().copied().collect(),
+                s.lazy_peers.iter().copied().collect()
+            ))
             .unwrap_or_default();
 
-        let eager_count = eager_peers.len();
-        for peer in eager_peers {
-            self.queue_message(&peer, publish_msg.clone()).await;
+        let mut flood_count = 0usize;
+        
+        // Always send to mesh peers (eager)
+        for peer in &eager_peers {
+            self.queue_message(peer, publish_msg.clone()).await;
+            flood_count += 1;
+        }
+        
+        // Flood Publishing: Also send to non-mesh peers above publish_threshold
+        for peer in lazy_peers {
+            if !self.is_peer_below_publish_threshold(&peer) {
+                self.queue_message(&peer, publish_msg.clone()).await;
+                flood_count += 1;
+            }
         }
 
         // NOTE: We do NOT deliver to local subscriber here.
         // GossipSub semantics: publishers do not receive their own messages.
-        // The message is only forwarded to eager peers for network delivery.
+        // The message is forwarded to mesh peers + flood peers for network delivery.
 
         debug!(
             topic = %topic,
             msg_id = %hex::encode(&msg_id[..8]),
-            eager_peers = eager_count,
-            "published message (GossipSub)"
+            mesh_peers = eager_peers.len(),
+            flood_total = flood_count,
+            "published message with flood publishing (GossipSub v1.1)"
         );
 
         Ok(msg_id)
@@ -2997,6 +3023,161 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                     mesh_size = mesh_count - peers_to_prune.len(),
                     outbound_remaining = current_outbound,
                     "mesh maintenance: removed excess peers via PRUNE (D_out protected)"
+                );
+            }
+        }
+        
+        // GossipSub v1.1 Adaptive Gossip: D_score and Opportunistic Grafting
+        self.adaptive_gossip_maintenance(topic).await;
+    }
+
+    /// GossipSub v1.1 Adaptive Gossip maintenance.
+    /// 
+    /// Two mechanisms to improve mesh quality:
+    /// 1. **D_score Enforcement**: Ensure minimum number of high-scoring peers in mesh
+    /// 2. **Opportunistic Grafting**: If median mesh score is below threshold, graft
+    ///    high-scoring lazy peers to improve overall mesh quality
+    /// 
+    /// SECURITY: These mechanisms defend against "cold boot" attacks where an attacker
+    /// fills the mesh with mediocre but not-yet-graylisted peers.
+    async fn adaptive_gossip_maintenance(&mut self, topic: &str) {
+        // Collect mesh peer identities first (avoids borrow conflict with get_peer_score)
+        let mesh_peers: Vec<Identity> = self.topics.get(topic)
+            .map(|state| state.eager_peers.iter().copied().collect())
+            .unwrap_or_default();
+        
+        if mesh_peers.is_empty() {
+            return;
+        }
+        
+        // Now compute scores (requires mutable self borrow for LRU)
+        let mesh_peer_scores: Vec<(Identity, f64)> = mesh_peers.iter()
+            .map(|p| (*p, self.get_peer_score(p)))
+            .collect();
+        
+        // Count high-scoring peers (score >= 0 is considered "good")
+        let high_score_threshold = 0.0;
+        let high_scoring_count = mesh_peer_scores.iter()
+            .filter(|(_, score)| *score >= high_score_threshold)
+            .count();
+        
+        // Calculate median score
+        let median_score = {
+            let mut scores: Vec<f64> = mesh_peer_scores.iter().map(|(_, s)| *s).collect();
+            scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mid = scores.len() / 2;
+            if scores.len().is_multiple_of(2) && scores.len() >= 2 {
+                (scores[mid - 1] + scores[mid]) / 2.0
+            } else {
+                scores[mid]
+            }
+        };
+        
+        // Collect lazy peer identities first (avoids borrow conflict)
+        let lazy_peers: Vec<Identity> = self.topics.get(topic)
+            .map(|state| state.lazy_peers.iter().copied().collect())
+            .unwrap_or_default();
+        
+        // Now compute scores for lazy peers
+        let lazy_peer_scores: Vec<(Identity, f64)> = lazy_peers.iter()
+            .map(|p| (*p, self.get_peer_score(p)))
+            .collect();
+        
+        // Sort lazy peers by score descending (highest first)
+        let mut sorted_lazy: Vec<(Identity, f64)> = lazy_peer_scores.into_iter()
+            .filter(|(p, score)| {
+                *score >= high_score_threshold && !self.is_in_backoff(p, topic)
+            })
+            .collect();
+        sorted_lazy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let mut grafted = 0usize;
+        
+        // 1. D_score enforcement: Ensure minimum high-scoring peers
+        if high_scoring_count < self.config.mesh_d_score && !sorted_lazy.is_empty() {
+            let needed = self.config.mesh_d_score.saturating_sub(high_scoring_count);
+            
+            for (peer, score) in sorted_lazy.iter().take(needed) {
+                // Send GRAFT
+                self.queue_message(peer, GossipSubRequest::Graft {
+                    topic: topic.to_string(),
+                }).await;
+                
+                // Move to mesh
+                if let Some(state) = self.topics.get_mut(topic)
+                    && state.lazy_peers.remove(peer)
+                {
+                    state.eager_peers.insert(*peer);
+                    state.mark_outbound(*peer);
+                    self.score_mesh_joined(peer, topic);
+                    grafted += 1;
+                    
+                    trace!(
+                        peer = %hex::encode(&peer.as_bytes()[..8]),
+                        topic = %topic,
+                        score = score,
+                        "D_score enforcement: grafted high-scoring peer"
+                    );
+                }
+            }
+            
+            if grafted > 0 {
+                debug!(
+                    topic = %topic,
+                    grafted = grafted,
+                    high_scoring_before = high_scoring_count,
+                    d_score = self.config.mesh_d_score,
+                    "D_score enforcement: grafted high-scoring peers"
+                );
+            }
+        }
+        
+        // 2. Opportunistic Grafting: If median score is below threshold
+        if median_score < self.config.opportunistic_graft_threshold {
+            // Find high-scoring lazy peers we haven't already grafted
+            let already_grafted: HashSet<Identity> = sorted_lazy.iter()
+                .take(grafted)
+                .map(|(p, _)| *p)
+                .collect();
+            
+            let candidates: Vec<(Identity, f64)> = sorted_lazy.into_iter()
+                .filter(|(p, _)| !already_grafted.contains(p))
+                .take(self.config.opportunistic_graft_peers)
+                .collect();
+            
+            let mut opportunistic_grafted = 0usize;
+            
+            for (peer, score) in candidates {
+                // Send GRAFT
+                self.queue_message(&peer, GossipSubRequest::Graft {
+                    topic: topic.to_string(),
+                }).await;
+                
+                // Move to mesh
+                if let Some(state) = self.topics.get_mut(topic)
+                    && state.lazy_peers.remove(&peer)
+                {
+                    state.eager_peers.insert(peer);
+                    state.mark_outbound(peer);
+                    self.score_mesh_joined(&peer, topic);
+                    opportunistic_grafted += 1;
+                    
+                    trace!(
+                        peer = %hex::encode(&peer.as_bytes()[..8]),
+                        topic = %topic,
+                        score = score,
+                        "opportunistic graft: added high-scoring peer to improve mesh quality"
+                    );
+                }
+            }
+            
+            if opportunistic_grafted > 0 {
+                debug!(
+                    topic = %topic,
+                    opportunistic_grafted = opportunistic_grafted,
+                    median_score = median_score,
+                    threshold = self.config.opportunistic_graft_threshold,
+                    "opportunistic grafting: improved mesh quality"
                 );
             }
         }

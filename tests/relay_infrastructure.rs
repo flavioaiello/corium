@@ -185,10 +185,7 @@ async fn three_node_with_relay_bootstrap() {
 async fn relay_telemetry_visibility() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Do some DHT operations
-    let _ = node.put(b"test-data".to_vec()).await;
-    
-    // Check telemetry
+    // Check telemetry is accessible
     let telemetry = node.telemetry().await;
     
     // Telemetry should be accessible

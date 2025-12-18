@@ -126,54 +126,14 @@ async fn node_relay_capability() {
 }
 
 #[tokio::test]
-async fn node_dht_put_get() {
-    let node = Node::bind(&test_addr()).await.expect("bind failed");
-    
-    let value = b"test-value-12345".to_vec();
-    
-    // Put returns the content-addressed key
-    let key = node.put(value.clone()).await.expect("put failed");
-    
-    // Key is [u8; 32] (blake3 hash)
-    assert_eq!(key.len(), 32, "key should be 32 bytes");
-    
-    // Get should return the value (from local store)
-    let retrieved = node.get(&key).await.expect("get failed");
-    assert_eq!(retrieved, Some(value));
-}
-
-#[tokio::test]
-async fn node_dht_put_at_get() {
-    let node = Node::bind(&test_addr()).await.expect("bind failed");
-    
-    let value = b"test-value-for-put-at".to_vec();
-    
-    // First put to get the content-addressed key
-    let key = node.put(value.clone()).await.expect("put failed");
-    
-    // Verify the key is 32 bytes (blake3 hash)
-    assert_eq!(key.len(), 32);
-    
-    // put_at with the SAME value at the SAME key should succeed
-    // (this is used for replication to specific nodes)
-    node.put_at(key, value.clone()).await.expect("put_at failed");
-    
-    // Get should return the value
-    let retrieved = node.get(&key).await.expect("get failed");
-    assert_eq!(retrieved, Some(value));
-}
-
-#[tokio::test]
 async fn node_telemetry() {
     let node = Node::bind(&test_addr()).await.expect("bind failed");
     
-    // Do some operations
-    let _ = node.put(b"telemetry-test".to_vec()).await;
-    
     let telemetry = node.telemetry().await;
     
-    // Telemetry should have reasonable values
-    assert!(telemetry.stored_keys >= 1, "should have at least 1 stored key");
+    // Telemetry should be accessible
+    let _ = telemetry.stored_keys;
+    let _ = telemetry.pressure;
 }
 
 #[tokio::test]
@@ -255,49 +215,6 @@ async fn two_node_connect() {
     
     // Connection should be open
     assert!(conn.close_reason().is_none(), "connection should be open");
-}
-
-#[tokio::test]
-async fn two_node_dht_replication() {
-    let start = std::time::Instant::now();
-    eprintln!("[{:>6.2}s] Starting two_node_dht_replication", start.elapsed().as_secs_f64());
-    
-    let node1 = Node::bind(&test_addr()).await.expect("node1 bind failed");
-    eprintln!("[{:>6.2}s] node1 bound", start.elapsed().as_secs_f64());
-    
-    let node2 = Node::bind(&test_addr()).await.expect("node2 bind failed");
-    eprintln!("[{:>6.2}s] node2 bound", start.elapsed().as_secs_f64());
-    
-    let node1_id = node1.identity();
-    let node1_addr = node1.local_addr().unwrap().to_string();
-    
-    // Bootstrap
-    eprintln!("[{:>6.2}s] starting bootstrap", start.elapsed().as_secs_f64());
-    node2.bootstrap(&node1_id, &node1_addr).await.expect("bootstrap failed");
-    eprintln!("[{:>6.2}s] bootstrap complete", start.elapsed().as_secs_f64());
-    
-    // Store value on node1
-    let value = b"replicated-value".to_vec();
-    eprintln!("[{:>6.2}s] starting put", start.elapsed().as_secs_f64());
-    let key = node1.put(value.clone()).await.expect("put failed");
-    eprintln!("[{:>6.2}s] put complete", start.elapsed().as_secs_f64());
-    
-    // Give time for gossip
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // Verify node1 can still retrieve its own value
-    eprintln!("[{:>6.2}s] starting get from node1", start.elapsed().as_secs_f64());
-    let retrieved = node1.get(&key).await.expect("get from origin failed");
-    eprintln!("[{:>6.2}s] get from node1 complete", start.elapsed().as_secs_f64());
-    assert_eq!(retrieved, Some(value.clone()));
-    
-    // Node2 should be able to look up the value (may or may not find it depending on replication)
-    // We don't assert the result since replication may not be instant
-    eprintln!("[{:>6.2}s] starting get from node2", start.elapsed().as_secs_f64());
-    let _ = node2.get(&key).await;
-    eprintln!("[{:>6.2}s] get from node2 complete", start.elapsed().as_secs_f64());
-    
-    eprintln!("[{:>6.2}s] test logic done, dropping nodes", start.elapsed().as_secs_f64());
 }
 
 #[tokio::test]

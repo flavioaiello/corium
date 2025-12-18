@@ -43,7 +43,6 @@ use tracing::{debug, info, warn};
 
 use crate::crypto::{generate_ed25519_cert, create_server_config, create_client_config};
 use crate::dht::{DhtNode, TelemetrySnapshot, DEFAULT_ALPHA, DEFAULT_K};
-use crate::dht::Key;
 use crate::identity::{Contact, Keypair};
 use crate::messages::{Message, RelayResponse};
 use crate::gossipsub::{GossipSub, GossipSubConfig, ReceivedMessage, RelaySignal};
@@ -445,19 +444,6 @@ impl Node {
         self.smartsock.relay()
     }
 
-    
-    pub async fn put(&self, value: Vec<u8>) -> Result<Key> {
-        self.dhtnode.put(value).await
-    }
-    
-    pub async fn put_at(&self, key: Key, value: Vec<u8>) -> Result<()> {
-        self.dhtnode.put_at(key, value).await
-    }
-    
-    pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>> {
-        self.dhtnode.get(key).await
-    }
-    
     pub async fn publish_address(&self, addresses: Vec<String>) -> Result<()> {
         // Warn if any address is unroutable (0.0.0.0 or ::)
         for addr in &addresses {

@@ -124,12 +124,6 @@ impl Provenance {
         
         host.parse::<IpAddr>().ok().map(Self::from_ip)
     }
-    
-    /// Get the raw prefix value (for debugging/testing).
-    #[cfg(test)]
-    pub fn value(&self) -> u16 {
-        self.0
-    }
 }
 
 // ============================================================================
