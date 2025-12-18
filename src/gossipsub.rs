@@ -64,6 +64,8 @@ use crate::rpc::RpcNode;
 /// 
 /// This is used for mesh-mediated signaling: relays can send connection
 /// notifications through mesh connections instead of dedicated signaling streams.
+/// 
+/// SECURITY: Signals are cryptographically signed by from_peer to prevent forgery.
 #[derive(Debug, Clone)]
 pub struct RelaySignal {
     /// The peer requesting connection (initiator).
@@ -73,6 +75,14 @@ pub struct RelaySignal {
     /// Address to send relay data packets to.
     pub relay_data_addr: String,
 }
+
+/// Domain separation prefix for RelaySignal signatures.
+/// SECURITY: Prevents cross-protocol signature replay attacks.
+pub const RELAY_SIGNAL_SIGNATURE_DOMAIN: &[u8] = b"corium-relay-signal-v1:";
+
+/// Maximum number of peers to retry when IWant times out.
+/// SECURITY: Bounds the tried_peers vector to prevent memory exhaustion.
+const MAX_IWANT_RETRY_PEERS: usize = 10;
 
 // ============================================================================
 // Configuration Constants
@@ -273,7 +283,6 @@ pub const DEFAULT_PRUNE_BACKOFF_SECS: u64 = 60;
 /// Some fields may not be read internally but are exposed for library users
 /// to configure when building custom implementations.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Config fields are public API for library users
 pub struct GossipSubConfig {
     // ========================================================================
     // GossipSub v1.1 Mesh Parameters
@@ -380,7 +389,6 @@ impl Default for GossipSubConfig {
 /// Some fields may not be read internally but are exposed for library users
 /// to configure custom scoring policies.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Config fields are public API for library users
 pub struct TopicScoreParams {
     /// Weight of this topic in overall peer score.
     pub topic_weight: f64,
@@ -521,13 +529,29 @@ impl TopicScore {
 }
 
 /// Complete peer score state per GossipSub v1.1 spec.
+/// 
+/// ## Implementation Status
+/// 
+/// | Component | Status | Notes |
+/// |-----------|--------|-------|
+/// | P1-P4 | ✅ Implemented | Topic-specific scoring |
+/// | P5 | ✅ Implemented | Application-specific score |
+/// | P6 | ⚠️ **NOT IMPLEMENTED** | IP colocation factor is always 0.0 |
+/// | P7 | ✅ Implemented | Behavioural penalty |
+/// 
+/// **Known Limitation (P6):** IP colocation scoring is not implemented.
+/// This means multiple Sybil identities from the same IP address receive
+/// the same score as distributed identities. Implementing P6 requires
+/// tracking peer IP addresses, which adds complexity and privacy concerns.
+/// The S/Kademlia PoW requirement provides Sybil resistance at the DHT layer.
 #[derive(Debug, Clone)]
 struct PeerScore {
     /// Per-topic score components.
     topic_scores: HashMap<String, TopicScore>,
     /// P5: Application-specific score (set externally).
     app_specific_score: f64,
-    /// P6: IP colocation factor (simplified: count of peers with same IP).
+    /// P6: IP colocation factor.
+    /// **NOT IMPLEMENTED**: Always 0.0. See struct-level docs for rationale.
     ip_colocation_factor: f64,
     /// P7: Behavioural penalty counter.
     behaviour_penalty: f64,
@@ -698,6 +722,51 @@ fn verify_gossipsub_signature(
 }
 
 
+// ============================================================================
+// RelaySignal Signing (mesh-mediated signaling)
+// ============================================================================
+
+/// Build the payload that gets signed for a RelaySignal message.
+/// 
+/// Format: target(32) || session_id(16) || relay_data_addr_len(4) || relay_data_addr
+/// 
+/// SECURITY: This binds the signal to the target peer and session, preventing
+/// an attacker from replaying signals to different targets or sessions.
+fn build_relay_signal_signed_payload(
+    target: &Identity,
+    session_id: &[u8; 16],
+    relay_data_addr: &str,
+) -> Vec<u8> {
+    let addr_bytes = relay_data_addr.as_bytes();
+    let mut payload = Vec::with_capacity(32 + 16 + 4 + addr_bytes.len());
+    
+    // Target identity (binds signal to specific recipient)
+    payload.extend_from_slice(target.as_bytes());
+    
+    // Session ID
+    payload.extend_from_slice(session_id);
+    
+    // Relay data address (length-prefixed)
+    payload.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(addr_bytes);
+    
+    payload
+}
+
+/// Sign a RelaySignal for mesh-mediated signaling.
+/// 
+/// Uses domain separation to prevent cross-protocol signature replay.
+fn sign_relay_signal(
+    keypair: &Keypair,
+    target: &Identity,
+    session_id: &[u8; 16],
+    relay_data_addr: &str,
+) -> Vec<u8> {
+    let payload = build_relay_signal_signed_payload(target, session_id, relay_data_addr);
+    crate::crypto::sign_with_domain(keypair, RELAY_SIGNAL_SIGNATURE_DOMAIN, &payload)
+}
+
+
 const MAX_PENDING_IWANTS: usize = 100;
 
 /// Global limit on pending IWants across all topics to prevent memory exhaustion.
@@ -805,6 +874,39 @@ impl CachedMessage {
     }
 }
 
+/// State for pending IWant requests with bounded retry tracking.
+/// SECURITY: tried_peers is bounded by MAX_IWANT_RETRY_PEERS to prevent memory exhaustion.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingIWant {
+    pub requested_at: Instant,
+    /// Peers we've tried requesting from. Bounded by MAX_IWANT_RETRY_PEERS.
+    pub tried_peers: Vec<Identity>,
+}
+
+impl PendingIWant {
+    pub fn new(peer: Identity) -> Self {
+        Self {
+            requested_at: Instant::now(),
+            tried_peers: vec![peer],
+        }
+    }
+    
+    /// Add a peer to tried list if not at capacity.
+    /// Returns true if added, false if at MAX_IWANT_RETRY_PEERS limit.
+    pub fn add_tried_peer(&mut self, peer: Identity) -> bool {
+        if self.tried_peers.len() >= MAX_IWANT_RETRY_PEERS {
+            return false;
+        }
+        self.tried_peers.push(peer);
+        true
+    }
+    
+    /// Reset the request timestamp for retry.
+    pub fn reset_timestamp(&mut self) {
+        self.requested_at = Instant::now();
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TopicState {
     pub eager_peers: HashSet<Identity>,
@@ -814,10 +916,9 @@ pub(crate) struct TopicState {
     pub outbound_peers: HashSet<Identity>,
     pub recent_messages: VecDeque<MessageId>,
     /// Pending IWant requests awaiting message delivery.
-    /// SECURITY: Bounded by MAX_PENDING_IWANTS (100) per topic and
-    /// MAX_GLOBAL_PENDING_IWANTS (1000) globally. Uses HashMap instead of
-    /// LruCache because we need iter_mut() for timeout checking.
-    pub pending_iwants: HashMap<MessageId, (Instant, Vec<Identity>)>,
+    /// SECURITY: Bounded by MAX_PENDING_IWANTS (100) per topic.
+    /// Uses LruCache for O(1) eviction when at capacity.
+    pub pending_iwants: LruCache<MessageId, PendingIWant>,
     pub last_lazy_push: Instant,
 }
 
@@ -828,7 +929,9 @@ impl Default for TopicState {
             lazy_peers: HashSet::new(),
             outbound_peers: HashSet::new(),
             recent_messages: VecDeque::new(),
-            pending_iwants: HashMap::new(),
+            pending_iwants: LruCache::new(
+                NonZeroUsize::new(MAX_PENDING_IWANTS).expect("MAX_PENDING_IWANTS must be > 0")
+            ),
             last_lazy_push: Instant::now(),
         }
     }
@@ -932,27 +1035,22 @@ impl TopicState {
     }
 
     /// Record a pending IWant for a message. Returns the delta to apply to the global count:
-    /// +1 if a new entry was added, 0 if updated existing, -1 if an old entry was evicted.
+    /// +1 if a new entry was added, 0 if already exists.
+    /// SECURITY: LruCache automatically evicts oldest entry when at MAX_PENDING_IWANTS capacity.
     pub fn record_iwant(&mut self, msg_id: MessageId, peer: Identity) -> i32 {
-        let mut delta = 0i32;
-        
         // If entry already exists, just return 0 (no change to global count)
-        if self.pending_iwants.contains_key(&msg_id) {
+        if self.pending_iwants.contains(&msg_id) {
             return 0;
         }
         
-        if self.pending_iwants.len() >= MAX_PENDING_IWANTS
-            && let Some(oldest) = self.pending_iwants
-                .iter()
-                .min_by_key(|(_, (t, _))| *t)
-                .map(|(id, _)| *id)
-        {
-            self.pending_iwants.remove(&oldest);
-            delta -= 1; // Evicted one
-        }
-        self.pending_iwants.insert(msg_id, (Instant::now(), vec![peer]));
-        delta += 1; // Added one
-        delta
+        // Check if we're at capacity - LruCache will evict, but we need to track for global count
+        let will_evict = self.pending_iwants.len() >= MAX_PENDING_IWANTS;
+        
+        // LruCache::put automatically evicts LRU entry when at capacity
+        self.pending_iwants.put(msg_id, PendingIWant::new(peer));
+        
+        // Return delta: +1 for new entry, but if we evicted, net is 0
+        if will_evict { 0 } else { 1 }
     }
 
     /// Check for timed out IWant requests and retry with different peers.
@@ -963,24 +1061,40 @@ impl TopicState {
         let mut retries = Vec::new();
         let mut completed = Vec::new();
 
-        for (msg_id, (requested_at, tried_peers)) in self.pending_iwants.iter_mut() {
-            if now.duration_since(*requested_at) > ihave_timeout {
+        // Collect data first to avoid borrow conflicts with LruCache
+        let entries: Vec<(MessageId, Instant, Vec<Identity>)> = self.pending_iwants
+            .iter()
+            .map(|(id, pending)| (*id, pending.requested_at, pending.tried_peers.clone()))
+            .collect();
+
+        for (msg_id, requested_at, tried_peers) in entries {
+            if now.duration_since(requested_at) > ihave_timeout {
+                // Find a lazy peer we haven't tried yet
                 if let Some(next_peer) = self.lazy_peers.iter()
                     .find(|p| !tried_peers.contains(p))
                     .copied()
                 {
-                    tried_peers.push(next_peer);
-                    *requested_at = now;
-                    retries.push((*msg_id, next_peer));
+                    // Update the pending entry
+                    if let Some(pending) = self.pending_iwants.get_mut(&msg_id) {
+                        // SECURITY: Bounded by MAX_IWANT_RETRY_PEERS
+                        if pending.add_tried_peer(next_peer) {
+                            pending.reset_timestamp();
+                            retries.push((msg_id, next_peer));
+                        } else {
+                            // Exhausted retry limit
+                            completed.push(msg_id);
+                        }
+                    }
                 } else {
-                    completed.push(*msg_id);
+                    // No more peers to try
+                    completed.push(msg_id);
                 }
             }
         }
 
         let completed_count = completed.len();
         for msg_id in completed {
-            self.pending_iwants.remove(&msg_id);
+            self.pending_iwants.pop(&msg_id);
         }
 
         (retries, completed_count)
@@ -988,7 +1102,7 @@ impl TopicState {
 
     /// Remove a pending IWant when message is received. Returns true if an entry was removed.
     pub fn message_received(&mut self, msg_id: &MessageId) -> bool {
-        self.pending_iwants.remove(msg_id).is_some()
+        self.pending_iwants.pop(msg_id).is_some()
     }
 }
 
@@ -1661,7 +1775,12 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 .find(|(_, s)| s.eager_peers.is_empty() && s.lazy_peers.is_empty())
                 .map(|(t, _)| t.clone());
             if let Some(t) = empty {
-                self.topics.remove(&t);
+                // SECURITY: Subtract pending IWants before dropping TopicState to prevent
+                // global_pending_iwants from drifting.
+                if let Some(evicted_state) = self.topics.remove(&t) {
+                    self.global_pending_iwants = self.global_pending_iwants
+                        .saturating_sub(evicted_state.pending_iwants.len());
+                }
                 debug!(evicted_topic = %t, new_topic = %topic, "evicted empty topic to make room");
             } else {
                 self.subscriptions.remove(topic);
@@ -1707,6 +1826,11 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         }
 
         let all_peers: Vec<Identity> = if let Some(state) = self.topics.remove(topic) {
+            // SECURITY: Subtract pending IWants before dropping TopicState to prevent
+            // global_pending_iwants from drifting (counter would stay elevated otherwise).
+            self.global_pending_iwants = self.global_pending_iwants
+                .saturating_sub(state.pending_iwants.len());
+            
             state.eager_peers.into_iter()
                 .chain(state.lazy_peers.into_iter())
                 .collect()
@@ -1837,8 +1961,8 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             GossipSubRequest::IDontWant { msg_ids } => {
                 self.handle_idontwant(from, msg_ids);
             }
-            GossipSubRequest::RelaySignal { target, from_peer, session_id, relay_data_addr } => {
-                self.handle_relay_signal(from, target, from_peer, session_id, relay_data_addr).await;
+            GossipSubRequest::RelaySignal { target, from_peer, session_id, relay_data_addr, signature } => {
+                self.handle_relay_signal(from, target, from_peer, session_id, relay_data_addr, signature).await;
             }
         }
         Ok(())
@@ -2362,8 +2486,10 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     /// This allows relay signals to be forwarded through the GossipSub mesh
     /// instead of requiring a dedicated signaling connection to the relay.
     /// 
-    /// Security: Only forwards to relay_signal_tx if target matches our identity.
-    /// The sender must be a mesh peer to prevent amplification attacks.
+    /// # Security
+    /// - Only forwards to relay_signal_tx if target matches our identity
+    /// - Verifies the cryptographic signature from from_peer to prevent forgery
+    /// - The sender must be a mesh peer to prevent amplification attacks
     async fn handle_relay_signal(
         &mut self,
         from: &Identity,
@@ -2371,6 +2497,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         from_peer: Identity,
         session_id: [u8; 16],
         relay_data_addr: String,
+        signature: Vec<u8>,
     ) {
         // Only process signals intended for us
         if target != self.local_identity {
@@ -2392,6 +2519,24 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
             return;
         }
 
+        // SECURITY: Verify the signature from from_peer to prevent forgery.
+        // This ensures the signal genuinely came from the claimed initiator,
+        // not a malicious mesh peer spoofing the from_peer identity.
+        let payload = build_relay_signal_signed_payload(&target, &session_id, &relay_data_addr);
+        if let Err(e) = crate::crypto::verify_with_domain(
+            &from_peer,
+            RELAY_SIGNAL_SIGNATURE_DOMAIN,
+            &payload,
+            &signature,
+        ) {
+            warn!(
+                from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
+                error = ?e,
+                "rejecting relay signal with invalid signature"
+            );
+            return;
+        }
+
         // Forward to relay client via channel
         if let Some(ref tx) = self.relay_signal_tx {
             let signal = RelaySignal {
@@ -2405,7 +2550,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
                 debug!(
                     from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
                     session_id = %hex::encode(&session_id[..8]),
-                    "forwarded relay signal to relay client"
+                    "forwarded relay signal to relay client (signature verified)"
                 );
             }
         } else {
@@ -2421,6 +2566,7 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
     /// # Security
     /// - Only sends to known mesh peers or peers we have contact info for
     /// - No gossip flooding - direct unicast to target or mesh neighbors
+    /// - Messages are signed by the sender for authentication
     async fn send_relay_signal_internal(
         &mut self,
         target: Identity,
@@ -2428,11 +2574,15 @@ impl<N: GossipSubRpc + Send + Sync + 'static> GossipSubActor<N> {
         session_id: [u8; 16],
         relay_data_addr: String,
     ) -> anyhow::Result<()> {
+        // Sign the relay signal for authentication
+        let signature = sign_relay_signal(&self.keypair, &target, &session_id, &relay_data_addr);
+        
         let msg = GossipSubRequest::RelaySignal {
             target,
             from_peer,
             session_id,
             relay_data_addr,
+            signature,
         };
         
         // Check if target is a direct mesh peer
@@ -3089,7 +3239,7 @@ mod tests {
 
         state.record_iwant(msg_id, peer1);
         assert_eq!(state.pending_iwants.len(), 1);
-        assert!(state.pending_iwants.contains_key(&msg_id));
+        assert!(state.pending_iwants.contains(&msg_id));
 
         state.message_received(&msg_id);
         assert!(state.pending_iwants.is_empty());

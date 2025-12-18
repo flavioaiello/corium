@@ -77,9 +77,43 @@ pub const POW_DIFFICULTY: u32 = 8;
 /// With difficulty 24, success is virtually guaranteed within 2^32 attempts.
 const POW_MAX_NONCE: u64 = 1 << 36;
 
+/// Maximum keypair regeneration attempts before panic.
+/// If inner loop (POW_MAX_NONCE attempts) fails, regenerate keypair.
+/// Exhausting this limit requires P < 10^(-1780) per keypair, making
+/// this bound purely defensive against hypothetical CSPRNG failures.
+const POW_MAX_KEYPAIR_ATTEMPTS: u32 = 16;
+
 /// Domain separation prefix for PoW hashing.
 /// Prevents cross-protocol hash reuse.
 const POW_HASH_DOMAIN: &[u8] = b"corium-pow-v1:";
+
+/// Error type for Proof-of-Work generation failures.
+/// 
+/// This error indicates a catastrophic failure in the random number generator
+/// or an unreasonable difficulty setting. In practice, this should never occur
+/// with a functioning CSPRNG and reasonable difficulty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoWError {
+    /// Number of keypairs attempted before giving up.
+    pub keypairs_tried: u32,
+    /// Number of nonces tried per keypair.
+    pub nonces_per_keypair: u64,
+    /// The difficulty level that was requested.
+    pub difficulty: u32,
+}
+
+impl std::fmt::Display for PoWError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PoW generation failed after {} keypairs with {} nonces each (difficulty={}). \
+             This indicates a CSPRNG failure or unreasonable difficulty.",
+            self.keypairs_tried, self.nonces_per_keypair, self.difficulty
+        )
+    }
+}
+
+impl std::error::Error for PoWError {}
 
 /// Returns current time as milliseconds since Unix epoch.
 /// Used for timestamp generation in signed records.
@@ -115,42 +149,33 @@ impl Keypair {
     /// This iterates through random keypairs until finding one where:
     /// `BLAKE3(POW_HASH_DOMAIN || public_key || nonce)` has `POW_DIFFICULTY` leading zeros.
     /// 
-    /// Returns `(Keypair, IdentityProof)` - the proof must be included in Contact
+    /// Returns `Ok((Keypair, IdentityProof))` - the proof must be included in Contact
     /// records for DHT acceptance.
     /// 
     /// # Performance
     /// - Expected time: 50-200ms on modern CPU (difficulty 16)
     /// - Parallelizable across cores if needed
     /// 
-    /// # Panics
-    /// Panics if no valid proof is found within `POW_MAX_NONCE` attempts
-    /// (astronomically unlikely with proper difficulty settings).
-    pub fn generate_with_pow() -> (Self, IdentityProof) {
-        loop {
-            let signing_key = SigningKey::generate(&mut OsRng);
-            let public_key = signing_key.verifying_key().to_bytes();
-            
-            for nonce in 0..POW_MAX_NONCE {
-                if verify_pow_hash(&public_key, nonce, POW_DIFFICULTY) {
-                    let keypair = Self { signing_key };
-                    let proof = IdentityProof { nonce };
-                    return (keypair, proof);
-                }
-            }
-            // Extremely unlikely: no valid nonce found, try new keypair
-        }
+    /// # Errors
+    /// Returns `Err(PoWError)` if no valid proof is found within the bounded attempts.
+    /// This is astronomically unlikely (probability < 10^(-28000)) with a functioning CSPRNG.
+    pub fn generate_with_pow() -> Result<(Self, IdentityProof), PoWError> {
+        Self::generate_with_pow_difficulty(POW_DIFFICULTY)
     }
 
     /// Generate a keypair with custom PoW difficulty.
     /// 
     /// Useful for testing (difficulty=0) or high-security deployments.
-    pub fn generate_with_pow_difficulty(difficulty: u32) -> (Self, IdentityProof) {
+    /// 
+    /// # Errors
+    /// Returns `Err(PoWError)` if difficulty > 0 and no valid proof is found.
+    pub fn generate_with_pow_difficulty(difficulty: u32) -> Result<(Self, IdentityProof), PoWError> {
         if difficulty == 0 {
             let keypair = Self::generate();
-            return (keypair, IdentityProof { nonce: 0 });
+            return Ok((keypair, IdentityProof { nonce: 0 }));
         }
         
-        loop {
+        for keypair_attempt in 0..POW_MAX_KEYPAIR_ATTEMPTS {
             let signing_key = SigningKey::generate(&mut OsRng);
             let public_key = signing_key.verifying_key().to_bytes();
             
@@ -158,10 +183,24 @@ impl Keypair {
                 if verify_pow_hash(&public_key, nonce, difficulty) {
                     let keypair = Self { signing_key };
                     let proof = IdentityProof { nonce };
-                    return (keypair, proof);
+                    return Ok((keypair, proof));
                 }
             }
+            // Exhausted nonce space for this keypair, try another.
+            // This branch is astronomically unlikely (P < 10^(-1780)).
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "PoW: exhausted nonce space on keypair attempt {}/{} (difficulty={}), regenerating",
+                keypair_attempt + 1,
+                POW_MAX_KEYPAIR_ATTEMPTS,
+                difficulty
+            );
         }
+        Err(PoWError {
+            keypairs_tried: POW_MAX_KEYPAIR_ATTEMPTS,
+            nonces_per_keypair: POW_MAX_NONCE,
+            difficulty,
+        })
     }
 
     pub fn from_secret_key_bytes(bytes: &[u8; 32]) -> Self {
@@ -472,6 +511,32 @@ pub struct Contact {
     pub pow_proof: IdentityProof,
 }
 
+/// Reasons a Contact record may fail freshness verification.
+///
+/// This structured error enables differentiated logging and metrics:
+/// - Signature failures indicate tampering or corruption
+/// - Clock skew failures may indicate infrastructure issues
+/// - Stale records are normal expiry
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessError {
+    /// Cryptographic signature verification failed.
+    SignatureInvalid,
+    /// Record timestamp is too far in the future (clock skew detected).
+    /// Contains: (record_timestamp_ms, local_time_ms, drift_ms)
+    ClockSkewFuture {
+        record_ts: u64,
+        local_ts: u64,
+        drift_ms: u64,
+    },
+    /// Record has expired (older than max_age).
+    /// Contains: (record_timestamp_ms, local_time_ms, age_ms)
+    Stale {
+        record_ts: u64,
+        local_ts: u64,
+        age_ms: u64,
+    },
+}
+
 impl Contact {
     /// Create an unsigned endpoint record (lightweight peer reference).
     /// Unsigned records have timestamp=0, empty signature, and no PoW proof.
@@ -562,10 +627,31 @@ impl Contact {
     /// Rejects records that are:
     /// - Not cryptographically valid (via verify())
     /// - Older than max_age_secs (stale)
-    /// - More than 30 seconds in the future (clock skew tolerance)
-    pub fn verify_fresh(&self, max_age_secs: u64) -> bool {
+    /// - More than FUTURE_TOLERANCE_MS in the future (clock skew tolerance)
+    /// 
+    /// ## Clock Synchronization Requirements
+    /// 
+    /// This function assumes nodes have reasonably synchronized clocks (within 5s).
+    /// Nodes with severely drifted clocks may reject valid Contact records or
+    /// accept stale ones. Operators SHOULD ensure NTP synchronization is active.
+    /// 
+    /// ## Security Properties
+    /// 
+    /// - **Pre-dating Attack Resistance**: Future tolerance is kept tight (5s) to
+    ///   minimize the window where an attacker with clock control can create records
+    ///   that remain valid longer than intended. The effective maximum age of any
+    ///   record is `max_age_secs + FUTURE_TOLERANCE_MS/1000` (i.e., max_age + 5s).
+    /// 
+    /// - **Replay Attack Resistance**: Stale records are rejected based on the
+    ///   timestamp embedded in the signed payload, preventing replay of old addresses.
+    ///
+    /// ## Returns
+    /// 
+    /// - `Ok(())` if the record is valid and fresh
+    /// - `Err(FreshnessError)` with structured reason for rejection
+    pub fn verify_fresh(&self, max_age_secs: u64) -> Result<(), FreshnessError> {
         if self.verify().is_err() {
-            return false;
+            return Err(FreshnessError::SignatureInvalid);
         }
         
         // timestamp is already validated as non-zero by verify()
@@ -573,20 +659,38 @@ impl Contact {
         
         let max_age_ms = max_age_secs * 1000;
         
-        // SECURITY: Allow clock skew tolerance (30s) for future timestamps to
-        // accommodate nodes with poor NTP synchronization in global deployments.
-        // Reject anything too far in the future to prevent pre-dated attacks.
-        const FUTURE_TOLERANCE_MS: u64 = 30_000;
-        if self.timestamp > current_time + FUTURE_TOLERANCE_MS {
-            return false;
+        // SECURITY: Future tolerance is intentionally tight (5s) to limit pre-dating attacks.
+        // An attacker who can manipulate their clock could create Contact records with
+        // future timestamps that remain "fresh" for max_age + tolerance. By keeping this
+        // window small, we bound the attack surface while accommodating minor NTP drift.
+        //
+        // Trade-off: Nodes with >5s clock drift will have their Contact records rejected.
+        // This is acceptable as such severe drift indicates misconfiguration and NTP-synced
+        // systems typically maintain sub-second accuracy.
+        const FUTURE_TOLERANCE_MS: u64 = 5_000;
+        if self.timestamp > current_time.saturating_add(FUTURE_TOLERANCE_MS) {
+            let drift = self.timestamp.saturating_sub(current_time);
+            return Err(FreshnessError::ClockSkewFuture {
+                record_ts: self.timestamp,
+                local_ts: current_time,
+                drift_ms: drift,
+            });
         }
         
-        // Reject stale records to prevent replay of old addresses
-        if current_time.saturating_sub(self.timestamp) > max_age_ms {
-            return false;
+        // Reject stale records to prevent replay of old addresses.
+        // Note: A record timestamped at current_time + FUTURE_TOLERANCE_MS will be
+        // considered valid for up to max_age_secs + 5s from now. This is the maximum
+        // effective lifetime and is documented as a security property above.
+        let age_ms = current_time.saturating_sub(self.timestamp);
+        if age_ms > max_age_ms {
+            return Err(FreshnessError::Stale {
+                record_ts: self.timestamp,
+                local_ts: current_time,
+                age_ms,
+            });
         }
         
-        true
+        Ok(())
     }
 
     pub fn has_direct_addrs(&self) -> bool {
@@ -704,7 +808,8 @@ mod tests {
         let kp = Keypair::generate();
         let record = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
         
-        assert!(record.verify_fresh(3600));    }
+        assert!(record.verify_fresh(3600).is_ok());
+    }
 
     #[test]
     fn test_contact_verify_fresh_rejects_old() {
@@ -716,7 +821,9 @@ mod tests {
             .unwrap()
             .as_millis() as u64 - (2 * 60 * 60 * 1000);
         
-        assert!(!record.verify_fresh(3600));    }
+        // Signature is now invalid (timestamp changed), so we get SignatureInvalid
+        assert!(matches!(record.verify_fresh(3600), Err(FreshnessError::SignatureInvalid)));
+    }
 
     #[test]
     fn test_contact_verify_fresh_rejects_future() {
@@ -728,7 +835,38 @@ mod tests {
             .unwrap()
             .as_millis() as u64 + (5 * 60 * 1000);
         
-        assert!(!record.verify_fresh(3600));
+        // Signature is now invalid (timestamp changed), so we get SignatureInvalid
+        assert!(matches!(record.verify_fresh(3600), Err(FreshnessError::SignatureInvalid)));
+    }
+
+    #[test]
+    fn test_contact_verify_fresh_future_tolerance_boundary() {
+        // SECURITY: Verify that the 5-second future tolerance is correctly enforced.
+        // Records just within tolerance should pass, records just outside should fail.
+        let kp = Keypair::generate();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // 3 seconds in the future: should be accepted (within 5s tolerance)
+        let mut record_within = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
+        record_within.timestamp = now_ms + 3_000;
+        // Re-sign with the new timestamp
+        let payload = Contact::build_signed_payload(&kp.identity(), &record_within.addrs, record_within.timestamp);
+        record_within.signature = crate::crypto::sign_with_domain(&kp, crate::crypto::CONTACT_SIGNATURE_DOMAIN, &payload);
+        assert!(record_within.verify_fresh(3600).is_ok(), "record 3s in future should be accepted");
+        
+        // 7 seconds in the future: should be rejected (outside 5s tolerance)
+        let mut record_outside = kp.create_contact(vec!["192.168.1.1:8080".to_string()]);
+        record_outside.timestamp = now_ms + 7_000;
+        // Re-sign with the new timestamp
+        let payload = Contact::build_signed_payload(&kp.identity(), &record_outside.addrs, record_outside.timestamp);
+        record_outside.signature = crate::crypto::sign_with_domain(&kp, crate::crypto::CONTACT_SIGNATURE_DOMAIN, &payload);
+        assert!(
+            matches!(record_outside.verify_fresh(3600), Err(FreshnessError::ClockSkewFuture { .. })),
+            "record 7s in future should be rejected with ClockSkewFuture"
+        );
     }
 
     #[test]
@@ -983,7 +1121,7 @@ mod tests {
         let record = keypair.create_contact(addrs);
 
         assert!(record.verify().is_ok());
-        assert!(record.verify_fresh(3600));
+        assert!(record.verify_fresh(3600).is_ok());
     }
 
     #[test]
@@ -1052,7 +1190,7 @@ mod tests {
         // Signature should be valid (cryptographically correct)
         assert!(old_record.verify().is_ok());
         // But freshness check should fail (record is stale)
-        assert!(!old_record.verify_fresh(3600));
+        assert!(matches!(old_record.verify_fresh(3600), Err(FreshnessError::Stale { .. })));
     }
 
     #[test]
@@ -1082,7 +1220,7 @@ mod tests {
         };
 
         // Future-dated record should fail freshness check
-        assert!(!future_record.verify_fresh(3600));
+        assert!(matches!(future_record.verify_fresh(3600), Err(FreshnessError::ClockSkewFuture { .. })));
     }
 
     #[test]
@@ -1220,7 +1358,7 @@ mod tests {
     #[test]
     fn test_pow_generation_produces_valid_proof() {
         // Use lower difficulty for faster test
-        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8).expect("PoW generation failed");
         let identity = keypair.identity();
         
         assert!(
@@ -1231,7 +1369,7 @@ mod tests {
 
     #[test]
     fn test_pow_verification_rejects_invalid_nonce() {
-        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8).expect("PoW generation failed");
         let identity = keypair.identity();
         
         // Valid proof works
@@ -1247,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_pow_verification_rejects_wrong_identity() {
-        let (keypair1, proof1) = Keypair::generate_with_pow_difficulty(8);
+        let (keypair1, proof1) = Keypair::generate_with_pow_difficulty(8).expect("PoW generation failed");
         let keypair2 = Keypair::generate();
         
         // Proof from keypair1 shouldn't work for keypair2's identity
@@ -1274,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_contact_with_pow_serialization_roundtrip() {
-        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8);
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(8).expect("PoW generation failed");
         let contact = keypair.create_contact_with_pow(
             vec!["192.168.1.1:8080".to_string()],
             proof,
@@ -1342,7 +1480,7 @@ mod tests {
         let difficulty = if cfg!(debug_assertions) { 8 } else { POW_DIFFICULTY };
         
         let start = Instant::now();
-        let (keypair, proof) = Keypair::generate_with_pow_difficulty(difficulty);
+        let (keypair, proof) = Keypair::generate_with_pow_difficulty(difficulty).expect("PoW generation failed");
         let elapsed = start.elapsed();
         
         // Verify the proof is valid

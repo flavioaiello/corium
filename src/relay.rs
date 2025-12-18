@@ -591,7 +591,7 @@ impl RelayClient {
     ) -> anyhow::Result<()> {
         debug!(
             from_peer = %hex::encode(&from_peer.as_bytes()[..8]),
-            session = %hex::encode(session_id),
+            session = %hex::encode(&session_id[..4]),
             "received relay signal via mesh"
         );
         
@@ -1052,7 +1052,7 @@ impl RelayServerActor {
         self.addr_to_session.put(peer_a_addr, session_id);
         
         debug!(
-            session = hex::encode(session_id),
+            session = hex::encode(&session_id[..4]),
             peer_a = %peer_a_addr,
             "registered relay session (waiting for peer B)"
         );
@@ -1074,7 +1074,7 @@ impl RelayServerActor {
         // An attacker who guesses session IDs should not be able to keep probing.
         if session.peer_b_identity != from_peer || session.peer_a_identity != target_peer {
             warn!(
-                session = hex::encode(session_id),
+                session = hex::encode(&session_id[..4]),
                 expected_from = ?session.peer_b_identity,
                 got_from = ?from_peer,
                 "identity mismatch in complete_session, removing session"
@@ -1104,7 +1104,7 @@ impl RelayServerActor {
         self.addr_to_session.put(peer_b_addr, session_id);
         
         debug!(
-            session = hex::encode(session_id),
+            session = hex::encode(&session_id[..4]),
             peer_a = %session.peer_a_addr,
             peer_b = %peer_b_addr,
             "relay session complete"
@@ -1133,7 +1133,7 @@ impl RelayServerActor {
                 debug!(
                     target = ?target_peer,
                     from = ?from_peer,
-                    session = hex::encode(session_id),
+                    session = hex::encode(&session_id[..4]),
                     "sent incoming connection notification via mesh signaling"
                 );
                 true
@@ -1173,7 +1173,7 @@ impl RelayServerActor {
             Some(s) => s,
             None => {
                 trace!(
-                    session = hex::encode(session_id),
+                    session = hex::encode(&session_id[..4]),
                     from = %from,
                     "dropping packet for unknown session"
                 );
@@ -1190,7 +1190,7 @@ impl RelayServerActor {
         // Peer B must complete the session via RPC before sending data.
         if !session.is_complete() && from != session.peer_a_addr {
             trace!(
-                session = hex::encode(session_id),
+                session = hex::encode(&session_id[..4]),
                 from = %from,
                 "dropping packet: session incomplete and sender is not peer_a"
             );
@@ -1204,7 +1204,7 @@ impl RelayServerActor {
             }
             None => {
                 trace!(
-                    session = hex::encode(session_id),
+                    session = hex::encode(&session_id[..4]),
                     from = %from,
                     "dropping packet from non-participant"
                 );
@@ -1225,7 +1225,7 @@ impl RelayServerActor {
             }
             Err(e) => {
                 warn!(
-                    session = hex::encode(session_id),
+                    session = hex::encode(&session_id[..4]),
                     dest = %dest,
                     error = %e,
                     "failed to forward relay packet"
@@ -1291,7 +1291,7 @@ pub async fn handle_relay_request(
             debug!(
                 from = ?from_peer,
                 target = ?target_peer,
-                session = hex::encode(session_id),
+                session = hex::encode(&session_id[..4]),
                 "handling RELAY_CONNECT request"
             );
 
@@ -1326,7 +1326,7 @@ pub async fn handle_relay_request(
             {
                 Ok(()) => {
                     debug!(
-                        session = hex::encode(session_id),
+                        session = hex::encode(&session_id[..4]),
                         peer = %remote_addr,
                         "relay session pending (waiting for peer B)"
                     );
@@ -1351,7 +1351,7 @@ pub async fn handle_relay_request(
                     {
                         Ok(()) => {
                             debug!(
-                                session = hex::encode(session_id),
+                                session = hex::encode(&session_id[..4]),
                                 peer = %remote_addr,
                                 "relay session established"
                             );
@@ -1362,7 +1362,7 @@ pub async fn handle_relay_request(
                         }
                         Err(e) => {
                             warn!(
-                                session = hex::encode(session_id),
+                                session = hex::encode(&session_id[..4]),
                                 error = e,
                                 "failed to complete relay session"
                             );
@@ -1374,7 +1374,7 @@ pub async fn handle_relay_request(
                 }
                 Err(e) => {
                     warn!(
-                        session = hex::encode(session_id),
+                        session = hex::encode(&session_id[..4]),
                         error = e,
                         "failed to register relay session"
                     );
@@ -1395,7 +1395,7 @@ pub async fn handle_relay_request(
             debug!(
                 from = ?from_peer,
                 target = ?target_peer,
-                session = hex::encode(session_id),
+                session = hex::encode(&session_id[..4]),
                 "handling MESH_RELAY request (opportunistic relay)"
             );
 
@@ -1434,7 +1434,7 @@ pub async fn handle_relay_request(
             {
                 Ok(()) => {
                     debug!(
-                        session = hex::encode(session_id),
+                        session = hex::encode(&session_id[..4]),
                         from = ?from_peer,
                         target = ?target_peer,
                         "mesh relay session registered"
@@ -1450,7 +1450,7 @@ pub async fn handle_relay_request(
                 }
                 Err(e) => {
                     warn!(
-                        session = hex::encode(session_id),
+                        session = hex::encode(&session_id[..4]),
                         error = e,
                         "failed to register mesh relay session"
                     );

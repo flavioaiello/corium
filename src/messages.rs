@@ -245,6 +245,9 @@ pub enum GossipSubRequest {
     /// The relay sends this to notify a NAT-bound peer about an incoming
     /// connection request. The target peer processes it and completes
     /// the relay handshake.
+    /// 
+    /// SECURITY: The signature field cryptographically binds the signal to
+    /// from_peer's identity, preventing forgery by intermediate mesh peers.
     RelaySignal {
         /// The target peer identity (recipient of the signal).
         target: Identity,
@@ -254,6 +257,9 @@ pub enum GossipSubRequest {
         session_id: [u8; 16],
         /// Address to send relay data packets to.
         relay_data_addr: String,
+        /// Ed25519 signature by from_peer over (target || session_id || relay_data_addr).
+        /// SECURITY: Prevents forgery of relay signals by malicious mesh peers.
+        signature: Vec<u8>,
     },
 }
 

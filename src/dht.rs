@@ -46,7 +46,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use crate::identity::{distance_cmp, Contact, Identity, Keypair};
+use crate::identity::{distance_cmp, Contact, FreshnessError, Identity, Keypair};
 use crate::protocols::DhtNodeRpc;
 
 /// Maximum age for endpoint records before they're considered stale (24 hours).
@@ -78,6 +78,12 @@ pub enum ValueType {
     Invalid,
 }
 
+/// Maximum plausible size for a valid Contact record.
+/// A Contact with 16 addresses of 256 bytes each, plus signature and overhead = ~5KB.
+/// Anything larger is clearly invalid and we can skip deserialization.
+/// SECURITY: Saves CPU cycles on obviously malformed payloads.
+const MAX_CONTACT_RECORD_SIZE: usize = 16 * 1024;
+
 /// Classify a key-value pair and validate it.
 /// 
 /// Returns `ValueType::Invalid` if the value cannot be stored.
@@ -91,6 +97,18 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
     // Fast path: content-addressed storage (hash of value == key)
     if hash(value).as_bytes() == key {
         return ValueType::ContentAddressed;
+    }
+
+    // SECURITY: Early rejection of oversized values before deserialization.
+    // Valid Contact records are typically <1KB; anything >16KB cannot be valid.
+    if value.len() > MAX_CONTACT_RECORD_SIZE {
+        debug!(
+            key = hex::encode(&key[..8]),
+            value_len = value.len(),
+            max = MAX_CONTACT_RECORD_SIZE,
+            "DHT store rejected: value too large to be a valid Contact record"
+        );
+        return ValueType::Invalid;
     }
 
     // Slow path: identity-keyed Contact record
@@ -122,16 +140,37 @@ pub fn classify_key_value_pair(key: &Key, value: &[u8]) -> ValueType {
             );
             return ValueType::Invalid;
         }
-        if !record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS) {
-            debug!(
-                key = hex::encode(&key[..8]),
-                identity = hex::encode(&record.identity.as_bytes()[..8]),
-                timestamp = record.timestamp,
-                "DHT store rejected: Contact record stale or invalid signature"
-            );
-            return ValueType::Invalid;
+        match record.verify_fresh(ENDPOINT_RECORD_MAX_AGE_SECS) {
+            Ok(()) => return ValueType::IdentityKeyed,
+            Err(FreshnessError::SignatureInvalid) => {
+                debug!(
+                    key = hex::encode(&key[..8]),
+                    identity = hex::encode(&record.identity.as_bytes()[..8]),
+                    "DHT store rejected: Contact record has invalid signature"
+                );
+            }
+            Err(FreshnessError::ClockSkewFuture { record_ts, local_ts, drift_ms }) => {
+                warn!(
+                    key = hex::encode(&key[..8]),
+                    identity = hex::encode(&record.identity.as_bytes()[..8]),
+                    record_ts,
+                    local_ts,
+                    drift_ms,
+                    "DHT store rejected: Contact record timestamp in future (clock skew detected)"
+                );
+            }
+            Err(FreshnessError::Stale { record_ts, local_ts, age_ms }) => {
+                debug!(
+                    key = hex::encode(&key[..8]),
+                    identity = hex::encode(&record.identity.as_bytes()[..8]),
+                    record_ts,
+                    local_ts,
+                    age_ms,
+                    "DHT store rejected: Contact record is stale"
+                );
+            }
         }
-        return ValueType::IdentityKeyed;
+        return ValueType::Invalid;
     }
 
     // Neither content-addressed nor valid Contact record
@@ -191,6 +230,17 @@ const ROUTING_INSERTION_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum peers to track for insertion rate limiting.
 /// Uses LRU eviction when full.
 const MAX_ROUTING_INSERTION_TRACKED_PEERS: usize = 1_000;
+
+/// Maximum direct peer insertions per IP per rate window.
+/// SECURITY: Limits routing table pollution from direct connections without PoW.
+/// An attacker with many IPs can still populate the table, but must pay connection cost.
+const DIRECT_PEER_PER_IP_LIMIT: usize = 20;
+
+/// Time window for direct peer IP rate limiting.
+const DIRECT_PEER_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum IPs to track for direct peer rate limiting.
+const MAX_DIRECT_PEER_TRACKED_IPS: usize = 1_000;
 
 /// Whether to enforce Proof-of-Work verification for routing table insertion.
 /// 
@@ -257,6 +307,77 @@ impl RoutingInsertionLimiter {
         } else {
             ROUTING_INSERTION_PER_PEER_LIMIT as f64
         }
+    }
+}
+
+/// Rate limiter for direct peer insertions by IP address.
+/// 
+/// SECURITY: Direct peers bypass PoW verification because their identity is
+/// verified via mTLS. However, an attacker with many IP addresses could exploit
+/// this to populate the routing table without paying PoW cost. This limiter
+/// restricts insertions per IP to bound the attack surface.
+#[derive(Debug, Clone, Copy)]
+struct DirectPeerIpBucket {
+    tokens: f64,
+    last_update: Instant,
+}
+
+impl DirectPeerIpBucket {
+    fn new() -> Self {
+        Self {
+            tokens: DIRECT_PEER_PER_IP_LIMIT as f64,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        let window_secs = DIRECT_PEER_RATE_WINDOW.as_secs_f64();
+        
+        let rate = DIRECT_PEER_PER_IP_LIMIT as f64 / window_secs;
+        self.tokens = (self.tokens + elapsed * rate).min(DIRECT_PEER_PER_IP_LIMIT as f64);
+        self.last_update = now;
+        
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct DirectPeerIpLimiter {
+    buckets: LruCache<IpAddr, DirectPeerIpBucket>,
+}
+
+impl DirectPeerIpLimiter {
+    pub fn new() -> Self {
+        Self {
+            buckets: LruCache::new(
+                NonZeroUsize::new(MAX_DIRECT_PEER_TRACKED_IPS)
+                    .expect("MAX_DIRECT_PEER_TRACKED_IPS must be non-zero")
+            ),
+        }
+    }
+
+    /// Check if a direct peer from the given IP should be allowed.
+    /// Extracts IP from the contact's primary address.
+    pub fn allow_direct_peer(&mut self, contact: &Contact) -> bool {
+        let ip = match contact.primary_addr() {
+            Some(addr_str) => {
+                // Parse "host:port" format
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => addr.ip(),
+                    Err(_) => return true, // Can't parse, allow (fail-open for edge cases)
+                }
+            }
+            None => return true, // No address, allow (unusual but not attackable)
+        };
+        
+        let bucket = self.buckets.get_or_insert_mut(ip, DirectPeerIpBucket::new);
+        bucket.try_consume()
     }
 }
 
@@ -1647,6 +1768,9 @@ struct DhtNodeActor<N: DhtNodeRpc> {
     params: AdaptiveParams,
     tiering: TieringManager,
     routing_limiter: RoutingInsertionLimiter,
+    /// Rate limiter for direct peer insertions by IP address.
+    /// SECURITY: Bounds PoW bypass exploitation from multi-IP attackers.
+    direct_peer_limiter: DirectPeerIpLimiter,
     cmd_rx: mpsc::Receiver<Command>,
     cmd_tx: mpsc::Sender<Command>,
     network: Arc<N>,
@@ -1694,6 +1818,7 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
             params: AdaptiveParams::new(k, alpha),
             tiering: TieringManager::new(),
             routing_limiter: RoutingInsertionLimiter::new(),
+            direct_peer_limiter: DirectPeerIpLimiter::new(),
             cmd_rx,
             cmd_tx: cmd_tx.clone(),
             network: network.clone(),
@@ -2284,10 +2409,17 @@ impl<N: DhtNodeRpc + 'static> DhtNode<N> {
                     return Err(anyhow!("Endpoint record peer_id mismatch"));
                 }
 
-                if !record.verify_fresh(MAX_RECORD_AGE_SECS) {
-                    return Err(anyhow!(
-                        "Endpoint record signature or timestamp verification failed"
-                    ));
+                if let Err(e) = record.verify_fresh(MAX_RECORD_AGE_SECS) {
+                    let reason = match e {
+                        FreshnessError::SignatureInvalid => "invalid signature".to_string(),
+                        FreshnessError::ClockSkewFuture { drift_ms, .. } => {
+                            format!("timestamp {}ms in future (clock skew)", drift_ms)
+                        }
+                        FreshnessError::Stale { age_ms, .. } => {
+                            format!("record is {}s old (stale)", age_ms / 1000)
+                        }
+                    };
+                    return Err(anyhow!("Endpoint record verification failed: {}", reason));
                 }
 
                 Ok(Some(record))
@@ -2446,6 +2578,11 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
     /// 
     /// SECURITY: Bypasses PoW check because the peer has proven identity
     /// via mTLS certificate verification during QUIC handshake.
+    /// 
+    /// However, to prevent exploitation by attackers with many IP addresses,
+    /// insertions are rate-limited per source IP. This ensures that while
+    /// direct peers don't need PoW, the connection establishment cost provides
+    /// an economic bound on routing table pollution.
     fn handle_observe_direct_peer(&mut self, contact: Contact) {
         if contact.identity == self.id {
             return;
@@ -2453,6 +2590,18 @@ impl<N: DhtNodeRpc> DhtNodeActor<N> {
         if !contact.identity.is_valid() {
             return;
         }
+        
+        // SECURITY: Rate limit by source IP to prevent multi-IP attackers from
+        // bypassing PoW by establishing many direct connections.
+        if !self.direct_peer_limiter.allow_direct_peer(&contact) {
+            debug!(
+                peer = ?hex::encode(&contact.identity.as_bytes()[..8]),
+                addr = ?contact.primary_addr(),
+                "direct peer rate limited by IP"
+            );
+            return;
+        }
+        
         // No PoW check - peer identity was verified via mTLS
         self.insert_contact_into_routing(contact);
     }
@@ -3598,6 +3747,56 @@ mod tests {
         assert!(
             (remaining - (ROUTING_INSERTION_PER_PEER_LIMIT as f64 - 1.0)).abs() < 0.1,
             "new peer should have used one token"
+        );
+    }
+
+    #[test]
+    fn direct_peer_ip_limiter_enforces_per_ip_limit() {
+        // SECURITY TEST: Verify that the DirectPeerIpLimiter enforces per-IP rate limiting
+        // to prevent multi-IP attackers from bypassing PoW via direct connections.
+        let mut limiter = DirectPeerIpLimiter::new();
+        
+        // Create a contact with a known IP address using the correct API
+        let keypair = crate::identity::Keypair::generate();
+        let contact = Contact::single(keypair.identity(), "192.168.1.100:8080");
+        
+        // Should allow up to DIRECT_PEER_PER_IP_LIMIT insertions
+        for i in 0..DIRECT_PEER_PER_IP_LIMIT {
+            assert!(
+                limiter.allow_direct_peer(&contact),
+                "insertion {} should be allowed within limit",
+                i
+            );
+        }
+        
+        // Next insertion should be rate-limited
+        assert!(
+            !limiter.allow_direct_peer(&contact),
+            "insertion beyond limit should be rejected"
+        );
+    }
+    
+    #[test]
+    fn direct_peer_ip_limiter_independent_per_ip() {
+        // SECURITY TEST: Verify that different IPs have independent rate limits
+        let mut limiter = DirectPeerIpLimiter::new();
+        
+        let keypair1 = crate::identity::Keypair::generate();
+        let contact1 = Contact::single(keypair1.identity(), "192.168.1.100:8080");
+        
+        let keypair2 = crate::identity::Keypair::generate();
+        let contact2 = Contact::single(keypair2.identity(), "192.168.1.200:8080");
+        
+        // Exhaust limit for first IP
+        for _ in 0..DIRECT_PEER_PER_IP_LIMIT {
+            limiter.allow_direct_peer(&contact1);
+        }
+        assert!(!limiter.allow_direct_peer(&contact1), "first IP should be limited");
+        
+        // Second IP should still be allowed
+        assert!(
+            limiter.allow_direct_peer(&contact2),
+            "different IP should have independent limit"
         );
     }
 

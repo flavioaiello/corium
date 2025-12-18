@@ -82,17 +82,28 @@ async fn main() -> Result<()> {
 
     let telemetry_interval = args.telemetry_interval;
     let mut interval = time::interval(Duration::from_secs(telemetry_interval));
+    
+    // Graceful shutdown on Ctrl+C
     loop {
-        interval.tick().await;
-        let snapshot = node.telemetry().await;
-        info!(
-            pressure = format!("{:.2}", snapshot.pressure),
-            stored_keys = snapshot.stored_keys,
-            tier_counts = ?snapshot.tier_counts,
-            tier_centroids = ?snapshot.tier_centroids,
-            k = snapshot.replication_factor,
-            alpha = snapshot.concurrency,
-            "telemetry snapshot"
-        );
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, exiting gracefully");
+                break;
+            }
+            _ = interval.tick() => {
+                let snapshot = node.telemetry().await;
+                info!(
+                    pressure = format!("{:.2}", snapshot.pressure),
+                    stored_keys = snapshot.stored_keys,
+                    tier_counts = ?snapshot.tier_counts,
+                    tier_centroids = ?snapshot.tier_centroids,
+                    k = snapshot.replication_factor,
+                    alpha = snapshot.concurrency,
+                    "telemetry snapshot"
+                );
+            }
+        }
     }
+    
+    Ok(())
 }

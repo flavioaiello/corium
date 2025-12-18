@@ -68,7 +68,7 @@ type RequestTuple = (
 );
 
 // Re-export Identity and PoW types for public API consumers
-pub use crate::identity::{Identity, IdentityProof, POW_DIFFICULTY};
+pub use crate::identity::{Identity, IdentityProof, PoWError, POW_DIFFICULTY};
 
 pub struct Node {
     keypair: Keypair,
@@ -90,8 +90,12 @@ impl Node {
     /// 
     /// This generates a new Ed25519 keypair and computes a Proof-of-Work
     /// for Sybil resistance. PoW computation takes ~1-4 seconds.
+    /// 
+    /// # Errors
+    /// Returns error if PoW generation fails (astronomically unlikely) or socket binding fails.
     pub async fn bind(addr: &str) -> Result<Self> {
-        let (keypair, pow_proof) = Keypair::generate_with_pow();
+        let (keypair, pow_proof) = Keypair::generate_with_pow()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         Self::create(addr, keypair, pow_proof).await
     }
 
@@ -311,26 +315,58 @@ impl Node {
     }
     
     /// Enumerate all local network interface addresses.
+    /// 
+    /// Uses a pure-Rust approach that doesn't shell out to external commands.
+    /// This avoids potential issues with missing `hostname` command on some systems
+    /// and eliminates subprocess overhead.
     fn enumerate_local_addresses(port: u16, ipv4_only: bool) -> Vec<String> {
         let mut addresses = Vec::new();
         
-        // Try to get network interfaces
-        if let Ok(interfaces) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            // Get local address to verify we can bind
-            if interfaces.local_addr().is_ok() {
-                // Use DNS to get all local addresses (cross-platform)
-                if let Ok(hostname) = std::process::Command::new("hostname").output() {
-                    let hostname = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
-                    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
-                        &format!("{}:0", hostname)
-                    ) {
-                        for addr in addrs {
-                            if ipv4_only && !addr.is_ipv4() {
-                                continue;
-                            }
-                            if !addr.ip().is_loopback() {
-                                addresses.push(SocketAddr::new(addr.ip(), port).to_string());
-                            }
+        // Probe method: bind to 0.0.0.0 then connect to public DNS to discover local IP.
+        // This works reliably across platforms without shelling out.
+        // We try multiple targets for robustness.
+        let probe_targets = [
+            "8.8.8.8:53",     // Google DNS
+            "1.1.1.1:53",     // Cloudflare DNS
+            "9.9.9.9:53",     // Quad9 DNS
+        ];
+        
+        for target in probe_targets {
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+                && socket.connect(target).is_ok()
+                && let Ok(local) = socket.local_addr()
+            {
+                let ip = local.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    let addr_str = SocketAddr::new(ip, port).to_string();
+                    if !addresses.contains(&addr_str) {
+                        // Filter by IP version if requested
+                        if ipv4_only && !ip.is_ipv4() {
+                            continue;
+                        }
+                        addresses.push(addr_str);
+                    }
+                }
+            }
+        }
+        
+        // Also try IPv6 probe if not ipv4_only
+        if !ipv4_only {
+            // Use IPv6 DNS targets
+            let ipv6_targets = [
+                "[2001:4860:4860::8888]:53", // Google DNS IPv6
+                "[2606:4700:4700::1111]:53", // Cloudflare DNS IPv6
+            ];
+            for target in ipv6_targets {
+                if let Ok(socket) = std::net::UdpSocket::bind("[::]:0")
+                    && socket.connect(target).is_ok()
+                    && let Ok(local) = socket.local_addr()
+                {
+                    let ip = local.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        let addr_str = SocketAddr::new(ip, port).to_string();
+                        if !addresses.contains(&addr_str) {
+                            addresses.push(addr_str);
                         }
                     }
                 }

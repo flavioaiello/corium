@@ -815,7 +815,7 @@ impl RelayRpc for RpcNode {
         smartsock.send_relay_probe(&from_peer, session_id).await?;
         
         debug!(
-            session = hex::encode(session_id),
+            session = hex::encode(&session_id[..4]),
             from_peer = ?from_peer,
             relay = %relay_addr,
             "completed relay session as receiver"
@@ -838,7 +838,7 @@ impl RelayRpc for RpcNode {
             mesh_peer = ?mesh_peer.identity,
             from_peer = ?from_peer,
             target_peer = ?target_peer,
-            session = hex::encode(session_id),
+            session = hex::encode(&session_id[..4]),
             "requesting mesh relay from peer"
         );
 

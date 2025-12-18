@@ -49,4 +49,4 @@ mod relay;
 mod rpc;
 mod transport;
 
-pub use node::{Identity, IdentityProof, POW_DIFFICULTY, Node};
+pub use node::{Identity, IdentityProof, PoWError, POW_DIFFICULTY, Node};

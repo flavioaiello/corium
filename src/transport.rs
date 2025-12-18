@@ -271,12 +271,18 @@ impl PathProbeResponse {
         data.len() >= 5 && data[0..4] == PROBE_MAGIC && data[4] == PROBE_TYPE_RESPONSE
     }
     
+    /// Maximum RTT value to prevent f32 precision loss.
+    /// 60 seconds is far beyond any reasonable network RTT.
+    const MAX_RTT_MS: u64 = 60_000;
+
     pub fn rtt_ms(&self) -> f32 {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        (now_ms.saturating_sub(self.echo_timestamp_ms)) as f32
+        // Clamp to MAX_RTT_MS to prevent f32 precision loss for extreme values
+        let rtt = now_ms.saturating_sub(self.echo_timestamp_ms).min(Self::MAX_RTT_MS);
+        rtt as f32
     }
 }
 
